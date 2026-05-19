@@ -1,0 +1,30 @@
+# ── Java backend ─────────────────────────────────
+backend/target/
+backend/*.db
+backend/chroma-data/
+backend/config.properties
+
+# ── Frontend ──────────────────────────────────────
+ui/node_modules/
+ui/out/
+ui/dist/
+
+# ── Root-level build / runtime artifacts ─────────
+target/
+chroma-data/
+*.db
+*.db-shm
+*.db-wal
+chunks.jsonl
+lib/
+
+# ── Secrets / env ────────────────────────────────
+.env
+.env.*
+config.properties
+
+# ── IDE / OS ──────────────────────────────────────
+.idea/
+.vscode/
+.DS_Store
+**/.DS_Store

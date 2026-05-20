@@ -16,17 +16,70 @@ function fmtAge(iso) {
   } catch { return iso }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// Icons
+const FilesIcon = () => (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+    <polyline points="14 2 14 8 20 8"/>
+  </svg>
+)
+const ChunksIcon = () => (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <rect x="3" y="3" width="7" height="7" rx="1.5"/>
+    <rect x="14" y="3" width="7" height="7" rx="1.5"/>
+    <rect x="3" y="14" width="7" height="7" rx="1.5"/>
+    <rect x="14" y="14" width="7" height="7" rx="1.5"/>
+  </svg>
+)
+const FailedIcon = () => (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+    <line x1="12" y1="9" x2="12" y2="13"/>
+    <line x1="12" y1="17" x2="12.01" y2="17"/>
+  </svg>
+)
+const FolderIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+  </svg>
+)
+const RefreshIcon = () => (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <polyline points="1 4 1 10 7 10"/>
+    <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
+  </svg>
+)
+const PlayIcon = () => (
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+    <polygon points="6 4 20 12 6 20 6 4"/>
+  </svg>
+)
+const ArrowRightSm = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <line x1="5" y1="12" x2="19" y2="12"/>
+    <polyline points="12 5 19 12 12 19"/>
+  </svg>
+)
+const CheckIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+    <polyline points="20 6 9 17 4 12"/>
+  </svg>
+)
+const XIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+    <line x1="18" y1="6" x2="6" y2="18"/>
+    <line x1="6" y1="6" x2="18" y2="18"/>
+  </svg>
+)
 
 export default function Library({ active, onGoSettings }) {
   const { api, connected, toast } = useApp()
 
   const [stats,    setStats]    = useState(null)
   const [indexing, setIndexing] = useState(false)
-  const [result,   setResult]   = useState(null)   // { ok, data } | null
+  const [result,   setResult]   = useState(null)
   const [pollTmr,  setPollTmr]  = useState(null)
 
-  // Load / refresh stats
   const loadStats = useCallback(async () => {
     if (!connected || !api) return
     try {
@@ -35,12 +88,10 @@ export default function Library({ active, onGoSettings }) {
     } catch {}
   }, [api, connected])
 
-  // Refresh when view becomes active
   useEffect(() => {
     if (active) loadStats()
   }, [active, loadStats])
 
-  // Poll indexing status
   const startPolling = useCallback(() => {
     const t = setInterval(async () => {
       try {
@@ -59,7 +110,6 @@ export default function Library({ active, onGoSettings }) {
     setPollTmr(t)
   }, [api, loadStats, toast])
 
-  // Cleanup on unmount
   useEffect(() => () => clearInterval(pollTmr), [pollTmr])
 
   const handleIndex = async () => {
@@ -77,32 +127,33 @@ export default function Library({ active, onGoSettings }) {
   return (
     <div className={`view${active ? ' active' : ''}`} id="view-lib">
       <div className="view-header">
-        <h1 className="view-title">Library</h1>
+        <div>
+          <h1 className="view-title">Library</h1>
+          <div className="view-subtitle">Index, monitor, and manage your knowledge base.</div>
+        </div>
         <div className="header-actions">
           <button className="icon-btn" onClick={loadStats} title="Refresh stats">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <polyline points="1 4 1 10 7 10"/>
-              <path d="M3.51 15a9 9 0 102.13-9.36L1 10"/>
-            </svg>
+            <RefreshIcon />
           </button>
         </div>
       </div>
+      <div className="view-divider" />
 
       <div className="lib-body">
-        {/* Stats */}
+        {/* Stats — unified strip */}
         <div className="stats-grid">
           <div className="stat-card g">
-            <div className="stat-icon">📁</div>
+            <div className="stat-icon"><FilesIcon /></div>
             <div className="stat-val">{fmt(stats?.indexedFiles)}</div>
             <div className="stat-lbl">Files Indexed</div>
           </div>
           <div className="stat-card">
-            <div className="stat-icon">🧩</div>
+            <div className="stat-icon"><ChunksIcon /></div>
             <div className="stat-val">{fmt(stats?.totalChunks)}</div>
             <div className="stat-lbl">Chunks Stored</div>
           </div>
           <div className="stat-card r">
-            <div className="stat-icon">⚠️</div>
+            <div className="stat-icon"><FailedIcon /></div>
             <div className="stat-val">{fmt(stats?.failedFiles)}</div>
             <div className="stat-lbl">Failed Files</div>
           </div>
@@ -118,15 +169,27 @@ export default function Library({ active, onGoSettings }) {
           </div>
 
           <div className="path-display">
-            {stats?.rootPath || 'No folder configured — go to Settings'}
+            <FolderIcon />
+            <span>{stats?.rootPath || 'No folder configured — go to Settings'}</span>
           </div>
 
           <div className="index-actions">
             <button className="btn-primary" onClick={handleIndex} disabled={indexing || !connected}>
-              {indexing ? 'Indexing…' : 'Index Now'}
+              {indexing ? (
+                <>
+                  <div className="spin-sm" style={{ borderTopColor: '#1a1610', borderColor: 'rgba(26,22,16,.3)' }} />
+                  Indexing…
+                </>
+              ) : (
+                <>
+                  <PlayIcon />
+                  Index Now
+                </>
+              )}
             </button>
             <button className="btn-ghost" onClick={onGoSettings}>
-              Configure Path →
+              Configure Path
+              <ArrowRightSm />
             </button>
           </div>
 
@@ -145,7 +208,8 @@ export default function Library({ active, onGoSettings }) {
               {result.ok ? (
                 <>
                   <div className="result-head">
-                    ✓ Indexing complete — {(result.data.durationMs / 1000).toFixed(1)}s
+                    <CheckIcon />
+                    Indexing complete — {(result.data.durationMs / 1000).toFixed(1)}s
                   </div>
                   <div className="result-grid">
                     {[
@@ -163,8 +227,11 @@ export default function Library({ active, onGoSettings }) {
                 </>
               ) : (
                 <>
-                  <div className="result-head">✕ Indexing failed</div>
-                  <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 4 }}>{result.msg}</div>
+                  <div className="result-head">
+                    <XIcon />
+                    Indexing failed
+                  </div>
+                  <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 6, lineHeight: 1.5 }}>{result.msg}</div>
                 </>
               )}
             </div>

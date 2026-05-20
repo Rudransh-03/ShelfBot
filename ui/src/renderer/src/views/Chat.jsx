@@ -3,19 +3,46 @@ import { useApp } from '../context/AppContext'
 import BookshelfIcon from '../components/BookshelfIcon'
 
 const SUGGESTIONS = [
-  { emoji: '💡', text: 'Summarize the main topics across my documents' },
-  { emoji: '🔍', text: 'What are the most important decisions documented?' },
-  { emoji: '📋', text: 'Find anything related to project requirements or specs' },
+  {
+    text: 'Summarize the main topics across my documents',
+    icon: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M9 11l3 3L22 4"/>
+        <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+      </svg>
+    ),
+  },
+  {
+    text: 'What are the most important decisions documented?',
+    icon: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <circle cx="11" cy="11" r="8"/>
+        <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+      </svg>
+    ),
+  },
+  {
+    text: 'Find anything related to project requirements or specs',
+    icon: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+        <polyline points="14 2 14 8 20 8"/>
+      </svg>
+    ),
+  },
 ]
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Sub-components
-// ─────────────────────────────────────────────────────────────────────────────
+const ArrowRightIcon = () => (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <line x1="5" y1="12" x2="19" y2="12"/>
+    <polyline points="12 5 19 12 12 19"/>
+  </svg>
+)
 
 function AiAvatar() {
   return (
     <div className="msg-avatar">
-      <BookshelfIcon size={15} />
+      <BookshelfIcon size={14} color="#e8c995" />
     </div>
   )
 }
@@ -23,8 +50,8 @@ function AiAvatar() {
 function UserAvatar() {
   return (
     <div className="msg-avatar">
-      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-        <path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/>
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
         <circle cx="12" cy="7" r="4"/>
       </svg>
     </div>
@@ -63,10 +90,6 @@ function TypingIndicator() {
     </div>
   )
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Chat view
-// ─────────────────────────────────────────────────────────────────────────────
 
 export default function Chat({ active }) {
   const { api, connected, toast } = useApp()
@@ -121,26 +144,37 @@ export default function Chat({ active }) {
 
   return (
     <div className={`view${active ? ' active' : ''}`} id="view-chat">
-      <div className="view-header">
-        <h1 className="view-title">Chat</h1>
-        <div className="header-actions">
-          <button className="icon-btn" onClick={clearChat} title="Clear conversation">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <polyline points="1 4 1 10 7 10"/>
-              <path d="M3.51 15a9 9 0 102.13-9.36L1 10"/>
-            </svg>
-          </button>
-        </div>
-      </div>
+      {hasMessages && (
+        <>
+          <div className="view-header">
+            <div>
+              <h1 className="view-title">Chat</h1>
+              <div className="view-subtitle">Conversation with your library</div>
+            </div>
+            <div className="header-actions">
+              <button className="icon-btn" onClick={clearChat} title="Clear conversation">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="1 4 1 10 7 10"/>
+                  <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+          <div className="view-divider" />
+        </>
+      )}
 
       {!hasMessages ? (
         <div className="chat-empty">
           <div className="empty-icon">
-            <BookshelfIcon size={34} />
+            <BookshelfIcon size={28} color="#e8c995" />
           </div>
-          <div className="empty-title">Ask your files anything</div>
+          <div className="empty-title">
+            Your library, <em>in conversation</em>
+          </div>
           <div className="empty-sub">
-            ShelfBot searches your indexed documents and answers using AI.
+            ShelfBot reads across your indexed documents and answers in context.
+            Begin with one of these, or ask anything.
           </div>
           <div className="suggestions">
             {SUGGESTIONS.map(s => (
@@ -150,7 +184,9 @@ export default function Chat({ active }) {
                 onClick={() => sendMessage(s.text)}
                 disabled={!connected}
               >
-                {s.emoji}&nbsp;&nbsp;{s.text}
+                <span className="sugg-ico">{s.icon}</span>
+                <span>{s.text}</span>
+                <span className="sugg-arrow"><ArrowRightIcon /></span>
               </button>
             ))}
           </div>
@@ -169,7 +205,7 @@ export default function Chat({ active }) {
           <div className="input-box">
             <input
               type="text"
-              placeholder="Ask anything about your files…"
+              placeholder="Ask your library anything…"
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={handleKey}
@@ -180,8 +216,9 @@ export default function Chat({ active }) {
             className="send-btn"
             onClick={() => sendMessage(input)}
             disabled={!connected || !input.trim() || loading}
+            title="Send (Enter)"
           >
-            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
               <line x1="22" y1="2" x2="11" y2="13"/>
               <polygon points="22 2 15 22 11 13 2 9 22 2"/>
             </svg>

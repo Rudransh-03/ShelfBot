@@ -7,24 +7,74 @@ import com.localfilebrain.storage.ChromaDBClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
+
+import com.localfilebrain.storage.ChromaDBClient.QueryResult.Match;
 
 /**
  * Orchestrates the full query pipeline:
- *   1. Embed question via OpenAI
- *   2. Search ChromaDB for top-K similar chunks
- *   3. Relevance threshold check
- *   4. Call GPT-4o mini with context + history
- *   5. Store exchange in ConversationHistory
- *   6. Return answer + source files
+ *   1. Short-circuit conversational greetings / thanks / farewells
+ *   2. Embed question via OpenAI
+ *   3. Search ChromaDB for top-K similar chunks
+ *   4. Relevance threshold check
+ *   5. Call GPT-4o mini with context + history (LLM is the final arbiter
+ *      for borderline matches — it returns the not-found message itself
+ *      when the excerpts are too weak to answer)
+ *   6. Store exchange in ConversationHistory
+ *   7. Return answer + source files
  */
 public final class QueryEngine {
 
     private static final Logger log = LoggerFactory.getLogger(QueryEngine.class);
 
-    private static final double RELEVANCE_THRESHOLD = 0.7;
-    private static final int    TOP_K               = 5;
+    // Cosine-distance ceiling. Above this the top match is essentially unrelated
+    // to the query, so we skip the LLM and return the default fallback. Below
+    // this — even a loose semantic match like "resume" hitting a resume doc —
+    // we let the LLM see the excerpts and decide whether it can answer.
+    //
+    // Tuned slightly upward (was 1.3) so that when the user has multiple files
+    // on the same topic (e.g. two resumes), a borderline-scoring second file
+    // isn't filtered out entirely — the LLM is the better arbiter for borderline
+    // matches than a hard distance cut.
+    private static final double RELEVANCE_THRESHOLD = 1.5;
+
+    // Top-K retrieval count from ChromaDB. Intentionally much wider than the
+    // number of chunks we'll actually send to the LLM, because diversification
+    // happens AFTER retrieval — we need enough raw matches for every relevant
+    // file to surface, not just the single best-scoring one.
+    //
+    // Example: with two resumes of ~6 chunks each, one resume's chunks can
+    // easily occupy the top 6-10 ranks. A small TOP_K (was 12) means the
+    // second resume's first chunk lands at rank 13+ and never enters the
+    // candidate pool. ChromaDB/embedding cost for a wider K is negligible.
+    private static final int    TOP_K               = 40;
+
+    // After retrieval, cap how many chunks we keep per source file so the
+    // prompt doesn't get dominated by one document.
+    private static final int    MAX_CHUNKS_PER_FILE = 3;
+
+    // Hard cap on chunks sent to the LLM — keeps token usage predictable.
+    private static final int    MAX_CONTEXT_CHUNKS  = 10;
+
+    private static final Set<String> GREETINGS = Set.of(
+            "hi", "hii", "hiii", "hello", "helo", "hey", "heya", "hiya",
+            "yo", "sup", "wassup", "whatsup", "howdy", "hola", "namaste",
+            "good morning", "good afternoon", "good evening", "good night",
+            "morning", "evening", "greetings"
+    );
+    private static final Set<String> THANKS = Set.of(
+            "thanks", "thank you", "thx", "ty", "thank u", "thankyou",
+            "thanks a lot", "thanks!", "many thanks"
+    );
+    private static final Set<String> FAREWELLS = Set.of(
+            "bye", "goodbye", "good bye", "see you", "see ya", "cya",
+            "later", "ttyl", "take care"
+    );
 
     private final OpenAIEmbeddingClient embeddingClient;
     private final ChromaDBClient        chromaClient;
@@ -49,9 +99,16 @@ public final class QueryEngine {
             return QueryResult.notFound("Please enter a question.");
         }
 
-        log.info("Query: {}", question);
+        String trimmed = question.trim();
+        log.info("Query: {}", trimmed);
 
-        List<float[]> embeddings  = embeddingClient.embedBatch(List.of(question));
+        String chatReply = handleSmallTalk(trimmed);
+        if (chatReply != null) {
+            history.add(trimmed, chatReply);
+            return QueryResult.found(chatReply, List.of());
+        }
+
+        List<float[]> embeddings  = embeddingClient.embedBatch(List.of(trimmed));
         float[]       queryVector = embeddings.get(0);
 
         ChromaDBClient.QueryResult chromaResult = chromaClient.query(queryVector, TOP_K);
@@ -59,7 +116,7 @@ public final class QueryEngine {
 
         if (matches.isEmpty()) {
             log.info("ChromaDB returned no matches");
-            return notFound(question);
+            return notFound(trimmed);
         }
 
         double bestDistance = matches.get(0).distance();
@@ -67,26 +124,77 @@ public final class QueryEngine {
 
         if (bestDistance > RELEVANCE_THRESHOLD) {
             log.info("No relevant chunks found (best distance: {})", bestDistance);
-            return notFound(question);
+            return notFound(trimmed);
         }
 
-        List<ChromaDBClient.QueryResult.Match> relevantMatches = matches.stream()
+        List<ChromaDBClient.QueryResult.Match> withinThreshold = matches.stream()
                 .filter(m -> m.distance() <= RELEVANCE_THRESHOLD)
                 .collect(Collectors.toList());
 
-        String answer = llmClient.answer(question, relevantMatches, history);
-
-        List<String> sources = relevantMatches.stream()
-                .map(ChromaDBClient.QueryResult.Match::fileName)
+        long candidateFiles = withinThreshold.stream()
+                .map(ChromaDBClient.QueryResult.Match::sourceFilePath)
                 .distinct()
-                .collect(Collectors.toList());
+                .count();
 
-        history.add(question, answer);
+        List<ChromaDBClient.QueryResult.Match> relevantMatches =
+                diversifyByFile(withinThreshold, MAX_CHUNKS_PER_FILE, MAX_CONTEXT_CHUNKS);
+
+        long finalFiles = relevantMatches.stream()
+                .map(ChromaDBClient.QueryResult.Match::sourceFilePath)
+                .distinct()
+                .count();
+
+        log.info("Retrieval: {} chunks in pool from {} file(s) → {} chunks sent to LLM from {} file(s)",
+                withinThreshold.size(), candidateFiles, relevantMatches.size(), finalFiles);
+
+        String answer = llmClient.answer(trimmed, relevantMatches, history);
+
+        List<Source> sources = groupMatchesByFile(relevantMatches);
+
+        history.add(trimmed, answer);
 
         log.info("Answer generated from {} chunk(s) across {} file(s)",
                 relevantMatches.size(), sources.size());
 
-        return QueryResult.found(answer, sources);
+        boolean answerFound = !isFallbackAnswer(answer);
+        return answerFound
+                ? QueryResult.found(answer, sources)
+                : QueryResult.notFound(answer);
+    }
+
+    /**
+     * Groups the retrieved chunks by source file so the UI can render one
+     * clickable chip per file, each carrying the file's absolute path (for
+     * "open in default app") and a short list of matched snippets (for the
+     * hover preview).
+     *
+     * Snippet text is truncated to keep the response payload small and to
+     * avoid leaking irrelevantly large amounts of file content into the UI.
+     */
+    private List<Source> groupMatchesByFile(List<Match> matches) {
+        // LinkedHashMap preserves the diversified ordering produced earlier
+        // — most relevant file first, then per-file the best chunks first.
+        LinkedHashMap<String, Source.Builder> byPath = new LinkedHashMap<>();
+
+        for (Match m : matches) {
+            byPath.computeIfAbsent(
+                    m.sourceFilePath(),
+                    p -> new Source.Builder(m.fileName(), p)
+            ).addSnippet(snippet(m.text()));
+        }
+
+        return byPath.values().stream()
+                .map(Source.Builder::build)
+                .collect(Collectors.toList());
+    }
+
+    private static final int SNIPPET_MAX_CHARS = 320;
+
+    private static String snippet(String text) {
+        if (text == null) return "";
+        String cleaned = text.strip();
+        if (cleaned.length() <= SNIPPET_MAX_CHARS) return cleaned;
+        return cleaned.substring(0, SNIPPET_MAX_CHARS).stripTrailing() + "…";
     }
 
     public void clearHistory() {
@@ -100,16 +208,116 @@ public final class QueryEngine {
         return QueryResult.notFound(message);
     }
 
+    /**
+     * Returns a canned reply for conversational openers (hi, thanks, bye…)
+     * so basic small-talk doesn't end up as "no information found".
+     * Returns null when the input isn't pure small-talk and should go
+     * through the retrieval pipeline.
+     */
+    private String handleSmallTalk(String question) {
+        String normalised = question.toLowerCase()
+                .replaceAll("[\\p{Punct}]+$", "")
+                .trim();
+
+        if (normalised.isEmpty()) return null;
+
+        if (GREETINGS.contains(normalised)) {
+            return "Hi! I'm ShelfBot — ask me anything about the files you've indexed.";
+        }
+        if (THANKS.contains(normalised)) {
+            return "You're welcome! Let me know if there's anything else you'd like to look up.";
+        }
+        if (FAREWELLS.contains(normalised)) {
+            return "Goodbye! I'll be here whenever you need to search your files again.";
+        }
+        return null;
+    }
+
+    private boolean isFallbackAnswer(String answer) {
+        return answer != null
+                && answer.toLowerCase().contains("could not find relevant information");
+    }
+
+    /**
+     * Round-robin interleave of matches grouped by source file. Ensures every
+     * relevant file is represented before any single file contributes a second
+     * chunk — so a query like "work experience in resume" sees chunks from
+     * BOTH resumes instead of only the top-scoring one.
+     *
+     * Grouping uses the absolute source path, not the file name, so two files
+     * named the same in different folders (e.g. ~/Desktop/resume.pdf and
+     * ~/Documents/resume.pdf) are correctly treated as distinct.
+     */
+    private List<ChromaDBClient.QueryResult.Match> diversifyByFile(
+            List<ChromaDBClient.QueryResult.Match> matches,
+            int perFileCap,
+            int totalCap
+    ) {
+        LinkedHashMap<String, List<ChromaDBClient.QueryResult.Match>> byFile = new LinkedHashMap<>();
+        for (ChromaDBClient.QueryResult.Match m : matches) {
+            byFile.computeIfAbsent(m.sourceFilePath(), k -> new ArrayList<>()).add(m);
+        }
+
+        List<ChromaDBClient.QueryResult.Match> interleaved = new ArrayList<>();
+        int round = 0;
+        boolean addedThisRound = true;
+        while (addedThisRound && interleaved.size() < totalCap && round < perFileCap) {
+            addedThisRound = false;
+            for (Map.Entry<String, List<ChromaDBClient.QueryResult.Match>> entry : byFile.entrySet()) {
+                List<ChromaDBClient.QueryResult.Match> chunks = entry.getValue();
+                if (round < chunks.size()) {
+                    interleaved.add(chunks.get(round));
+                    addedThisRound = true;
+                    if (interleaved.size() >= totalCap) break;
+                }
+            }
+            round++;
+        }
+        return interleaved;
+    }
+
     public record QueryResult(
             String       answer,
-            List<String> sourceFiles,
+            List<Source> sourceFiles,
             boolean      found
     ) {
-        public static QueryResult found(String answer, List<String> sources) {
+        public static QueryResult found(String answer, List<Source> sources) {
             return new QueryResult(answer, sources, true);
         }
         public static QueryResult notFound(String message) {
             return new QueryResult(message, List.of(), false);
+        }
+    }
+
+    /**
+     * One source file referenced by an answer.
+     *
+     * @param fileName     display name shown on the chip
+     * @param absolutePath full path used by the UI to open the file in the default app
+     * @param snippets     truncated chunk excerpts that contributed to the answer
+     */
+    public record Source(
+            String       fileName,
+            String       absolutePath,
+            List<String> snippets
+    ) {
+        static final class Builder {
+            private final String       fileName;
+            private final String       absolutePath;
+            private final List<String> snippets = new ArrayList<>();
+
+            Builder(String fileName, String absolutePath) {
+                this.fileName     = fileName;
+                this.absolutePath = absolutePath;
+            }
+
+            void addSnippet(String snippet) {
+                if (snippet != null && !snippet.isBlank()) snippets.add(snippet);
+            }
+
+            Source build() {
+                return new Source(fileName, absolutePath, List.copyOf(snippets));
+            }
         }
     }
 }

@@ -8,6 +8,8 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Properties;
 
 public final class AppConfig {
@@ -48,14 +50,80 @@ public final class AppConfig {
     // Ingestion
     // -------------------------------------------------------------------------
 
-    public Path getFilesRootPath() {
-        String value = require("files.root.path");
-        Path path = Paths.get(value);
-        if (!Files.isDirectory(path)) {
-            throw new ConfigurationException(
-                    "files.root.path does not point to a directory: " + path.toAbsolutePath());
+    /**
+     * Returns every directory that should be scanned for files.
+     *
+     * Resolution order:
+     *   1. {@code files.root.paths} — comma-separated list (preferred for multi-root setups)
+     *   2. {@code files.root.path}  — legacy single-folder key (kept for backward compatibility)
+     *   3. Built-in defaults — the user's Desktop, Downloads, and Documents folders
+     *      (only the ones that actually exist on this machine)
+     *
+     * Always returns at least one directory. Throws {@link ConfigurationException} if
+     * no usable directory can be resolved.
+     */
+    public List<Path> getFilesRootPaths() {
+        String multi = getOrDefault("files.root.paths", "");
+        if (!multi.isBlank()) {
+            return parsePathList(multi, "files.root.paths");
         }
-        return path;
+
+        String single = getOrDefault("files.root.path", "");
+        if (!single.isBlank()) {
+            Path path = Paths.get(single);
+            if (!Files.isDirectory(path)) {
+                throw new ConfigurationException(
+                        "files.root.path does not point to a directory: " + path.toAbsolutePath());
+            }
+            return List.of(path);
+        }
+
+        return defaultUserRoots();
+    }
+
+    /**
+     * Backward-compatible accessor returning the first configured root.
+     * Existing call-sites that only display or log a single path remain valid;
+     * scanning code should prefer {@link #getFilesRootPaths()}.
+     */
+    public Path getFilesRootPath() {
+        return getFilesRootPaths().get(0);
+    }
+
+    private List<Path> parsePathList(String csv, String key) {
+        List<Path> paths = new ArrayList<>();
+        for (String raw : csv.split(",")) {
+            String trimmed = raw.trim();
+            if (trimmed.isEmpty()) continue;
+            Path path = Paths.get(trimmed);
+            if (!Files.isDirectory(path)) {
+                throw new ConfigurationException(
+                        key + " entry is not a directory: " + path.toAbsolutePath());
+            }
+            paths.add(path);
+        }
+        if (paths.isEmpty()) {
+            throw new ConfigurationException(key + " is set but contains no valid entries");
+        }
+        return paths;
+    }
+
+    private List<Path> defaultUserRoots() {
+        Path home = Paths.get(System.getProperty("user.home"));
+        List<Path> defaults = new ArrayList<>();
+        for (String name : new String[] { "Desktop", "Downloads", "Documents" }) {
+            Path candidate = home.resolve(name);
+            if (Files.isDirectory(candidate)) {
+                defaults.add(candidate);
+            }
+        }
+        if (defaults.isEmpty()) {
+            throw new ConfigurationException(
+                    "No files.root.paths configured and no default Desktop/Downloads/Documents "
+                    + "folders were found under " + home.toAbsolutePath()
+                    + ". Please set files.root.paths in config.properties.");
+        }
+        return defaults;
     }
 
     public Path getMetadataDbPath() {

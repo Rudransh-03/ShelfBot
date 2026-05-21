@@ -179,9 +179,11 @@ public final class Main {
             System.out.println(DIM + "  ──────────────────────────────" + RESET);
             System.out.printf("  " + CYAN + "%-14s" + RESET + " %s%n", "Files indexed", BOLD + count + RESET);
             System.out.printf("  " + CYAN + "%-14s" + RESET + " %s%n", "Metadata DB",   config.getMetadataDbPath().toAbsolutePath());
-            System.out.printf("  " + CYAN + "%-14s" + RESET + " %s%n", "Files root",    config.getFilesRootPath().toAbsolutePath());
-//            System.out.printf("  " + CYAN + "%-14s" + RESET + " %s%n", "ChromaDB",      config.getChromaDbUrl());
-//            System.out.printf("  " + CYAN + "%-14s" + RESET + " %s%n", "Collection",    config.getChromaDbCollection());
+            var roots = config.getFilesRootPaths();
+            System.out.printf("  " + CYAN + "%-14s" + RESET + " %s%n", "Files roots",   roots.get(0).toAbsolutePath());
+            for (int i = 1; i < roots.size(); i++) {
+                System.out.printf("  " + DIM + "%-14s" + RESET + " %s%n", "", roots.get(i).toAbsolutePath());
+            }
             System.out.println(DIM + "  ──────────────────────────────" + RESET);
         }
     }
@@ -237,8 +239,8 @@ public final class Main {
                 if (result.found() && !result.sourceFiles().isEmpty()) {
                     System.out.println();
                     System.out.print(DIM + "  sources  ");
-                    for (String src : result.sourceFiles()) {
-                        System.out.print(CYAN + src + RESET + DIM + "  ");
+                    for (QueryEngine.Source src : result.sourceFiles()) {
+                        System.out.print(CYAN + src.fileName() + RESET + DIM + "  ");
                     }
                     System.out.println(RESET);
                 }

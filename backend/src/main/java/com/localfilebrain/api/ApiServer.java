@@ -31,7 +31,8 @@ import java.util.concurrent.atomic.*;
  *   POST /api/query             – semantic search + LLM answer
  *   DELETE /api/conversation    – clear conversation history
  *   GET  /api/config            – read config values
- *   POST /api/config            – update files.root.path
+ *   POST /api/config            – update files root path(s)
+ *                                  Accepts either {"rootPath": "..."} or {"rootPaths": ["...", "..."]}
  */
 public final class ApiServer {
 
@@ -120,18 +121,20 @@ public final class ApiServer {
         if (preflight(ex)) return;
         if (!isMethod(ex, "GET")) { methodNotAllowed(ex); return; }
         try {
-            int    indexed     = metadataStore.countIndexed();
-            int    failed      = metadataStore.countFailed();
-            int    totalChunks = metadataStore.getTotalChunks();
-            String lastIndexed = metadataStore.getLastIndexedAt().orElse("");
-            String rootPath    = safeRootPath();
+            int          indexed     = metadataStore.countIndexed();
+            int          failed      = metadataStore.countFailed();
+            int          totalChunks = metadataStore.getTotalChunks();
+            String       lastIndexed = metadataStore.getLastIndexedAt().orElse("");
+            List<String> rootPaths   = safeRootPaths();
+            String       rootPath    = rootPaths.isEmpty() ? "" : rootPaths.get(0);
 
             sendJson(ex, 200, map(
                 "indexedFiles", indexed,
                 "failedFiles",  failed,
                 "totalChunks",  totalChunks,
                 "lastIndexed",  lastIndexed,
-                "rootPath",     rootPath
+                "rootPath",     rootPath,
+                "rootPaths",    rootPaths
             ));
         } catch (Exception e) {
             log.error("status error", e);
@@ -230,10 +233,13 @@ public final class ApiServer {
 
         if (isMethod(ex, "GET")) {
             try {
+                List<String> rootPaths = safeRootPaths();
+                String       rootPath  = rootPaths.isEmpty() ? "" : rootPaths.get(0);
                 sendJson(ex, 200, map(
-                    "rootPath",      safeRootPath(),
-                    "chromaUrl",     config.getChromaDbUrl(),
-                    "collection",    config.getChromaDbCollection(),
+                    "rootPath",       rootPath,
+                    "rootPaths",      rootPaths,
+                    "chromaUrl",      config.getChromaDbUrl(),
+                    "collection",     config.getChromaDbCollection(),
                     "metadataDbPath", config.getMetadataDbPath().toString()
                 ));
             } catch (Exception e) {
@@ -245,22 +251,41 @@ public final class ApiServer {
         if (!isMethod(ex, "POST")) { methodNotAllowed(ex); return; }
 
         try {
-            Map<?, ?> req     = readJson(ex);
-            String    newPath = (String) req.get("rootPath");
+            Map<?, ?> req = readJson(ex);
 
-            if (newPath == null || newPath.isBlank()) {
-                sendError(ex, 400, "rootPath is required");
+            // Accept either {"rootPaths": ["...", "..."]} (preferred, multi-root)
+            // or {"rootPath": "..."} (legacy, single).
+            Object       rootPathsRaw = req.get("rootPaths");
+            String       singlePath   = (String) req.get("rootPath");
+            List<String> cleaned      = new ArrayList<>();
+
+            if (rootPathsRaw instanceof List<?> list) {
+                for (Object o : list) {
+                    if (o instanceof String s && !s.isBlank()) {
+                        cleaned.add(s.trim());
+                    }
+                }
+            } else if (singlePath != null && !singlePath.isBlank()) {
+                cleaned.add(singlePath.trim());
+            }
+
+            if (cleaned.isEmpty()) {
+                sendError(ex, 400, "rootPath or rootPaths is required");
                 return;
             }
 
-            updateConfigRootPath(newPath.trim());
+            updateConfigRootPaths(cleaned);
 
-            // Reload config so safeRootPath() and future status calls reflect the new path
+            // Reload config so future status calls reflect the new paths
             this.config = AppConfig.load();
             // Reset QueryEngine so it re-initialises with the updated config on next query
             this.queryEngine = null;
 
-            sendJson(ex, 200, map("updated", true, "rootPath", newPath.trim()));
+            sendJson(ex, 200, map(
+                "updated",   true,
+                "rootPath",  cleaned.get(0),
+                "rootPaths", cleaned
+            ));
         } catch (Exception e) {
             log.error("Config update failed", e);
             sendError(ex, 500, e.getMessage());
@@ -283,15 +308,27 @@ public final class ApiServer {
         return queryEngine;
     }
 
-    private String safeRootPath() {
+    private List<String> safeRootPaths() {
         try {
-            return config.getFilesRootPath().toAbsolutePath().toString();
+            List<String> result = new ArrayList<>();
+            for (Path p : config.getFilesRootPaths()) {
+                result.add(p.toAbsolutePath().toString());
+            }
+            return result;
         } catch (Exception e) {
-            return "";
+            return List.of();
         }
     }
 
-    private void updateConfigRootPath(String newPath) throws IOException {
+    /**
+     * Persists the configured roots to {@code config.properties}.
+     *
+     * For a single path we write the legacy {@code files.root.path} key (so older
+     * builds of the CLI can still read it) and remove any stale multi-key.
+     * For multiple paths we write {@code files.root.paths} as a comma-separated
+     * list and remove the legacy single key to keep the file unambiguous.
+     */
+    private void updateConfigRootPaths(List<String> newPaths) throws IOException {
         Path configFile = Paths.get("config.properties");
         Properties props = new Properties();
         if (Files.exists(configFile)) {
@@ -299,7 +336,13 @@ public final class ApiServer {
                 props.load(in);
             }
         }
-        props.setProperty("files.root.path", newPath);
+        if (newPaths.size() == 1) {
+            props.setProperty("files.root.path", newPaths.get(0));
+            props.remove("files.root.paths");
+        } else {
+            props.setProperty("files.root.paths", String.join(",", newPaths));
+            props.remove("files.root.path");
+        }
         try (OutputStream out = Files.newOutputStream(configFile)) {
             props.store(out, "ShelfBot configuration — updated by UI");
         }

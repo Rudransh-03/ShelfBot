@@ -1,4 +1,24 @@
 import BookshelfIcon from './BookshelfIcon'
+import { useApp } from '../context/AppContext'
+
+const RescanIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <polyline points="23 4 23 10 17 10"/>
+    <polyline points="1 20 1 14 7 14"/>
+    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+  </svg>
+)
+
+function fmtAge(iso) {
+  if (!iso) return 'Never'
+  try {
+    const sec = (Date.now() - new Date(iso)) / 1000
+    if (sec < 60)    return 'just now'
+    if (sec < 3600)  return `${Math.floor(sec / 60)}m ago`
+    if (sec < 86400) return `${Math.floor(sec / 3600)}h ago`
+    return new Date(iso).toLocaleDateString()
+  } catch { return iso }
+}
 
 const ITEMS = [
   {
@@ -33,6 +53,22 @@ const ITEMS = [
 ]
 
 export default function Sidebar({ active, onNav, connected }) {
+  const { stats, indexing, triggerIndex } = useApp()
+
+  // What the badge says:
+  //   • during a job  → "Indexing…" (live)
+  //   • after a job   → "X minutes ago" based on /api/status lastIndexed
+  //   • before any job → "Never"
+  const syncedLabel = indexing
+    ? 'Indexing…'
+    : fmtAge(stats?.lastIndexed)
+
+  const syncedTooltip = indexing
+    ? 'A re-index is currently running'
+    : stats?.lastIndexed
+      ? `Last synced: ${new Date(stats.lastIndexed).toLocaleString()}\nClick the refresh icon to re-index now.`
+      : 'Files have not been indexed yet. Click the refresh icon to start.'
+
   return (
     <nav className="sidebar">
       <div className="sb-brand">
@@ -56,6 +92,26 @@ export default function Sidebar({ active, onNav, connected }) {
       ))}
 
       <div className="nav-spacer" />
+
+      <div className="sb-sync-row" title={syncedTooltip}>
+        <div className={`sb-sync-icon${indexing ? ' busy' : ''}`}>
+          <RescanIcon />
+        </div>
+        <div className="sb-sync-text">
+          <div className="sb-status-sublabel">Synced</div>
+          <div className="sb-sync-label">{syncedLabel}</div>
+        </div>
+        <button
+          type="button"
+          className="sb-sync-btn"
+          onClick={triggerIndex}
+          disabled={!connected || indexing}
+          title="Re-index now"
+          aria-label="Re-index now"
+        >
+          <RescanIcon />
+        </button>
+      </div>
 
       <div className="sb-status-row" title={connected ? 'Backend connected' : 'Backend offline'}>
         <div className={`sb-status-dot${connected ? ' on' : ' err'}`} />

@@ -20,5 +20,15 @@ export class ApiClient {
   query(q)          { return this._r('/api/query', { method: 'POST', body: JSON.stringify({ question: q }) }) }
   clearConvo()      { return this._r('/api/conversation', { method: 'DELETE' }) }
   getConfig()       { return this._r('/api/config') }
-  saveConfig(rp)    { return this._r('/api/config', { method: 'POST', body: JSON.stringify({ rootPath: rp }) }) }
+  /**
+   * Persists the indexed roots.
+   * Accepts either a single string (legacy) or an array of strings (multi-root).
+   * The backend understands both shapes.
+   */
+  saveConfig(paths) {
+    const body = Array.isArray(paths)
+      ? { rootPaths: paths }
+      : { rootPath:  paths }
+    return this._r('/api/config', { method: 'POST', body: JSON.stringify(body) })
+  }
 }

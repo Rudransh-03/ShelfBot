@@ -29,37 +29,70 @@ const SaveIcon = () => (
     <polyline points="7 3 7 8 15 8"/>
   </svg>
 )
+const PlusIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <line x1="12" y1="5" x2="12" y2="19"/>
+    <line x1="5" y1="12" x2="19" y2="12"/>
+  </svg>
+)
+const CloseIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <line x1="18" y1="6" x2="6" y2="18"/>
+    <line x1="6" y1="6" x2="18" y2="18"/>
+  </svg>
+)
 
 export default function Settings({ active }) {
   const { api, connected, apiBase, toast } = useApp()
-  const [rootPath,  setRootPath]  = useState('')
+  const [rootPaths, setRootPaths] = useState([])
   const [chromaUrl, setChromaUrl] = useState('—')
+  const [dirty,     setDirty]     = useState(false)
 
   useEffect(() => {
     if (!active || !connected || !api) return
     api.getConfig()
       .then(cfg => {
-        setRootPath(cfg.rootPath  ?? '')
+        // Prefer the new array field; fall back to the legacy single field.
+        const paths = Array.isArray(cfg.rootPaths) && cfg.rootPaths.length
+          ? cfg.rootPaths
+          : (cfg.rootPath ? [cfg.rootPath] : [])
+        setRootPaths(paths)
         setChromaUrl(cfg.chromaUrl ?? '—')
+        setDirty(false)
       })
       .catch(() => {})
   }, [active, connected, api])
 
-  const browse = async () => {
+  const addFolder = async () => {
     const E = window.electron
-    if (E?.selectFolder) {
-      const p = await E.selectFolder()
-      if (p) setRootPath(p)
-    } else {
+    if (!E?.selectFolder) {
       toast('Folder picker only available in the desktop app', 'i')
+      return
     }
+    const p = await E.selectFolder()
+    if (!p) return
+    if (rootPaths.includes(p)) {
+      toast('That folder is already added', 'i')
+      return
+    }
+    setRootPaths([...rootPaths, p])
+    setDirty(true)
   }
 
-  const savePath = async () => {
-    if (!rootPath.trim()) { toast('Please enter a path', 'e'); return }
+  const removeFolder = (path) => {
+    setRootPaths(rootPaths.filter(p => p !== path))
+    setDirty(true)
+  }
+
+  const savePaths = async () => {
+    if (rootPaths.length === 0) {
+      toast('Add at least one folder before saving', 'e')
+      return
+    }
     try {
-      await api.saveConfig(rootPath.trim())
-      toast('Path saved — remember to re-index!', 's')
+      await api.saveConfig(rootPaths)
+      setDirty(false)
+      toast('Folders saved — remember to re-index!', 's')
     } catch (e) {
       toast(e.message, 'e')
     }
@@ -78,34 +111,56 @@ export default function Settings({ active }) {
       <div className="view-divider" />
 
       <div className="settings-body">
-        {/* Root path */}
+        {/* Indexed folders */}
         <div className="scard">
-          <div className="scard-title">Documents folder</div>
+          <div className="scard-title">Indexed folders</div>
           <div className="scard-sub">
             ShelfBot recursively indexes all supported files
-            (PDF, DOCX, TXT, MD, XLSX, …) inside this folder.
+            (PDF, DOCX, TXT, MD, XLSX, …) inside every folder listed below.
+            Add as many as you need — your Desktop, Downloads, Documents, project folders, anything.
           </div>
 
           <div className="form-group">
-            <label className="form-lbl">Root path</label>
-            <div className="row-with-btn">
-              <input
-                className="txt-input"
-                type="text"
-                placeholder="/path/to/your/documents"
-                value={rootPath}
-                onChange={e => setRootPath(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && savePath()}
-              />
-              <button className="browse-btn" onClick={browse}>
-                <FolderIcon />
-                Browse
-              </button>
-            </div>
+            <label className="form-lbl">
+              Folders ({rootPaths.length})
+            </label>
+
+            {rootPaths.length === 0 ? (
+              <div className="paths-empty">
+                No folders added yet. Click <em>Add folder</em> to choose one.
+              </div>
+            ) : (
+              <ul className="paths-list">
+                {rootPaths.map(path => (
+                  <li className="path-row" key={path}>
+                    <FolderIcon />
+                    <span className="path-row-text" title={path}>{path}</span>
+                    <button
+                      className="path-remove-btn"
+                      onClick={() => removeFolder(path)}
+                      title="Remove this folder"
+                      aria-label={`Remove ${path}`}
+                    >
+                      <CloseIcon />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+
+            <button className="browse-btn add-folder-btn" onClick={addFolder}>
+              <PlusIcon />
+              Add folder
+            </button>
           </div>
-          <button className="btn-primary" onClick={savePath} disabled={!connected}>
+
+          <button
+            className="btn-primary"
+            onClick={savePaths}
+            disabled={!connected || !dirty || rootPaths.length === 0}
+          >
             <SaveIcon />
-            Save Path
+            {dirty ? 'Save changes' : 'Saved'}
           </button>
         </div>
 

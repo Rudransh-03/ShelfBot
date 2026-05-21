@@ -60,7 +60,10 @@ public final class IngestionPipeline {
     public IngestionResult run() {
         long startMs = System.currentTimeMillis();
         log.info("═══ Ingestion Pipeline ═══");
-        log.info("Root: {}", config.getFilesRootPath().toAbsolutePath());
+        log.info("Roots:");
+        for (Path root : config.getFilesRootPaths()) {
+            log.info("  • {}", root.toAbsolutePath());
+        }
 
         chromaClient.ensureCollection();
 

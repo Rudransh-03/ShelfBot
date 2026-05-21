@@ -27,6 +27,26 @@ public final class FileScanner {
 
     private static final Logger log = LoggerFactory.getLogger(FileScanner.class);
 
+    // Directory names that should never be indexed regardless of where they appear.
+    // Hidden directories (anything starting with ".") are skipped separately, so
+    // entries like ".git", ".venv", ".cache", ".next" do not need to be listed here.
+    private static final Set<String> SKIP_DIRECTORIES = Set.of(
+            "node_modules",
+            "target",          // Maven build output
+            "build",           // Gradle / generic build output
+            "dist",            // JS/TS bundler output
+            "out",             // various build outputs (Next.js, IntelliJ, etc.)
+            "bin",             // compiled binaries / build output
+            "obj",             // .NET intermediate output
+            "venv",            // Python virtualenv (un-dotted form)
+            "__pycache__",     // Python bytecode cache
+            "vendor",          // Composer / Go vendored deps
+            "Pods",            // CocoaPods
+            "bower_components",// legacy JS deps
+            "coverage",        // test coverage output
+            "Library"          // macOS user library cache (huge, never user-authored)
+    );
+
     private final AppConfig config;
     private final IndexMetadataStore metadataStore;
     private final Set<String> supportedExtensions;
@@ -38,8 +58,11 @@ public final class FileScanner {
     }
 
     public ScanResult scan() {
-        Path root = config.getFilesRootPath();
-        log.info("Starting file scan: {}", root.toAbsolutePath());
+        List<Path> roots = config.getFilesRootPaths();
+        log.info("Starting file scan across {} root(s):", roots.size());
+        for (Path root : roots) {
+            log.info("  • {}", root.toAbsolutePath());
+        }
 
         List<Path> toProcess   = new ArrayList<>();
         List<Path> skipped     = new ArrayList<>();
@@ -47,34 +70,40 @@ public final class FileScanner {
         List<Path> unsupported = new ArrayList<>();
         List<Path> errors      = new ArrayList<>();
 
-        try {
-            Files.walkFileTree(root, new SimpleFileVisitor<>() {
+        for (Path root : roots) {
+            try {
+                Files.walkFileTree(root, new SimpleFileVisitor<>() {
 
-                @Override
-                public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
-                    String dirName = dir.getFileName().toString();
-                    if (dirName.startsWith(".") || dirName.equals("node_modules")) {
-                        log.debug("Skipping hidden/system directory: {}", dir);
-                        return FileVisitResult.SKIP_SUBTREE;
+                    @Override
+                    public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                        String dirName = dir.getFileName().toString();
+                        if (dirName.startsWith(".") || SKIP_DIRECTORIES.contains(dirName)) {
+                            log.debug("Skipping hidden/system directory: {}", dir);
+                            return FileVisitResult.SKIP_SUBTREE;
+                        }
+                        return FileVisitResult.CONTINUE;
                     }
-                    return FileVisitResult.CONTINUE;
-                }
 
-                @Override
-                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
-                    processFile(file, attrs, toProcess, skipped, tooLarge, unsupported, errors);
-                    return FileVisitResult.CONTINUE;
-                }
+                    @Override
+                    public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                        processFile(file, attrs, toProcess, skipped, tooLarge, unsupported, errors);
+                        return FileVisitResult.CONTINUE;
+                    }
 
-                @Override
-                public FileVisitResult visitFileFailed(Path file, IOException exc) {
-                    log.warn("Cannot access file (permission denied?): {} — {}", file, exc.getMessage());
-                    errors.add(file);
-                    return FileVisitResult.CONTINUE;
-                }
-            });
-        } catch (IOException e) {
-            throw new ScanException("Fatal error walking directory: " + root, e);
+                    @Override
+                    public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                        log.warn("Cannot access file (permission denied?): {} — {}", file, exc.getMessage());
+                        errors.add(file);
+                        return FileVisitResult.CONTINUE;
+                    }
+                });
+            } catch (IOException e) {
+                // One unreadable root shouldn't abort the whole scan — log and continue.
+                // This is important for the desktop app where Desktop/Downloads/Documents
+                // each have independent permission grants on macOS.
+                log.error("Failed to walk root '{}': {}", root.toAbsolutePath(), e.getMessage());
+                errors.add(root);
+            }
         }
 
         log.info("Scan complete — to process: {}, skipped: {}, too large: {}, unsupported: {}, errors: {}",
@@ -162,6 +191,11 @@ public final class FileScanner {
         }
     }
 
+    /**
+     * @deprecated retained only for binary compatibility — current scan() logs and continues
+     * instead of throwing, so this is no longer raised. New code should not catch it.
+     */
+    @Deprecated
     public static class ScanException extends RuntimeException {
         public ScanException(String message, Throwable cause) { super(message, cause); }
     }

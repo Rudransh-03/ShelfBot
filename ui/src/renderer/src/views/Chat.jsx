@@ -58,7 +58,41 @@ function UserAvatar() {
   )
 }
 
-function Message({ role, text, sources = [], variant }) {
+function SourceChip({ source, onOpen }) {
+  // Backend now returns objects { fileName, absolutePath, snippets }.
+  // We still accept plain strings so older messages / fallback shapes don't break.
+  const isString = typeof source === 'string'
+  const fileName = isString ? source : source.fileName
+  const absPath  = isString ? null   : source.absolutePath
+  const snippets = isString ? []     : (source.snippets ?? [])
+
+  const clickable = Boolean(absPath)
+  const handleClick = () => { if (clickable) onOpen(absPath, fileName) }
+
+  return (
+    <span className={`src-chip-wrap${snippets.length ? ' has-preview' : ''}`}>
+      <button
+        type="button"
+        className={`src-chip${clickable ? ' clickable' : ''}`}
+        onClick={handleClick}
+        disabled={!clickable}
+        title={clickable ? `Open ${fileName}` : fileName}
+      >
+        {fileName}
+      </button>
+      {snippets.length > 0 && (
+        <span className="src-preview" role="tooltip">
+          <span className="src-preview-head">From {fileName}</span>
+          {snippets.map((s, i) => (
+            <span className="src-preview-snippet" key={i}>“{s}”</span>
+          ))}
+        </span>
+      )}
+    </span>
+  )
+}
+
+function Message({ role, text, sources = [], variant, onOpenSource }) {
   return (
     <div className={`msg-row ${role}`}>
       {role === 'ai' ? <AiAvatar /> : <UserAvatar />}
@@ -66,7 +100,13 @@ function Message({ role, text, sources = [], variant }) {
         <div className={`msg-bubble${variant ? ` ${variant}` : ''}`}>{text}</div>
         {sources.length > 0 && (
           <div className="msg-sources">
-            {sources.map(s => <span key={s} className="src-chip">{s}</span>)}
+            {sources.map((s, i) => (
+              <SourceChip
+                key={(typeof s === 'string' ? s : s.absolutePath || s.fileName) + ':' + i}
+                source={s}
+                onOpen={onOpenSource}
+              />
+            ))}
           </div>
         )}
       </div>
@@ -140,6 +180,16 @@ export default function Chat({ active }) {
     }
   }
 
+  const openSource = useCallback(async (absolutePath, fileName) => {
+    const E = window.electron
+    if (!E?.openPath) {
+      toast('Opening files is only supported in the desktop app', 'i')
+      return
+    }
+    const err = await E.openPath(absolutePath)
+    if (err) toast(`Couldn't open ${fileName}: ${err}`, 'e')
+  }, [toast])
+
   const hasMessages = messages.length > 0 || loading
 
   return (
@@ -194,7 +244,14 @@ export default function Chat({ active }) {
       ) : (
         <div className="messages" ref={msgsRef}>
           {messages.map((m, i) => (
-            <Message key={i} role={m.role} text={m.text} sources={m.sources} variant={m.variant} />
+            <Message
+              key={i}
+              role={m.role}
+              text={m.text}
+              sources={m.sources}
+              variant={m.variant}
+              onOpenSource={openSource}
+            />
           ))}
           {loading && <TypingIndicator />}
         </div>

@@ -155,6 +155,15 @@ ipcMain.handle('select-folder', async () => {
   return r.canceled ? null : r.filePaths[0]
 })
 
+// Opens a source file in the user's default app (Preview, Word, …).
+// shell.openPath returns an empty string on success and an error message on failure.
+ipcMain.handle('open-path', async (_event, filePath) => {
+  if (!filePath || typeof filePath !== 'string') return 'No path provided'
+  if (!existsSync(filePath)) return 'File no longer exists at: ' + filePath
+  const err = await shell.openPath(filePath)
+  return err || ''
+})
+
 ipcMain.on('window-minimize', () => mainWindow?.minimize())
 ipcMain.on('window-maximize', () =>
   mainWindow?.isMaximized() ? mainWindow.unmaximize() : mainWindow?.maximize()

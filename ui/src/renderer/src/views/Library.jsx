@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useEffect } from 'react'
 import { useApp } from '../context/AppContext'
 
 function fmt(n) {
@@ -73,56 +73,21 @@ const XIcon = () => (
 )
 
 export default function Library({ active, onGoSettings }) {
-  const { api, connected, toast } = useApp()
+  const {
+    connected,
+    stats,
+    indexing,
+    lastJob: result,
+    loadStats,
+    triggerIndex: handleIndex,
+  } = useApp()
 
-  const [stats,    setStats]    = useState(null)
-  const [indexing, setIndexing] = useState(false)
-  const [result,   setResult]   = useState(null)
-  const [pollTmr,  setPollTmr]  = useState(null)
-
-  const loadStats = useCallback(async () => {
-    if (!connected || !api) return
-    try {
-      const d = await api.status()
-      setStats(d)
-    } catch {}
-  }, [api, connected])
-
+  // Refresh stats whenever Library becomes the active view — gives the user
+  // an immediate, up-to-date snapshot the moment they click into it,
+  // independent of the slow background poll.
   useEffect(() => {
-    if (active) loadStats()
-  }, [active, loadStats])
-
-  const startPolling = useCallback(() => {
-    const t = setInterval(async () => {
-      try {
-        const s = await api.pollIndex()
-        if (!s.running) {
-          clearInterval(t)
-          setIndexing(false)
-          if (s.result)  { setResult({ ok: true,  data: s.result }); loadStats(); toast('Indexing complete!', 's') }
-          if (s.error)   { setResult({ ok: false, msg:  s.error  }); toast('Indexing failed', 'e') }
-        }
-      } catch {
-        clearInterval(t)
-        setIndexing(false)
-      }
-    }, 2200)
-    setPollTmr(t)
-  }, [api, loadStats, toast])
-
-  useEffect(() => () => clearInterval(pollTmr), [pollTmr])
-
-  const handleIndex = async () => {
-    try {
-      setResult(null)
-      await api.startIndex()
-      setIndexing(true)
-      toast('Indexing started…', 'i')
-      startPolling()
-    } catch (e) {
-      toast(e.message, 'e')
-    }
-  }
+    if (active && connected) loadStats()
+  }, [active, connected, loadStats])
 
   return (
     <div className={`view${active ? ' active' : ''}`} id="view-lib">
@@ -168,10 +133,29 @@ export default function Library({ active, onGoSettings }) {
             </span>
           </div>
 
-          <div className="path-display">
-            <FolderIcon />
-            <span>{stats?.rootPath || 'No folder configured — go to Settings'}</span>
-          </div>
+          {(() => {
+            const paths = Array.isArray(stats?.rootPaths) && stats.rootPaths.length
+              ? stats.rootPaths
+              : (stats?.rootPath ? [stats.rootPath] : [])
+            if (paths.length === 0) {
+              return (
+                <div className="path-display">
+                  <FolderIcon />
+                  <span>No folders configured — go to Settings</span>
+                </div>
+              )
+            }
+            return (
+              <div className="paths-display">
+                {paths.map(p => (
+                  <div className="path-display path-display-item" key={p} title={p}>
+                    <FolderIcon />
+                    <span>{p}</span>
+                  </div>
+                ))}
+              </div>
+            )
+          })()}
 
           <div className="index-actions">
             <button className="btn-primary" onClick={handleIndex} disabled={indexing || !connected}>

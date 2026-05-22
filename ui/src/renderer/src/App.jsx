@@ -4,6 +4,8 @@ import TitleBar       from './components/TitleBar'
 import Sidebar        from './components/Sidebar'
 import LoadingOverlay from './components/LoadingOverlay'
 import ToastContainer from './components/Toast'
+import UpdateBanner   from './components/UpdateBanner'
+import WelcomeModal   from './components/WelcomeModal'
 import Chat           from './views/Chat'
 import Library        from './views/Library'
 import Settings       from './views/Settings'
@@ -52,6 +54,7 @@ function Shell() {
 
       <div className="app">
         <TitleBar connected={connected} />
+        <UpdateBanner />
         <div className="main-area">
           <Sidebar
             active={view}
@@ -67,6 +70,7 @@ function Shell() {
       </div>
 
       <ToastContainer />
+      <WelcomeModal />
     </>
   )
 }

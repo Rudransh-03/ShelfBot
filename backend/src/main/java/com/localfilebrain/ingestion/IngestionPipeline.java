@@ -5,7 +5,7 @@ import com.localfilebrain.embedding.OpenAIEmbeddingClient;
 import com.localfilebrain.model.DocumentChunk;
 import com.localfilebrain.model.FileRecord;
 import com.localfilebrain.model.IngestionResult;
-import com.localfilebrain.storage.ChromaDBClient;
+import com.localfilebrain.storage.VectorStore;
 import com.localfilebrain.util.FileHashUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -22,11 +22,11 @@ import java.util.List;
  * Full ingestion pipeline: Scan → Extract → Chunk → Embed → Store.
  *
  * Per file:
- *   1. TextExtractor   → plain text
- *   2. TextChunker     → List<DocumentChunk>
- *   3. Delete old chunks from ChromaDB (handles file shrinking)
- *   4. OpenAIEmbeddingClient → List<float[]>
- *   5. ChromaDBClient.upsert → store text + vector + metadata
+ *   1. TextExtractor          → plain text
+ *   2. TextChunker            → List&lt;DocumentChunk&gt;
+ *   3. VectorStore.deleteBySourceFile → drop old chunks (handles file shrinking)
+ *   4. OpenAIEmbeddingClient  → List&lt;float[]&gt;
+ *   5. VectorStore.upsert     → store text + vector + metadata in Lucene HNSW
  *   6. IndexMetadataStore.upsert → mark file as INDEXED
  */
 public final class IngestionPipeline {
@@ -59,9 +59,20 @@ public final class IngestionPipeline {
     private final TextExtractor         textExtractor;
     private final TextChunker           textChunker;
     private final OpenAIEmbeddingClient embeddingClient;
-    private final ChromaDBClient        chromaClient;
+    private final VectorStore           vectorStore;
+    private final boolean               ownsVectorStore;
 
     public IngestionPipeline(AppConfig config, IndexMetadataStore metadataStore) {
+        this(config, metadataStore, null);
+    }
+
+    /**
+     * Lets callers (Main / ApiServer) inject a shared {@link VectorStore} so
+     * the live FileWatcher, the manual indexing job, and the query path all
+     * write/read through the same Lucene IndexWriter — Lucene only permits
+     * one writer per index directory.
+     */
+    public IngestionPipeline(AppConfig config, IndexMetadataStore metadataStore, VectorStore sharedStore) {
         this.config          = config;
         this.metadataStore   = metadataStore;
         this.fileScanner     = new FileScanner(config, metadataStore);
@@ -71,13 +82,37 @@ public final class IngestionPipeline {
                 config.getOpenAiApiKey(),
                 config.getEmbeddingBatchSize()
         );
-        this.chromaClient = new ChromaDBClient(
-                config.getChromaDbUrl(),
-                config.getChromaDbCollection()
-        );
+        if (sharedStore != null) {
+            this.vectorStore     = sharedStore;
+            this.ownsVectorStore = false;
+        } else {
+            this.vectorStore     = new VectorStore(config.getVectorIndexPath());
+            this.ownsVectorStore = true;
+        }
+    }
+
+    /**
+     * Releases the underlying {@link VectorStore} only if this pipeline
+     * created it (i.e. wasn't passed a shared one). Safe to call multiple
+     * times.
+     */
+    public void close() {
+        if (ownsVectorStore) vectorStore.close();
     }
 
     public IngestionResult run() {
+        return run(ProgressListener.NOOP);
+    }
+
+    /**
+     * Same as {@link #run()} but emits per-file progress events. The listener
+     * is called once before the loop starts (with processed=0) and once after
+     * each file completes — success, failure, or budget skip — so callers can
+     * drive a "X of N · current: foo.pdf" UI without polling internal state.
+     */
+    public IngestionResult run(ProgressListener listener) {
+        if (listener == null) listener = ProgressListener.NOOP;
+
         long startMs = System.currentTimeMillis();
         log.info("═══ Ingestion Pipeline ═══");
         log.info("Roots:");
@@ -85,8 +120,7 @@ public final class IngestionPipeline {
             log.info("  • {}", root.toAbsolutePath());
         }
 
-        chromaClient.ensureCollection();
-
+        // VectorStore is initialised on construction; no separate ensure step.
         FileScanner.ScanResult scan = fileScanner.scan();
         int totalScanned  = scan.totalScanned() + scan.skippedUnsupported().size();
         int skippedCount  = scan.skippedUnchanged().size();
@@ -114,9 +148,21 @@ public final class IngestionPipeline {
                 scan.errors().stream().map(Path::toString).toList()
         );
 
+        // Emit a starting tick so the UI can switch from "indexing…" to
+        // a real progress bar immediately, even before the first file
+        // finishes (large files can take a few seconds each).
+        listener.onProgress(0, toProcess.size(), 0,
+                toProcess.get(0).getFileName().toString());
+
         for (int i = 0; i < toProcess.size(); i++) {
             Path file = toProcess.get(i);
             log.info("[{}/{}] Processing: {}", i + 1, toProcess.size(), file.getFileName());
+
+            // Re-emit before processing so "current file" reflects the file
+            // we're *about* to handle (otherwise a slow file looks like the
+            // previous one is taking forever).
+            listener.onProgress(processedCount, toProcess.size(), failedCount,
+                    file.getFileName().toString());
 
             try {
                 ProcessResult result = processFile(file);
@@ -147,6 +193,10 @@ public final class IngestionPipeline {
                 failedPaths.add(file.toString());
             }
         }
+
+        // Final tick at 100% so the UI can show the completed state cleanly
+        // before the result card replaces the progress bar.
+        listener.onProgress(processedCount, toProcess.size(), failedCount, null);
 
         long duration = System.currentTimeMillis() - startMs;
 
@@ -226,7 +276,7 @@ public final class IngestionPipeline {
     public void removeFile(Path file) {
         String absolutePath = file.toAbsolutePath().toString();
         try {
-            chromaClient.deleteBySourceFile(absolutePath);
+            vectorStore.deleteBySourceFile(absolutePath);
             metadataStore.delete(absolutePath);
             log.info("[watcher] removed '{}' from index", file.getFileName());
         } catch (Exception e) {
@@ -253,12 +303,12 @@ public final class IngestionPipeline {
                 extraction.text(), file, extraction.mimeType(), lastModifiedMs);
         if (chunks.isEmpty()) return null;
 
-        chromaClient.deleteBySourceFile(absolutePath);
+        vectorStore.deleteBySourceFile(absolutePath);
 
         List<String>  texts      = chunks.stream().map(DocumentChunk::getText).toList();
         List<float[]> embeddings = embeddingClient.embedBatch(texts);
 
-        chromaClient.upsert(chunks, embeddings);
+        vectorStore.upsert(chunks, embeddings);
 
         // Use the actual chunked text length for storage — slightly more
         // accurate than the pre-chunk estimate (the chunker may trim
@@ -305,6 +355,17 @@ public final class IngestionPipeline {
 
     public static class BudgetExceededException extends RuntimeException {
         public BudgetExceededException(String message) { super(message); }
+    }
+
+    /**
+     * Receives per-file progress events during a full {@link #run(ProgressListener)}.
+     * Called from the indexing thread — implementations must be cheap and
+     * non-blocking (storing to an AtomicReference is the expected pattern).
+     */
+    @FunctionalInterface
+    public interface ProgressListener {
+        void onProgress(int processed, int total, int failed, String currentFile);
+        ProgressListener NOOP = (p, t, f, c) -> {};
     }
 
     private void recordSuccess(Path file, int chunkCount, long tokenCount) {

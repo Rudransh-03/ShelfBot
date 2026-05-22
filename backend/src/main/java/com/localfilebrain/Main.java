@@ -6,6 +6,7 @@ import com.localfilebrain.ingestion.FileWatcher;
 import com.localfilebrain.ingestion.IndexMetadataStore;
 import com.localfilebrain.ingestion.IngestionPipeline;
 import com.localfilebrain.query.QueryEngine;
+import com.localfilebrain.storage.VectorStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -28,6 +29,19 @@ public final class Main {
     private static final String WHITE   = "\u001B[97m";
 
     private static QueryEngine queryEngine;
+    // Lazily-created shared vector store for CLI mode. The Electron-driven
+    // server mode owns its own; this one only exists for the interactive menu.
+    private static VectorStore cliVectorStore;
+
+    private static synchronized VectorStore cliVectorStore(AppConfig config) {
+        if (cliVectorStore == null) {
+            cliVectorStore = new VectorStore(config.getVectorIndexPath());
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                if (cliVectorStore != null) cliVectorStore.close();
+            }));
+        }
+        return cliVectorStore;
+    }
 
     public static void main(String[] args) throws InterruptedException {
         // ── Server mode ──────────────────────────────────────────────────────
@@ -92,18 +106,31 @@ public final class Main {
             metadataStore = new IndexMetadataStore(Paths.get("shelfbot-metadata.db"));
         }
 
+        // Single, shared Lucene index. Owned by Main for the lifetime of the
+        // server. Every consumer (ApiServer's DELETE handler, QueryEngine,
+        // IngestionPipeline used by the watcher + manual jobs) is wired to
+        // this same instance because Lucene only allows one writer per dir.
+        final VectorStore vectorStore = new VectorStore(config.getVectorIndexPath());
+
+        // Self-heal the metadata/vector-store drift case: if the metadata DB
+        // claims files are indexed but the vector store is actually empty
+        // (e.g. the user deleted the index dir, a migration recreated it,
+        // or storage paths got moved), wipe the stale "INDEXED" rows so the
+        // next scan re-processes everything instead of skipping.
+        resetMetadataIfDrifted(metadataStore, vectorStore);
+
         // QueryEngine requires a valid OpenAI key; it may not be set yet —
         // ApiServer initialises it lazily on the first query request.
         QueryEngine queryEngine = null;
         try {
-            queryEngine = new QueryEngine(config);
+            queryEngine = new QueryEngine(config, vectorStore);
         } catch (Exception e) {
             log.warn("QueryEngine not ready ({}). It will be initialised on first query.", e.getMessage());
         }
 
         final IndexMetadataStore finalStore = metadataStore;
         try {
-            ApiServer server = new ApiServer(port, config, finalStore, queryEngine);
+            ApiServer server = new ApiServer(port, config, finalStore, vectorStore, queryEngine);
             server.start();
 
             // Signal to Electron that the server is ready (read from stdout)
@@ -114,11 +141,15 @@ public final class Main {
             // files. Requires a working OpenAI key (for re-embedding changed
             // files); if absent, we skip the watcher and the user can still
             // re-index manually after configuring the key in Settings.
-            final FileWatcher watcher = tryStartWatcher(config, finalStore);
+            final FileWatcher watcher = tryStartWatcher(config, finalStore, vectorStore);
 
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 if (watcher != null) watcher.close();
                 server.stop();
+                // Close the shared store before the metadata DB so any final
+                // commit lands before we tear down dependencies it doesn't
+                // actually have, but ordering here is defensive anyway.
+                vectorStore.close();
                 finalStore.close();
             }));
 
@@ -137,9 +168,9 @@ public final class Main {
      * failure is logged and swallowed — the API server still runs, and
      * the user can re-index manually via the UI.
      */
-    private static FileWatcher tryStartWatcher(AppConfig config, IndexMetadataStore store) {
+    private static FileWatcher tryStartWatcher(AppConfig config, IndexMetadataStore store, VectorStore vectorStore) {
         try {
-            IngestionPipeline pipeline = new IngestionPipeline(config, store);
+            IngestionPipeline pipeline = new IngestionPipeline(config, store, vectorStore);
             FileWatcher watcher = new FileWatcher(config, pipeline);
             watcher.start();
             return watcher;
@@ -188,8 +219,25 @@ public final class Main {
         System.out.println();
         AppConfig config = AppConfig.load();
         try (IndexMetadataStore metadataStore = new IndexMetadataStore(config.getMetadataDbPath())) {
-            IngestionPipeline pipeline = new IngestionPipeline(config, metadataStore);
+            VectorStore vec = cliVectorStore(config);
+            resetMetadataIfDrifted(metadataStore, vec);
+            IngestionPipeline pipeline = new IngestionPipeline(config, metadataStore, vec);
             pipeline.run();
+        }
+    }
+
+    /**
+     * Detects the "metadata says indexed, vector store is empty" drift state
+     * and resets the metadata so the next scan re-processes every file.
+     * No-op when the two stores are already consistent.
+     */
+    private static void resetMetadataIfDrifted(IndexMetadataStore meta, VectorStore vec) {
+        int filesIndexed = meta.countIndexed();
+        int vectorChunks = vec.count();
+        if (filesIndexed > 0 && vectorChunks == 0) {
+            log.warn("Drift detected: metadata claims {} indexed files but vector store is empty. "
+                   + "Clearing metadata so files get re-indexed.", filesIndexed);
+            meta.clearAllIndexedRecords();
         }
     }
 
@@ -223,7 +271,7 @@ public final class Main {
         AppConfig config = AppConfig.load();
 
         if (queryEngine == null) {
-            queryEngine = new QueryEngine(config);
+            queryEngine = new QueryEngine(config, cliVectorStore(config));
             System.out.println(DIM + "  Ready  ·  conversation history on (last 5 exchanges)" + RESET);
         }
 

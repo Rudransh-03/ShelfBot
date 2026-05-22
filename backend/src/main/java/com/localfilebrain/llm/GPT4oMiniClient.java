@@ -5,7 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.localfilebrain.query.ConversationHistory;
-import com.localfilebrain.storage.ChromaDBClient;
+import com.localfilebrain.storage.VectorStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -64,7 +64,7 @@ public final class GPT4oMiniClient {
 
     public String answer(
             String question,
-            List<ChromaDBClient.QueryResult.Match> chunks,
+            List<VectorStore.SearchResult> chunks,
             ConversationHistory history
     ) {
         try {
@@ -104,7 +104,7 @@ public final class GPT4oMiniClient {
 
     private ObjectNode buildRequest(
             String question,
-            List<ChromaDBClient.QueryResult.Match> chunks,
+            List<VectorStore.SearchResult> chunks,
             ConversationHistory history
     ) throws Exception {
         ObjectNode body = mapper.createObjectNode();
@@ -124,10 +124,10 @@ public final class GPT4oMiniClient {
         return body;
     }
 
-    private String buildUserMessage(String question, List<ChromaDBClient.QueryResult.Match> chunks) {
+    private String buildUserMessage(String question, List<VectorStore.SearchResult> chunks) {
         StringBuilder sb = new StringBuilder("Here are the relevant excerpts from your documents:\n\n");
         for (int i = 0; i < chunks.size(); i++) {
-            ChromaDBClient.QueryResult.Match chunk = chunks.get(i);
+            VectorStore.SearchResult chunk = chunks.get(i);
             sb.append("--- Excerpt ").append(i + 1)
               .append(" (from: ").append(chunk.fileName()).append(") ---\n")
               .append(chunk.text()).append("\n\n");

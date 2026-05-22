@@ -336,6 +336,24 @@ public final class IndexMetadataStore implements AutoCloseable {
     }
 
     /**
+     * Wipes every row whose status is INDEXED. Used to recover from a drift
+     * state where the metadata DB claims files are indexed but the vector
+     * store has been wiped or is otherwise empty — without this the scanner
+     * would honour the metadata and refuse to re-process anything.
+     *
+     * FAILED rows are preserved so we don't keep retrying known-bad files.
+     */
+    public synchronized int clearAllIndexedRecords() {
+        try (Statement stmt = connection.createStatement()) {
+            int n = stmt.executeUpdate("DELETE FROM file_index WHERE status = 'INDEXED'");
+            log.warn("Cleared {} INDEXED rows from metadata store (drift recovery)", n);
+            return n;
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to clear indexed records", e);
+        }
+    }
+
+    /**
      * Removes a file's record (used when a file is deleted from disk).
      */
     public synchronized void delete(String absolutePath) {

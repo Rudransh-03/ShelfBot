@@ -44,9 +44,9 @@ const CloseIcon = () => (
 
 export default function Settings({ active }) {
   const { api, connected, apiBase, toast } = useApp()
-  const [rootPaths, setRootPaths] = useState([])
-  const [chromaUrl, setChromaUrl] = useState('—')
-  const [dirty,     setDirty]     = useState(false)
+  const [rootPaths,       setRootPaths]       = useState([])
+  const [vectorIndexPath, setVectorIndexPath] = useState('—')
+  const [dirty,           setDirty]           = useState(false)
 
   useEffect(() => {
     if (!active || !connected || !api) return
@@ -57,7 +57,7 @@ export default function Settings({ active }) {
           ? cfg.rootPaths
           : (cfg.rootPath ? [cfg.rootPath] : [])
         setRootPaths(paths)
-        setChromaUrl(cfg.chromaUrl ?? '—')
+        setVectorIndexPath(cfg.vectorIndexPath ?? '—')
         setDirty(false)
       })
       .catch(() => {})
@@ -184,11 +184,11 @@ export default function Settings({ active }) {
             <div className="svc-row">
               <span className="svc-name">
                 <DatabaseIcon />
-                ChromaDB
+                Vector index
               </span>
-              <span className="svc-val">
-                <span className="dot a" />
-                {chromaUrl}
+              <span className="svc-val" title={vectorIndexPath}>
+                <span className="dot g" />
+                Embedded · {vectorIndexPath}
               </span>
             </div>
           </div>

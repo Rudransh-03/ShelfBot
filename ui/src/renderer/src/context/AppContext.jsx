@@ -20,6 +20,7 @@ export function AppProvider({ children }) {
   const [stats,    setStats]    = useState(null)
   const [indexing, setIndexing] = useState(false)
   const [lastJob,  setLastJob]  = useState(null) // { ok, data?, msg? }
+  const [progress, setProgress] = useState(null) // { processed, total, failed, currentFile }
 
   const busyTimer = useRef(null)
   const idleTimer = useRef(null)
@@ -52,10 +53,13 @@ export function AppProvider({ children }) {
       if (!api) return
       try {
         const s = await api.pollIndex()
+        // Surface per-file progress every tick so the bar moves smoothly.
+        setProgress(s.progress ?? null)
         if (!s.running) {
           clearInterval(busyTimer.current)
           busyTimer.current = null
           setIndexing(false)
+          setProgress(null)
           if (s.result) { setLastJob({ ok: true,  data: s.result }); toast('Indexing complete', 's') }
           if (s.error)  { setLastJob({ ok: false, msg:  s.error  }); toast('Indexing failed', 'e') }
           loadStats()
@@ -64,6 +68,7 @@ export function AppProvider({ children }) {
         clearInterval(busyTimer.current)
         busyTimer.current = null
         setIndexing(false)
+        setProgress(null)
       }
     }, BUSY_POLL_MS)
   }, [api, loadStats, toast])
@@ -104,7 +109,7 @@ export function AppProvider({ children }) {
       api, apiBase, setApiBase,
       connected, setConnected,
       toast, toasts,
-      stats, indexing, lastJob,
+      stats, indexing, progress, lastJob,
       loadStats, triggerIndex,
     }}>
       {children}

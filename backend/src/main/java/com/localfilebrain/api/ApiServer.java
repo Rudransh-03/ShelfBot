@@ -7,7 +7,7 @@ import com.localfilebrain.ingestion.IngestionPipeline;
 import com.localfilebrain.model.FileRecord;
 import com.localfilebrain.model.IngestionResult;
 import com.localfilebrain.query.QueryEngine;
-import com.localfilebrain.storage.ChromaDBClient;
+import com.localfilebrain.storage.VectorStore;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import org.slf4j.Logger;
@@ -47,14 +47,16 @@ public final class ApiServer {
     private final ObjectMapper       mapper  = new ObjectMapper();
     private volatile AppConfig       config;
     private final IndexMetadataStore metadataStore;
+    private final VectorStore        vectorStore;
 
     // QueryEngine is created lazily so the server still starts even when the
     // OpenAI key is not yet configured.
     private volatile QueryEngine queryEngine;
 
     // ── Indexing job state ────────────────────────────────────────────────────
-    private final AtomicBoolean                  indexingRunning = new AtomicBoolean(false);
-    private final AtomicReference<IndexingStatus> indexingStatus  = new AtomicReference<>(null);
+    private final AtomicBoolean                    indexingRunning = new AtomicBoolean(false);
+    private final AtomicReference<IndexingStatus>  indexingStatus  = new AtomicReference<>(null);
+    private final AtomicReference<IndexingProgress> currentProgress = new AtomicReference<>(null);
     private final ExecutorService                bgExecutor      = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "shelfbot-indexing");
         t.setDaemon(true);
@@ -68,9 +70,11 @@ public final class ApiServer {
     public ApiServer(int port,
                      AppConfig config,
                      IndexMetadataStore metadataStore,
+                     VectorStore vectorStore,
                      QueryEngine queryEngine) throws IOException {
         this.config        = config;
         this.metadataStore = metadataStore;
+        this.vectorStore   = vectorStore;
         this.queryEngine   = queryEngine;   // may be null if config incomplete
 
         this.server = HttpServer.create(new InetSocketAddress("localhost", port), 64);
@@ -127,13 +131,14 @@ public final class ApiServer {
         if (preflight(ex)) return;
         if (!isMethod(ex, "GET")) { methodNotAllowed(ex); return; }
         try {
-            int          indexed     = metadataStore.countIndexed();
-            int          failed      = metadataStore.countFailed();
-            int          totalChunks = metadataStore.getTotalChunks();
-            long         tokensUsed  = metadataStore.sumIndexedTokens();
-            String       lastIndexed = metadataStore.getLastIndexedAt().orElse("");
-            List<String> rootPaths   = safeRootPaths();
-            String       rootPath    = rootPaths.isEmpty() ? "" : rootPaths.get(0);
+            int          indexed      = metadataStore.countIndexed();
+            int          failed       = metadataStore.countFailed();
+            int          totalChunks  = metadataStore.getTotalChunks();
+            long         tokensUsed   = metadataStore.sumIndexedTokens();
+            String       lastIndexed  = metadataStore.getLastIndexedAt().orElse("");
+            List<String> rootPaths    = safeRootPaths();
+            String       rootPath     = rootPaths.isEmpty() ? "" : rootPaths.get(0);
+            List<String> accessIssues = findUnreadableRoots(rootPaths);
 
             sendJson(ex, 200, map(
                 "indexedFiles",       indexed,
@@ -144,7 +149,9 @@ public final class ApiServer {
                 "rootPaths",          rootPaths,
                 "tokensUsed",         tokensUsed,
                 "tokensLimit",        IngestionPipeline.MAX_TOKENS_TOTAL,
-                "tokensLimitPerFile", IngestionPipeline.MAX_TOKENS_PER_FILE
+                "tokensLimitPerFile", IngestionPipeline.MAX_TOKENS_PER_FILE,
+                "accessIssues",       accessIssues,
+                "platform",           System.getProperty("os.name", "").toLowerCase()
             ));
         } catch (Exception e) {
             log.error("status error", e);
@@ -158,11 +165,24 @@ public final class ApiServer {
 
         if (isMethod(ex, "GET")) {
             IndexingStatus s = indexingStatus.get();
+            Map<String, Object> body;
             if (s == null) {
-                sendJson(ex, 200, map("running", false, "hasRun", false));
+                body = map("running", false, "hasRun", false);
             } else {
-                sendJson(ex, 200, s.toMap());
+                body = s.toMap();
             }
+            // While a job is running, attach the latest per-file progress
+            // snapshot so the UI can render a real bar without a separate poll.
+            IndexingProgress prog = currentProgress.get();
+            if (prog != null && (s == null || s.running)) {
+                Map<String, Object> p = new LinkedHashMap<>();
+                p.put("processed",   prog.processed);
+                p.put("total",       prog.total);
+                p.put("failed",      prog.failed);
+                p.put("currentFile", prog.currentFile);
+                body.put("progress", p);
+            }
+            sendJson(ex, 200, body);
             return;
         }
 
@@ -174,18 +194,22 @@ public final class ApiServer {
         }
 
         indexingStatus.set(new IndexingStatus(true, null, null));
+        currentProgress.set(null);
 
         bgExecutor.submit(() -> {
             try {
                 AppConfig fresh = AppConfig.load();
-                IngestionPipeline pipeline = new IngestionPipeline(fresh, metadataStore);
-                IngestionResult result = pipeline.run();
+                IngestionPipeline pipeline = new IngestionPipeline(fresh, metadataStore, vectorStore);
+                IngestionResult result = pipeline.run((processed, total, failed, currentFile) ->
+                        currentProgress.set(new IndexingProgress(processed, total, failed, currentFile))
+                );
                 indexingStatus.set(new IndexingStatus(false, result, null));
             } catch (Throwable t) {
                 log.error("Indexing job failed", t);
                 String msg = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
                 indexingStatus.set(new IndexingStatus(false, null, msg));
             } finally {
+                currentProgress.set(null);
                 indexingRunning.set(false);
             }
         });
@@ -246,11 +270,10 @@ public final class ApiServer {
                 List<String> rootPaths = safeRootPaths();
                 String       rootPath  = rootPaths.isEmpty() ? "" : rootPaths.get(0);
                 sendJson(ex, 200, map(
-                    "rootPath",       rootPath,
-                    "rootPaths",      rootPaths,
-                    "chromaUrl",      config.getChromaDbUrl(),
-                    "collection",     config.getChromaDbCollection(),
-                    "metadataDbPath", config.getMetadataDbPath().toString()
+                    "rootPath",        rootPath,
+                    "rootPaths",       rootPaths,
+                    "vectorIndexPath", config.getVectorIndexPath().toAbsolutePath().toString(),
+                    "metadataDbPath",  config.getMetadataDbPath().toAbsolutePath().toString()
                 ));
             } catch (Exception e) {
                 sendError(ex, 500, e.getMessage());
@@ -340,16 +363,13 @@ public final class ApiServer {
                 return;
             }
 
-            // Drop the file's chunks from Chroma first; metadata row last
-            // so that a failure midway leaves the metadata consistent with
-            // what's actually in the vector store.
+            // Drop the file's chunks from the vector store first; metadata
+            // row last so that a failure midway leaves the metadata consistent
+            // with what's actually in the index.
             try {
-                ChromaDBClient chroma = new ChromaDBClient(
-                        config.getChromaDbUrl(),
-                        config.getChromaDbCollection());
-                chroma.deleteBySourceFile(path);
+                vectorStore.deleteBySourceFile(path);
             } catch (Exception e) {
-                log.warn("Chroma delete failed for '{}': {} (continuing to remove metadata)", path, e.getMessage());
+                log.warn("Vector store delete failed for '{}': {} (continuing to remove metadata)", path, e.getMessage());
             }
 
             metadataStore.delete(path);
@@ -371,10 +391,35 @@ public final class ApiServer {
         synchronized (this) {
             if (queryEngine == null) {
                 AppConfig fresh = AppConfig.load();
-                queryEngine = new QueryEngine(fresh);
+                queryEngine = new QueryEngine(fresh, vectorStore);
             }
         }
         return queryEngine;
+    }
+
+    /**
+     * Returns the configured roots that we cannot actually read. This is the
+     * symptom of macOS Full Disk Access being denied for the bundled Java
+     * process (the watcher silently sees nothing, scans return 0 files).
+     * Cheap: opens a directory stream and closes it immediately.
+     */
+    private List<String> findUnreadableRoots(List<String> roots) {
+        List<String> issues = new ArrayList<>();
+        for (String pathStr : roots) {
+            try {
+                Path p = Paths.get(pathStr);
+                if (!Files.isDirectory(p)) {
+                    issues.add(pathStr);
+                    continue;
+                }
+                try (var stream = Files.newDirectoryStream(p)) {
+                    stream.iterator(); // touch it
+                }
+            } catch (Exception e) {
+                issues.add(pathStr);
+            }
+        }
+        return issues;
     }
 
     private List<String> safeRootPaths() {
@@ -468,6 +513,21 @@ public final class ApiServer {
     // ─────────────────────────────────────────────────────────────────────────
     // Indexing job status DTO
     // ─────────────────────────────────────────────────────────────────────────
+
+    /** Snapshot of the in-flight indexing job, streamed via {@code progress} on /api/index GET. */
+    public static final class IndexingProgress {
+        final int processed;
+        final int total;
+        final int failed;
+        final String currentFile;
+
+        IndexingProgress(int processed, int total, int failed, String currentFile) {
+            this.processed   = processed;
+            this.total       = total;
+            this.failed      = failed;
+            this.currentFile = currentFile;
+        }
+    }
 
     public static final class IndexingStatus {
         final boolean       running;

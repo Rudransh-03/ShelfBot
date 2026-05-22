@@ -3,19 +3,58 @@
   "version": "1.0.0",
   "description": "Ask anything. Your files have the answer.",
   "main": "out/main/index.js",
+  "author": "Rudransh Tyagi",
+  "license": "UNLICENSED",
   "scripts": {
-    "dev":   "electron-vite dev",
-    "build": "electron-vite build",
-    "start": "electron-vite preview"
+    "dev":     "electron-vite dev",
+    "build":   "electron-vite build",
+    "start":   "electron-vite preview",
+    "dist":    "electron-vite build && electron-builder",
+    "publish": "electron-vite build && electron-builder --publish always"
   },
   "dependencies": {
-    "react":     "^18.3.1",
-    "react-dom": "^18.3.1"
+    "electron-log":     "^5.1.7",
+    "electron-updater": "^6.3.9",
+    "react":            "^18.3.1",
+    "react-dom":        "^18.3.1"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.1",
     "electron":             "^31.0.0",
+    "electron-builder":     "^25.1.8",
     "electron-vite":        "^2.3.0",
     "vite":                 "^5.4.0"
+  },
+  "build": {
+    "appId": "com.shelfbot.app",
+    "productName": "ShelfBot",
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../backend/target/local-file-brain-1.0.0.jar",
+        "to":   "shelfbot.jar"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target":   ["dmg", "zip"]
+    },
+    "win": {
+      "target": ["nsis"]
+    },
+    "linux": {
+      "target":   ["AppImage"],
+      "category": "Utility"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner":    "Rudransh-03",
+        "repo":     "ShelfBot"
+      }
+    ]
   }
 }

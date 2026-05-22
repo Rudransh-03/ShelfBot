@@ -5,6 +5,38 @@ import { existsSync } from 'fs'
 import { createServer } from 'net'
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Auto-updater
+// ─────────────────────────────────────────────────────────────────────────────
+// We lazy-require so a packaged build without the dep (or `npm install` not
+// yet run in development) doesn't crash the app. The updater is meaningful
+// only for packaged builds — in dev `app.isPackaged` is false and we skip it
+// entirely.
+
+let autoUpdater = null
+try {
+  if (app.isPackaged) {
+    autoUpdater = require('electron-updater').autoUpdater
+    // Don't auto-restart silently. We surface a UI banner and let the user pick.
+    autoUpdater.autoDownload         = true
+    autoUpdater.autoInstallOnAppQuit = true
+
+    // Route updater logs to electron-log so we can diagnose issues from
+    // user reports without needing to ship console output. Lives at the
+    // platform default location (~/Library/Logs/ShelfBot on macOS, etc.).
+    try {
+      const log = require('electron-log')
+      log.transports.file.level = 'info'
+      autoUpdater.logger = log
+    } catch (e) {
+      console.warn('[ShelfBot] electron-log not available:', e.message)
+    }
+  }
+} catch (e) {
+  console.warn('[ShelfBot] electron-updater not available; auto-updates disabled:', e.message)
+  autoUpdater = null
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Paths
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -137,10 +169,59 @@ function createWindow(port) {
 app.whenReady().then(async () => {
   const port = await startJavaBackend()
   createWindow(port)
+  // Defer the update check so the window paints first and the user isn't
+  // staring at a hanging window while we hit GitHub.
+  setTimeout(initAutoUpdater, 4_000)
 })
 
 app.on('window-all-closed', () => { stopJava(); app.quit() })
 app.on('before-quit', stopJava)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Auto-updater event wiring
+// ─────────────────────────────────────────────────────────────────────────────
+
+function sendToRenderer(channel, payload) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send(channel, payload)
+  }
+}
+
+function initAutoUpdater() {
+  if (!autoUpdater) return
+
+  autoUpdater.on('checking-for-update', () => {
+    console.log('[updater] checking…')
+  })
+  autoUpdater.on('update-available', (info) => {
+    console.log('[updater] update available:', info.version)
+    sendToRenderer('update-status', { state: 'available', version: info.version })
+  })
+  autoUpdater.on('update-not-available', () => {
+    sendToRenderer('update-status', { state: 'none' })
+  })
+  autoUpdater.on('download-progress', (p) => {
+    sendToRenderer('update-status', {
+      state: 'downloading',
+      percent: Math.round(p.percent ?? 0),
+    })
+  })
+  autoUpdater.on('update-downloaded', (info) => {
+    console.log('[updater] downloaded:', info.version)
+    sendToRenderer('update-status', { state: 'downloaded', version: info.version })
+  })
+  autoUpdater.on('error', (err) => {
+    // Networks fail; we don't want this to scare the user. Just log and stay quiet.
+    console.warn('[updater] error:', err?.message || err)
+    sendToRenderer('update-status', { state: 'error', message: err?.message || String(err) })
+  })
+
+  try {
+    autoUpdater.checkForUpdates()
+  } catch (e) {
+    console.warn('[updater] check failed:', e.message)
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IPC
@@ -170,3 +251,25 @@ ipcMain.on('window-maximize', () =>
 )
 ipcMain.on('window-close',    () => mainWindow?.close())
 ipcMain.on('open-external',   (_, url) => shell.openExternal(url))
+
+// Auto-updater IPC: trigger install (with relaunch) or a manual check.
+ipcMain.handle('updater:install', () => {
+  if (!autoUpdater) return { ok: false, reason: 'unavailable' }
+  try {
+    // quitAndInstall(isSilent=false, isForceRunAfter=true) — restart the app
+    // after installing rather than leaving the user with a quit app.
+    autoUpdater.quitAndInstall(false, true)
+    return { ok: true }
+  } catch (e) {
+    return { ok: false, reason: e?.message || 'install failed' }
+  }
+})
+ipcMain.handle('updater:check', async () => {
+  if (!autoUpdater) return { ok: false, reason: 'unavailable' }
+  try {
+    const r = await autoUpdater.checkForUpdates()
+    return { ok: true, version: r?.updateInfo?.version }
+  } catch (e) {
+    return { ok: false, reason: e?.message || 'check failed' }
+  }
+})

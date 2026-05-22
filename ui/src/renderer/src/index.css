@@ -920,6 +920,390 @@ input:focus-visible {
   margin-top: 4px;
 }
 
+/* ── Auto-update banner (above main-area) ─────────────────────────────────── */
+.update-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 14px;
+  background: linear-gradient(90deg,
+              rgba(212, 165, 116, .12),
+              rgba(212, 165, 116, .05));
+  border-bottom: 1px solid rgba(212, 165, 116, .25);
+  -webkit-app-region: no-drag;
+  animation: updateSlide .25s var(--ease);
+}
+@keyframes updateSlide {
+  from { transform: translateY(-100%); opacity: 0; }
+  to   { transform: translateY(0);     opacity: 1; }
+}
+.update-banner-icon {
+  color: var(--accent-bright);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.update-banner-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.update-banner-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-1);
+  letter-spacing: 0.005em;
+}
+.update-banner-sub {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+.update-banner-btn {
+  background: var(--accent);
+  color: #1a1610;
+  border: none;
+  border-radius: 6px;
+  padding: 5px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background .15s var(--ease), opacity .15s var(--ease);
+  flex-shrink: 0;
+}
+.update-banner-btn:hover:not(:disabled) {
+  background: var(--accent-bright);
+}
+.update-banner-btn:disabled {
+  opacity: .55;
+  cursor: default;
+}
+.update-banner-close {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-3);
+  cursor: pointer;
+  transition: all .15s var(--ease);
+  flex-shrink: 0;
+}
+.update-banner-close:hover {
+  background: rgba(255, 240, 220, .06);
+  color: var(--text-1);
+}
+
+/* ── macOS Full Disk Access banner ────────────────────────────────────────── */
+.access-banner {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  background: rgba(217, 119, 87, .07);
+  border: 1px solid rgba(217, 119, 87, .28);
+  border-radius: var(--r-lg);
+  padding: 16px 20px;
+  margin-bottom: 4px;
+}
+.access-banner-icon {
+  color: var(--red);
+  background: rgba(217, 119, 87, .12);
+  border-radius: 50%;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.access-banner-body { flex: 1; min-width: 0; }
+.access-banner-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-1);
+  letter-spacing: 0.005em;
+}
+.access-banner-sub {
+  font-size: 12.5px;
+  color: var(--text-2);
+  line-height: 1.55;
+  margin-top: 4px;
+}
+.access-banner-list {
+  list-style: none;
+  padding: 0;
+  margin: 10px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.access-banner-list li {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-3);
+  padding-left: 12px;
+  position: relative;
+}
+.access-banner-list li::before {
+  content: "•";
+  position: absolute;
+  left: 2px;
+  color: var(--text-4);
+}
+.access-banner-btn {
+  margin-top: 12px;
+  background: var(--accent-faint);
+  border: 1px solid rgba(212, 165, 116, .3);
+  border-radius: 8px;
+  padding: 7px 14px;
+  color: var(--accent-bright);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all .15s var(--ease);
+}
+.access-banner-btn:hover {
+  background: rgba(212, 165, 116, .18);
+  border-color: rgba(212, 165, 116, .5);
+  color: var(--text-1);
+}
+
+/* ── Real indexing progress (per-file) ────────────────────────────────────── */
+.prog-bg-real {
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 240, 220, .04);
+  border: 1px solid var(--border-soft);
+  overflow: hidden;
+  margin-top: 14px;
+}
+.prog-fill-real {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent-deep), var(--accent));
+  border-radius: 999px;
+  transition: width .3s var(--ease);
+  box-shadow: 0 0 12px rgba(212, 165, 116, .35);
+}
+.prog-label-real {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  font-size: 12.5px;
+  color: var(--text-2);
+  flex-wrap: wrap;
+}
+.prog-label-real strong { color: var(--text-1); font-weight: 600; }
+.prog-failed { color: var(--red); }
+.prog-current {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-3);
+  margin-left: auto;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Welcome modal (first run) ────────────────────────────────────────────── */
+.welcome-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: rgba(11, 11, 20, .68);
+  backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  animation: welcomeFadeIn .25s var(--ease);
+}
+@keyframes welcomeFadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.welcome-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 32px 36px 28px;
+  width: 100%;
+  max-width: 520px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, .55);
+  animation: welcomeSlide .3s var(--ease);
+}
+@keyframes welcomeSlide {
+  from { transform: translateY(8px); opacity: 0; }
+  to   { transform: translateY(0);   opacity: 1; }
+}
+.welcome-steps {
+  display: flex;
+  gap: 6px;
+  justify-content: center;
+  margin-bottom: 22px;
+}
+.welcome-dot {
+  width: 28px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border-soft);
+  transition: background .25s var(--ease);
+}
+.welcome-dot.active { background: var(--accent); }
+.welcome-dot.done   { background: rgba(212, 165, 116, .55); }
+
+.welcome-step {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 280px;
+}
+.welcome-hero {
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  background: var(--accent-faint);
+  border: 1px solid rgba(212, 165, 116, .2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto 4px;
+}
+.welcome-hero.subtle {
+  color: var(--accent);
+  background: rgba(212, 165, 116, .06);
+}
+.welcome-title {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text-1);
+  margin: 0;
+  text-align: center;
+  letter-spacing: -0.005em;
+}
+.welcome-sub {
+  font-size: 13px;
+  color: var(--text-2);
+  line-height: 1.6;
+  margin: 0;
+  text-align: center;
+  max-width: 420px;
+  align-self: center;
+}
+.welcome-empty {
+  font-size: 12.5px;
+  color: var(--text-3);
+  text-align: center;
+  padding: 18px;
+  background: rgba(255, 240, 220, .015);
+  border: 1px dashed var(--border-soft);
+  border-radius: 9px;
+  font-style: italic;
+}
+.welcome-folders {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.welcome-folder {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--bg-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 9px;
+  padding: 9px 10px 9px 12px;
+}
+.welcome-folder svg { color: var(--text-3); flex-shrink: 0; }
+.welcome-folder-path {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.welcome-folder-del {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-3);
+  cursor: pointer;
+  transition: all .15s var(--ease);
+}
+.welcome-folder-del:hover {
+  background: rgba(220, 80, 80, .12);
+  border-color: rgba(220, 80, 80, .25);
+  color: #e08585;
+}
+.welcome-add { align-self: flex-start; }
+
+.welcome-bullets {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 4px 0 6px;
+}
+.welcome-bullet {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 12.5px;
+  color: var(--text-2);
+  line-height: 1.55;
+}
+.welcome-bullet svg {
+  color: var(--green);
+  flex-shrink: 0;
+  margin-top: 3px;
+}
+.welcome-bullet strong { color: var(--text-1); font-weight: 600; }
+
+.welcome-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: auto;
+  padding-top: 8px;
+}
+.welcome-next { padding: 10px 20px; }
+.welcome-next:disabled { opacity: .45; cursor: default; }
+.welcome-back,
+.welcome-skip {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-3);
+  font-size: 12.5px;
+  font-weight: 500;
+  padding: 8px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all .15s var(--ease);
+}
+.welcome-back:hover,
+.welcome-skip:hover {
+  background: rgba(255, 240, 220, .04);
+  color: var(--text-1);
+}
+.welcome-skip { margin-right: auto; }
+
 /* ── Token budget meter ───────────────────────────────────────────────────── */
 .token-meter {
   background: var(--surface);

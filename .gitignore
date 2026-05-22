@@ -2,6 +2,7 @@
 backend/target/
 backend/*.db
 backend/chroma-data/
+backend/shelfbot-vector-index/
 backend/config.properties
 
 # ── Frontend ──────────────────────────────────────

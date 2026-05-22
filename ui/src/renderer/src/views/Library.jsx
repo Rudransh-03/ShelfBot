@@ -105,6 +105,57 @@ const FileTypeIcon = () => (
   </svg>
 )
 
+// ── macOS Full Disk Access banner ───────────────────────────────────────────
+// Shown only when the backend reports it can't read one or more configured
+// roots — the classic symptom of macOS gating folders behind Full Disk Access.
+
+const ALERT_ICON = (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+    <circle cx="12" cy="12" r="10"/>
+    <line x1="12" y1="8"  x2="12"    y2="12"/>
+    <line x1="12" y1="16" x2="12.01" y2="16"/>
+  </svg>
+)
+
+function AccessBanner({ stats }) {
+  const issues   = stats?.accessIssues ?? []
+  const isMac    = (stats?.platform ?? '').includes('mac')
+  if (issues.length === 0) return null
+
+  const openSettings = () => {
+    const E = window.electron
+    if (isMac && E?.openExternal) {
+      E.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles')
+    }
+  }
+
+  return (
+    <div className="access-banner">
+      <div className="access-banner-icon">{ALERT_ICON}</div>
+      <div className="access-banner-body">
+        <div className="access-banner-title">
+          {isMac
+            ? 'Some folders are blocked by macOS'
+            : 'Some folders are unreadable'}
+        </div>
+        <div className="access-banner-sub">
+          {isMac
+            ? 'ShelfBot can\'t read these folders without Full Disk Access. Open System Settings → Privacy & Security → Full Disk Access and enable ShelfBot.'
+            : 'ShelfBot can\'t read these folders. Check permissions or remove them in Settings.'}
+        </div>
+        <ul className="access-banner-list">
+          {issues.map(p => <li key={p}>{p}</li>)}
+        </ul>
+        {isMac && (
+          <button className="access-banner-btn" onClick={openSettings}>
+            Open Privacy Settings
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ── Token budget meter ──────────────────────────────────────────────────────
 
 function TokenMeter({ used = 0, limit = 1, perFileLimit = 0 }) {
@@ -275,7 +326,7 @@ function IndexedFilesPanel({ api, connected, refreshKey, onDeleted, toast }) {
 export default function Library({ active, onGoSettings }) {
   const {
     api, connected,
-    stats, indexing,
+    stats, indexing, progress,
     lastJob: result,
     loadStats, triggerIndex: handleIndex,
     toast,
@@ -315,6 +366,8 @@ export default function Library({ active, onGoSettings }) {
       <div className="view-divider" />
 
       <div className="lib-body">
+        <AccessBanner stats={stats} />
+
         {/* Stats */}
         <div className="stats-grid">
           <div className="stat-card g">
@@ -396,11 +449,36 @@ export default function Library({ active, onGoSettings }) {
 
           {indexing && (
             <div className="prog-section">
-              <div className="prog-bg"><div className="prog-fill" /></div>
-              <div className="prog-label">
-                <div className="spin-sm" />
-                <span>Scanning and embedding files…</span>
-              </div>
+              {progress?.total > 0 ? (
+                <>
+                  <div className="prog-bg-real">
+                    <div
+                      className="prog-fill-real"
+                      style={{ width: `${Math.min(100, (progress.processed / progress.total) * 100)}%` }}
+                    />
+                  </div>
+                  <div className="prog-label-real">
+                    <div className="spin-sm" />
+                    <span>
+                      <strong>{progress.processed}</strong> of <strong>{progress.total}</strong> files
+                      {progress.failed > 0 && <span className="prog-failed"> · {progress.failed} skipped</span>}
+                    </span>
+                    {progress.currentFile && (
+                      <span className="prog-current" title={progress.currentFile}>
+                        {progress.currentFile}
+                      </span>
+                    )}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="prog-bg"><div className="prog-fill" /></div>
+                  <div className="prog-label">
+                    <div className="spin-sm" />
+                    <span>Scanning files…</span>
+                  </div>
+                </>
+              )}
             </div>
           )}
 

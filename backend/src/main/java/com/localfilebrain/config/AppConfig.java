@@ -165,15 +165,16 @@ public final class AppConfig {
     }
 
     // -------------------------------------------------------------------------
-    // ChromaDB
+    // Vector store (embedded Lucene HNSW)
     // -------------------------------------------------------------------------
 
-    public String getChromaDbUrl() {
-        return getOrDefault("chromadb.url", "http://[::1]:8000");
-    }
-
-    public String getChromaDbCollection() {
-        return getOrDefault("chromadb.collection", "shelfbot");
+    /**
+     * Filesystem directory where the Lucene HNSW index lives. Defaults to
+     * {@code shelfbot-vector-index/} alongside the metadata DB. Auto-created
+     * on first run.
+     */
+    public Path getVectorIndexPath() {
+        return Paths.get(getOrDefault("vector.index.path", "shelfbot-vector-index"));
     }
 
     // -------------------------------------------------------------------------

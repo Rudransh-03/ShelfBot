@@ -3,7 +3,8 @@ package com.localfilebrain.query;
 import com.localfilebrain.config.AppConfig;
 import com.localfilebrain.embedding.OpenAIEmbeddingClient;
 import com.localfilebrain.llm.GPT4oMiniClient;
-import com.localfilebrain.storage.ChromaDBClient;
+import com.localfilebrain.storage.VectorStore;
+import com.localfilebrain.storage.VectorStore.SearchResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -13,8 +14,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
-
-import com.localfilebrain.storage.ChromaDBClient.QueryResult.Match;
 
 /**
  * Orchestrates the full query pipeline:
@@ -77,21 +76,38 @@ public final class QueryEngine {
     );
 
     private final OpenAIEmbeddingClient embeddingClient;
-    private final ChromaDBClient        chromaClient;
+    private final VectorStore           vectorStore;
     private final GPT4oMiniClient       llmClient;
     private final ConversationHistory   history;
+    private final boolean               ownsVectorStore;
 
     public QueryEngine(AppConfig config) {
+        this(config, null);
+    }
+
+    /**
+     * Accepts a shared {@link VectorStore} so the indexer (which owns the
+     * Lucene IndexWriter) and the query engine (read-only) operate on the
+     * same index without competing for the writer lock.
+     */
+    public QueryEngine(AppConfig config, VectorStore sharedStore) {
         this.embeddingClient = new OpenAIEmbeddingClient(
                 config.getOpenAiApiKey(),
                 config.getEmbeddingBatchSize()
         );
-        this.chromaClient = new ChromaDBClient(
-                config.getChromaDbUrl(),
-                config.getChromaDbCollection()
-        );
+        if (sharedStore != null) {
+            this.vectorStore     = sharedStore;
+            this.ownsVectorStore = false;
+        } else {
+            this.vectorStore     = new VectorStore(config.getVectorIndexPath());
+            this.ownsVectorStore = true;
+        }
         this.llmClient = new GPT4oMiniClient(config.getOpenAiApiKey());
         this.history   = new ConversationHistory(5);
+    }
+
+    public void close() {
+        if (ownsVectorStore) vectorStore.close();
     }
 
     public QueryResult query(String question) {
@@ -111,11 +127,10 @@ public final class QueryEngine {
         List<float[]> embeddings  = embeddingClient.embedBatch(List.of(trimmed));
         float[]       queryVector = embeddings.get(0);
 
-        ChromaDBClient.QueryResult chromaResult = chromaClient.query(queryVector, TOP_K);
-        List<ChromaDBClient.QueryResult.Match> matches = chromaResult.matches();
+        List<SearchResult> matches = vectorStore.query(queryVector, TOP_K);
 
         if (matches.isEmpty()) {
-            log.info("ChromaDB returned no matches");
+            log.info("VectorStore returned no matches");
             return notFound(trimmed);
         }
 
@@ -127,20 +142,20 @@ public final class QueryEngine {
             return notFound(trimmed);
         }
 
-        List<ChromaDBClient.QueryResult.Match> withinThreshold = matches.stream()
+        List<SearchResult> withinThreshold = matches.stream()
                 .filter(m -> m.distance() <= RELEVANCE_THRESHOLD)
                 .collect(Collectors.toList());
 
         long candidateFiles = withinThreshold.stream()
-                .map(ChromaDBClient.QueryResult.Match::sourceFilePath)
+                .map(SearchResult::sourceFilePath)
                 .distinct()
                 .count();
 
-        List<ChromaDBClient.QueryResult.Match> relevantMatches =
+        List<SearchResult> relevantMatches =
                 diversifyByFile(withinThreshold, MAX_CHUNKS_PER_FILE, MAX_CONTEXT_CHUNKS);
 
         long finalFiles = relevantMatches.stream()
-                .map(ChromaDBClient.QueryResult.Match::sourceFilePath)
+                .map(SearchResult::sourceFilePath)
                 .distinct()
                 .count();
 
@@ -171,12 +186,12 @@ public final class QueryEngine {
      * Snippet text is truncated to keep the response payload small and to
      * avoid leaking irrelevantly large amounts of file content into the UI.
      */
-    private List<Source> groupMatchesByFile(List<Match> matches) {
+    private List<Source> groupMatchesByFile(List<SearchResult> matches) {
         // LinkedHashMap preserves the diversified ordering produced earlier
         // — most relevant file first, then per-file the best chunks first.
         LinkedHashMap<String, Source.Builder> byPath = new LinkedHashMap<>();
 
-        for (Match m : matches) {
+        for (SearchResult m : matches) {
             byPath.computeIfAbsent(
                     m.sourceFilePath(),
                     p -> new Source.Builder(m.fileName(), p)
@@ -248,23 +263,23 @@ public final class QueryEngine {
      * named the same in different folders (e.g. ~/Desktop/resume.pdf and
      * ~/Documents/resume.pdf) are correctly treated as distinct.
      */
-    private List<ChromaDBClient.QueryResult.Match> diversifyByFile(
-            List<ChromaDBClient.QueryResult.Match> matches,
+    private List<SearchResult> diversifyByFile(
+            List<SearchResult> matches,
             int perFileCap,
             int totalCap
     ) {
-        LinkedHashMap<String, List<ChromaDBClient.QueryResult.Match>> byFile = new LinkedHashMap<>();
-        for (ChromaDBClient.QueryResult.Match m : matches) {
+        LinkedHashMap<String, List<SearchResult>> byFile = new LinkedHashMap<>();
+        for (SearchResult m : matches) {
             byFile.computeIfAbsent(m.sourceFilePath(), k -> new ArrayList<>()).add(m);
         }
 
-        List<ChromaDBClient.QueryResult.Match> interleaved = new ArrayList<>();
+        List<SearchResult> interleaved = new ArrayList<>();
         int round = 0;
         boolean addedThisRound = true;
         while (addedThisRound && interleaved.size() < totalCap && round < perFileCap) {
             addedThisRound = false;
-            for (Map.Entry<String, List<ChromaDBClient.QueryResult.Match>> entry : byFile.entrySet()) {
-                List<ChromaDBClient.QueryResult.Match> chunks = entry.getValue();
+            for (Map.Entry<String, List<SearchResult>> entry : byFile.entrySet()) {
+                List<SearchResult> chunks = entry.getValue();
                 if (round < chunks.size()) {
                     interleaved.add(chunks.get(round));
                     addedThisRound = true;

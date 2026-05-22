@@ -7,6 +7,8 @@ import org.slf4j.LoggerFactory;
 import java.nio.file.Path;
 import java.sql.*;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -62,6 +64,7 @@ public final class IndexMetadataStore implements AutoCloseable {
                     content_hash     TEXT    NOT NULL,
                     status           TEXT    NOT NULL DEFAULT 'INDEXED',
                     chunk_count      INTEGER NOT NULL DEFAULT 0,
+                    token_count      INTEGER NOT NULL DEFAULT 0,
                     last_indexed_at  TEXT,
                     error_message    TEXT
                 )
@@ -71,6 +74,16 @@ public final class IndexMetadataStore implements AutoCloseable {
             stmt.executeUpdate("""
                 CREATE INDEX IF NOT EXISTS idx_status ON file_index(status)
                 """);
+
+            // Lightweight migration: pre-existing DBs from before token tracking
+            // won't have the column. Adding it is idempotent — SQLite throws
+            // "duplicate column" if it already exists, which we swallow.
+            try {
+                stmt.executeUpdate("ALTER TABLE file_index ADD COLUMN token_count INTEGER NOT NULL DEFAULT 0");
+                log.info("Added token_count column to existing file_index table");
+            } catch (SQLException ignored) {
+                // Column already exists — nothing to do.
+            }
 
             log.debug("Schema initialized");
         }
@@ -185,6 +198,53 @@ public final class IndexMetadataStore implements AutoCloseable {
     }
 
     /**
+     * Returns the sum of token_count across all INDEXED files — used to
+     * enforce the per-user indexing budget.
+     */
+    public synchronized long sumIndexedTokens() {
+        String sql = "SELECT COALESCE(SUM(token_count), 0) FROM file_index WHERE status = 'INDEXED'";
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            return rs.next() ? rs.getLong(1) : 0L;
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to sum token counts", e);
+        }
+    }
+
+    /**
+     * Returns the stored token count for a specific file (0 if unknown).
+     * Used during re-index to compute the delta against the user budget.
+     */
+    public synchronized long getTokenCountForFile(String absolutePath) {
+        String sql = "SELECT token_count FROM file_index WHERE absolute_path = ?";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, absolutePath);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getLong(1) : 0L;
+            }
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to read tokens for: " + absolutePath, e);
+        }
+    }
+
+    /**
+     * Returns every INDEXED file, sorted by file size descending. Used by
+     * the Library view to show a per-file management list.
+     */
+    public synchronized List<FileRecord> listIndexedFilesBySizeDesc() {
+        String sql = "SELECT * FROM file_index WHERE status = 'INDEXED' "
+                   + "ORDER BY file_size_bytes DESC, file_name ASC";
+        List<FileRecord> out = new ArrayList<>();
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            while (rs.next()) out.add(mapRow(rs));
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to list indexed files", e);
+        }
+        return out;
+    }
+
+    /**
      * Returns the sum of all chunk_count values for INDEXED files.
      */
     public synchronized int getTotalChunks() {
@@ -222,8 +282,9 @@ public final class IndexMetadataStore implements AutoCloseable {
         String sql = """
             INSERT INTO file_index
               (absolute_path, file_name, file_extension, file_size_bytes,
-               last_modified_ms, content_hash, status, chunk_count, last_indexed_at, error_message)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               last_modified_ms, content_hash, status, chunk_count, token_count,
+               last_indexed_at, error_message)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(absolute_path) DO UPDATE SET
               file_name        = excluded.file_name,
               file_extension   = excluded.file_extension,
@@ -232,20 +293,22 @@ public final class IndexMetadataStore implements AutoCloseable {
               content_hash     = excluded.content_hash,
               status           = excluded.status,
               chunk_count      = excluded.chunk_count,
+              token_count      = excluded.token_count,
               last_indexed_at  = excluded.last_indexed_at,
               error_message    = excluded.error_message
             """;
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
-            ps.setString(1, record.getAbsolutePath());
-            ps.setString(2, record.getFileName());
-            ps.setString(3, record.getFileExtension());
-            ps.setLong  (4, record.getFileSizeBytes());
-            ps.setLong  (5, record.getLastModifiedMs());
-            ps.setString(6, record.getContentHash());
-            ps.setString(7, record.getStatus().name());
-            ps.setInt   (8, record.getChunkCount());
-            ps.setString(9, record.getLastIndexedAt() != null ? record.getLastIndexedAt().toString() : null);
-            ps.setString(10, record.getErrorMessage());
+            ps.setString(1,  record.getAbsolutePath());
+            ps.setString(2,  record.getFileName());
+            ps.setString(3,  record.getFileExtension());
+            ps.setLong  (4,  record.getFileSizeBytes());
+            ps.setLong  (5,  record.getLastModifiedMs());
+            ps.setString(6,  record.getContentHash());
+            ps.setString(7,  record.getStatus().name());
+            ps.setInt   (8,  record.getChunkCount());
+            ps.setLong  (9,  record.getTokenCount());
+            ps.setString(10, record.getLastIndexedAt() != null ? record.getLastIndexedAt().toString() : null);
+            ps.setString(11, record.getErrorMessage());
             ps.executeUpdate();
         } catch (SQLException e) {
             throw new MetadataStoreException("Failed to upsert record for: " + record.getAbsolutePath(), e);
@@ -301,6 +364,13 @@ public final class IndexMetadataStore implements AutoCloseable {
         String lastIndexedStr = rs.getString("last_indexed_at");
         Instant lastIndexed   = lastIndexedStr != null ? Instant.parse(lastIndexedStr) : null;
 
+        long tokenCount = 0L;
+        try {
+            tokenCount = rs.getLong("token_count");
+        } catch (SQLException ignored) {
+            // Older row without the column — leave at 0.
+        }
+
         return FileRecord.builder()
             .absolutePath(rs.getString("absolute_path"))
             .fileName(rs.getString("file_name"))
@@ -310,6 +380,7 @@ public final class IndexMetadataStore implements AutoCloseable {
             .contentHash(rs.getString("content_hash"))
             .status(status)
             .chunkCount(rs.getInt("chunk_count"))
+            .tokenCount(tokenCount)
             .lastIndexedAt(lastIndexed)
             .errorMessage(rs.getString("error_message"))
             .build();

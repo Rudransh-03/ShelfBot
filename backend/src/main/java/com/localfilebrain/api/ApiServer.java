@@ -4,8 +4,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.localfilebrain.config.AppConfig;
 import com.localfilebrain.ingestion.IndexMetadataStore;
 import com.localfilebrain.ingestion.IngestionPipeline;
+import com.localfilebrain.model.FileRecord;
 import com.localfilebrain.model.IngestionResult;
 import com.localfilebrain.query.QueryEngine;
+import com.localfilebrain.storage.ChromaDBClient;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import org.slf4j.Logger;
@@ -33,6 +35,9 @@ import java.util.concurrent.atomic.*;
  *   GET  /api/config            – read config values
  *   POST /api/config            – update files root path(s)
  *                                  Accepts either {"rootPath": "..."} or {"rootPaths": ["...", "..."]}
+ *   GET  /api/files             – list indexed files (sorted by size desc)
+ *   DELETE /api/files           – remove an indexed file (frees its token budget)
+ *                                  Body: {"path": "/absolute/path/to/file"}
  */
 public final class ApiServer {
 
@@ -103,6 +108,7 @@ public final class ApiServer {
         server.createContext("/api/query",        this::handleQuery);
         server.createContext("/api/conversation", this::handleConversation);
         server.createContext("/api/config",       this::handleConfig);
+        server.createContext("/api/files",        this::handleFiles);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -124,17 +130,21 @@ public final class ApiServer {
             int          indexed     = metadataStore.countIndexed();
             int          failed      = metadataStore.countFailed();
             int          totalChunks = metadataStore.getTotalChunks();
+            long         tokensUsed  = metadataStore.sumIndexedTokens();
             String       lastIndexed = metadataStore.getLastIndexedAt().orElse("");
             List<String> rootPaths   = safeRootPaths();
             String       rootPath    = rootPaths.isEmpty() ? "" : rootPaths.get(0);
 
             sendJson(ex, 200, map(
-                "indexedFiles", indexed,
-                "failedFiles",  failed,
-                "totalChunks",  totalChunks,
-                "lastIndexed",  lastIndexed,
-                "rootPath",     rootPath,
-                "rootPaths",    rootPaths
+                "indexedFiles",       indexed,
+                "failedFiles",        failed,
+                "totalChunks",        totalChunks,
+                "lastIndexed",        lastIndexed,
+                "rootPath",           rootPath,
+                "rootPaths",          rootPaths,
+                "tokensUsed",         tokensUsed,
+                "tokensLimit",        IngestionPipeline.MAX_TOKENS_TOTAL,
+                "tokensLimitPerFile", IngestionPipeline.MAX_TOKENS_PER_FILE
             ));
         } catch (Exception e) {
             log.error("status error", e);
@@ -288,6 +298,65 @@ public final class ApiServer {
             ));
         } catch (Exception e) {
             log.error("Config update failed", e);
+            sendError(ex, 500, e.getMessage());
+        }
+    }
+
+    /** GET /api/files – sorted by size desc.   DELETE /api/files – remove one file by path. */
+    private void handleFiles(HttpExchange ex) throws IOException {
+        if (preflight(ex)) return;
+
+        if (isMethod(ex, "GET")) {
+            try {
+                List<FileRecord> records = metadataStore.listIndexedFilesBySizeDesc();
+                List<Map<String, Object>> rows = new ArrayList<>(records.size());
+                for (FileRecord r : records) {
+                    Map<String, Object> row = new LinkedHashMap<>();
+                    row.put("path",          r.getAbsolutePath());
+                    row.put("name",          r.getFileName());
+                    row.put("extension",     r.getFileExtension());
+                    row.put("sizeBytes",     r.getFileSizeBytes());
+                    row.put("chunkCount",    r.getChunkCount());
+                    row.put("tokenCount",    r.getTokenCount());
+                    row.put("lastIndexedAt", r.getLastIndexedAt() != null ? r.getLastIndexedAt().toString() : null);
+                    rows.add(row);
+                }
+                sendJson(ex, 200, map("files", rows, "count", rows.size()));
+            } catch (Exception e) {
+                log.error("list files error", e);
+                sendError(ex, 500, e.getMessage());
+            }
+            return;
+        }
+
+        if (!isMethod(ex, "DELETE")) { methodNotAllowed(ex); return; }
+
+        try {
+            Map<?, ?> req  = readJson(ex);
+            String    path = (String) req.get("path");
+
+            if (path == null || path.isBlank()) {
+                sendError(ex, 400, "path is required");
+                return;
+            }
+
+            // Drop the file's chunks from Chroma first; metadata row last
+            // so that a failure midway leaves the metadata consistent with
+            // what's actually in the vector store.
+            try {
+                ChromaDBClient chroma = new ChromaDBClient(
+                        config.getChromaDbUrl(),
+                        config.getChromaDbCollection());
+                chroma.deleteBySourceFile(path);
+            } catch (Exception e) {
+                log.warn("Chroma delete failed for '{}': {} (continuing to remove metadata)", path, e.getMessage());
+            }
+
+            metadataStore.delete(path);
+
+            sendJson(ex, 200, map("deleted", true, "path", path));
+        } catch (Exception e) {
+            log.error("delete file error", e);
             sendError(ex, 500, e.getMessage());
         }
     }

@@ -2,6 +2,7 @@ package com.localfilebrain;
 
 import com.localfilebrain.api.ApiServer;
 import com.localfilebrain.config.AppConfig;
+import com.localfilebrain.ingestion.FileWatcher;
 import com.localfilebrain.ingestion.IndexMetadataStore;
 import com.localfilebrain.ingestion.IngestionPipeline;
 import com.localfilebrain.query.QueryEngine;
@@ -109,7 +110,14 @@ public final class Main {
             System.out.println("SHELFBOT_SERVER_READY:" + port);
             System.out.flush();
 
+            // Live file watcher — keeps the index in sync as the user edits
+            // files. Requires a working OpenAI key (for re-embedding changed
+            // files); if absent, we skip the watcher and the user can still
+            // re-index manually after configuring the key in Settings.
+            final FileWatcher watcher = tryStartWatcher(config, finalStore);
+
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                if (watcher != null) watcher.close();
                 server.stop();
                 finalStore.close();
             }));
@@ -120,6 +128,24 @@ public final class Main {
         } catch (Exception e) {
             log.error("Failed to start API server: {}", e.getMessage(), e);
             System.exit(1);
+        }
+    }
+
+    /**
+     * Constructs the {@link FileWatcher} if the configuration is complete
+     * enough (OpenAI key present, embedding client constructible). Any
+     * failure is logged and swallowed — the API server still runs, and
+     * the user can re-index manually via the UI.
+     */
+    private static FileWatcher tryStartWatcher(AppConfig config, IndexMetadataStore store) {
+        try {
+            IngestionPipeline pipeline = new IngestionPipeline(config, store);
+            FileWatcher watcher = new FileWatcher(config, pipeline);
+            watcher.start();
+            return watcher;
+        } catch (Exception e) {
+            log.warn("File watcher not started ({}). Manual re-indexing still works.", e.getMessage());
+            return null;
         }
     }
 

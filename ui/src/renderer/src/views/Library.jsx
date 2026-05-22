@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { useApp } from '../context/AppContext'
 
 function fmt(n) {
@@ -16,7 +16,23 @@ function fmtAge(iso) {
   } catch { return iso }
 }
 
-// Icons
+function fmtBytes(n) {
+  if (n == null) return '—'
+  const k = 1024
+  if (n < k)            return `${n} B`
+  if (n < k * k)        return `${(n / k).toFixed(1)} KB`
+  if (n < k * k * k)    return `${(n / (k * k)).toFixed(1)} MB`
+  return `${(n / (k * k * k)).toFixed(2)} GB`
+}
+
+function fmtTokens(n) {
+  if (n == null) return '—'
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`
+  if (n >= 1_000)     return `${(n / 1_000).toFixed(0)}K`
+  return String(n)
+}
+
+// ── Icons ───────────────────────────────────────────────────────────────────
 const FilesIcon = () => (
   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
     <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
@@ -25,16 +41,16 @@ const FilesIcon = () => (
 )
 const ChunksIcon = () => (
   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-    <rect x="3" y="3" width="7" height="7" rx="1.5"/>
-    <rect x="14" y="3" width="7" height="7" rx="1.5"/>
-    <rect x="3" y="14" width="7" height="7" rx="1.5"/>
+    <rect x="3"  y="3"  width="7" height="7" rx="1.5"/>
+    <rect x="14" y="3"  width="7" height="7" rx="1.5"/>
+    <rect x="3"  y="14" width="7" height="7" rx="1.5"/>
     <rect x="14" y="14" width="7" height="7" rx="1.5"/>
   </svg>
 )
 const FailedIcon = () => (
   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
     <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
-    <line x1="12" y1="9" x2="12" y2="13"/>
+    <line x1="12" y1="9"  x2="12"    y2="13"/>
     <line x1="12" y1="17" x2="12.01" y2="17"/>
   </svg>
 )
@@ -67,27 +83,221 @@ const CheckIcon = () => (
 )
 const XIcon = () => (
   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
-    <line x1="18" y1="6" x2="6" y2="18"/>
-    <line x1="6" y1="6" x2="18" y2="18"/>
+    <line x1="18" y1="6" x2="6"  y2="18"/>
+    <line x1="6"  y1="6" x2="18" y2="18"/>
+  </svg>
+)
+const TrashIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+    <polyline points="3 6 5 6 21 6"/>
+    <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+    <path d="M10 11v6"/>
+    <path d="M14 11v6"/>
+    <path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/>
+  </svg>
+)
+const FileTypeIcon = () => (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+    <polyline points="14 2 14 8 20 8"/>
+    <line x1="9"  y1="13" x2="15" y2="13"/>
+    <line x1="9"  y1="17" x2="15" y2="17"/>
   </svg>
 )
 
+// ── Token budget meter ──────────────────────────────────────────────────────
+
+function TokenMeter({ used = 0, limit = 1, perFileLimit = 0 }) {
+  const pct = Math.min(100, Math.max(0, (used / Math.max(1, limit)) * 100))
+  const tier = pct >= 95 ? 'critical' : pct >= 75 ? 'warn' : 'ok'
+
+  return (
+    <div className={`token-meter tier-${tier}`}>
+      <div className="token-meter-head">
+        <div className="token-meter-title">Token budget</div>
+        <div className="token-meter-pct">{pct.toFixed(1)}%</div>
+      </div>
+      <div className="token-meter-bar">
+        <div className="token-meter-fill" style={{ width: `${pct}%` }} />
+      </div>
+      <div className="token-meter-foot">
+        <span>
+          <strong>{fmtTokens(used)}</strong> of {fmtTokens(limit)} tokens used
+        </span>
+        {perFileLimit > 0 && (
+          <span className="token-meter-sub">
+            Per-file limit: {fmtTokens(perFileLimit)}
+          </span>
+        )}
+      </div>
+      {tier !== 'ok' && (
+        <div className="token-meter-msg">
+          {tier === 'critical'
+            ? 'You’ve nearly hit your indexing limit. Delete files below to free up budget.'
+            : 'Approaching the indexing limit. Consider trimming large files.'}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Per-file row with inline delete confirmation ────────────────────────────
+
+function FileRow({ file, onDelete }) {
+  const [pendingDelete, setPendingDelete] = useState(false)
+  const [busy, setBusy] = useState(false)
+
+  const confirmDelete = async () => {
+    setBusy(true)
+    try { await onDelete(file) } finally {
+      setBusy(false)
+      setPendingDelete(false)
+    }
+  }
+
+  return (
+    <li className={`file-row${pendingDelete ? ' confirming' : ''}`} title={file.path}>
+      <span className="file-row-icon"><FileTypeIcon /></span>
+      <div className="file-row-main">
+        <div className="file-row-name">{file.name}</div>
+        <div className="file-row-meta">
+          <span>{fmtBytes(file.sizeBytes)}</span>
+          <span className="dot-sep">·</span>
+          <span>{fmt(file.chunkCount)} chunks</span>
+          <span className="dot-sep">·</span>
+          <span>{fmtTokens(file.tokenCount)} tokens</span>
+          <span className="dot-sep">·</span>
+          <span>{fmtAge(file.lastIndexedAt)}</span>
+        </div>
+      </div>
+
+      {pendingDelete ? (
+        <div className="file-row-confirm">
+          <span className="file-row-confirm-msg">Remove from index?</span>
+          <button
+            className="file-row-confirm-cancel"
+            onClick={() => setPendingDelete(false)}
+            disabled={busy}
+          >
+            Cancel
+          </button>
+          <button
+            className="file-row-confirm-yes"
+            onClick={confirmDelete}
+            disabled={busy}
+          >
+            {busy ? 'Removing…' : 'Remove'}
+          </button>
+        </div>
+      ) : (
+        <button
+          className="file-row-del"
+          onClick={() => setPendingDelete(true)}
+          title="Remove from index (file on disk is not touched)"
+          aria-label={`Remove ${file.name} from index`}
+        >
+          <TrashIcon />
+        </button>
+      )}
+    </li>
+  )
+}
+
+// ── Indexed files panel ─────────────────────────────────────────────────────
+
+function IndexedFilesPanel({ api, connected, refreshKey, onDeleted, toast }) {
+  const [files, setFiles] = useState(null)
+  const [loading, setLoading] = useState(false)
+
+  const load = useCallback(async () => {
+    if (!api || !connected) return
+    setLoading(true)
+    try {
+      const res = await api.listFiles()
+      setFiles(res.files ?? [])
+    } catch (e) {
+      toast(e.message, 'e')
+    } finally {
+      setLoading(false)
+    }
+  }, [api, connected, toast])
+
+  // Reload on mount, on refresh trigger, and when the file list might have changed.
+  useEffect(() => { load() }, [load, refreshKey])
+
+  const handleDelete = useCallback(async (file) => {
+    try {
+      await api.deleteFile(file.path)
+      setFiles(prev => (prev ?? []).filter(f => f.path !== file.path))
+      toast(`Removed “${file.name}” from index`, 's')
+      onDeleted?.()
+    } catch (e) {
+      toast(e.message, 'e')
+    }
+  }, [api, toast, onDeleted])
+
+  return (
+    <div className="files-panel">
+      <div className="files-panel-head">
+        <div>
+          <div className="files-panel-title">Indexed files</div>
+          <div className="files-panel-sub">
+            Sorted by size · largest first. Removing a file frees its tokens; the file on disk is untouched.
+          </div>
+        </div>
+        <button
+          className="icon-btn"
+          onClick={load}
+          title="Refresh list"
+          disabled={loading || !connected}
+        >
+          <RefreshIcon />
+        </button>
+      </div>
+
+      {files == null ? (
+        <div className="files-panel-empty">{loading ? 'Loading…' : ''}</div>
+      ) : files.length === 0 ? (
+        <div className="files-panel-empty">No files indexed yet.</div>
+      ) : (
+        <ul className="file-list">
+          {files.map(f => (
+            <FileRow key={f.path} file={f} onDelete={handleDelete} />
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
+
+// ── Library view ────────────────────────────────────────────────────────────
+
 export default function Library({ active, onGoSettings }) {
   const {
-    connected,
-    stats,
-    indexing,
+    api, connected,
+    stats, indexing,
     lastJob: result,
-    loadStats,
-    triggerIndex: handleIndex,
+    loadStats, triggerIndex: handleIndex,
+    toast,
   } = useApp()
 
-  // Refresh stats whenever Library becomes the active view — gives the user
-  // an immediate, up-to-date snapshot the moment they click into it,
-  // independent of the slow background poll.
+  // Bumping this forces IndexedFilesPanel to refetch — e.g. after an indexing
+  // job finishes or after the user deletes a file.
+  const [filesRefreshKey, setFilesRefreshKey] = useState(0)
+  const bumpFiles = useCallback(() => setFilesRefreshKey(k => k + 1), [])
+
   useEffect(() => {
     if (active && connected) loadStats()
   }, [active, connected, loadStats])
+
+  // When an indexing job completes (result transitions from null → set), the
+  // file list and token totals have likely changed — refresh both.
+  useEffect(() => {
+    if (result) {
+      bumpFiles()
+      loadStats()
+    }
+  }, [result, bumpFiles, loadStats])
 
   return (
     <div className={`view${active ? ' active' : ''}`} id="view-lib">
@@ -105,7 +315,7 @@ export default function Library({ active, onGoSettings }) {
       <div className="view-divider" />
 
       <div className="lib-body">
-        {/* Stats — unified strip */}
+        {/* Stats */}
         <div className="stats-grid">
           <div className="stat-card g">
             <div className="stat-icon"><FilesIcon /></div>
@@ -123,6 +333,13 @@ export default function Library({ active, onGoSettings }) {
             <div className="stat-lbl">Failed Files</div>
           </div>
         </div>
+
+        {/* Token budget */}
+        <TokenMeter
+          used={stats?.tokensUsed ?? 0}
+          limit={stats?.tokensLimit ?? 40_000_000}
+          perFileLimit={stats?.tokensLimitPerFile ?? 0}
+        />
 
         {/* Index control */}
         <div className="index-card">
@@ -221,6 +438,15 @@ export default function Library({ active, onGoSettings }) {
             </div>
           )}
         </div>
+
+        {/* Indexed files list */}
+        <IndexedFilesPanel
+          api={api}
+          connected={connected}
+          refreshKey={filesRefreshKey}
+          onDeleted={loadStats}
+          toast={toast}
+        />
       </div>
     </div>
   )

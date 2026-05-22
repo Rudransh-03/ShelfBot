@@ -31,4 +31,10 @@ export class ApiClient {
       : { rootPath:  paths }
     return this._r('/api/config', { method: 'POST', body: JSON.stringify(body) })
   }
+
+  /** Returns indexed files sorted by size desc. */
+  listFiles()       { return this._r('/api/files') }
+
+  /** Removes an indexed file by absolute path. Frees its token budget. */
+  deleteFile(path)  { return this._r('/api/files', { method: 'DELETE', body: JSON.stringify({ path }) }) }
 }

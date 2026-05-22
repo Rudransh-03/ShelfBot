@@ -25,6 +25,7 @@ public final class FileRecord {
     private final String contentHash;   // SHA-256 of file content
     private final Status status;
     private final int    chunkCount;
+    private final long   tokenCount;    // estimated tokens consumed during indexing
     private final Instant lastIndexedAt;
     private final String errorMessage;  // populated if status = FAILED
 
@@ -37,6 +38,7 @@ public final class FileRecord {
         this.contentHash    = builder.contentHash;
         this.status         = builder.status;
         this.chunkCount     = builder.chunkCount;
+        this.tokenCount     = builder.tokenCount;
         this.lastIndexedAt  = builder.lastIndexedAt;
         this.errorMessage   = builder.errorMessage;
     }
@@ -49,6 +51,7 @@ public final class FileRecord {
     public String   getContentHash()    { return contentHash; }
     public Status   getStatus()         { return status; }
     public int      getChunkCount()     { return chunkCount; }
+    public long     getTokenCount()     { return tokenCount; }
     public Instant  getLastIndexedAt()  { return lastIndexedAt; }
     public String   getErrorMessage()   { return errorMessage; }
 
@@ -63,6 +66,7 @@ public final class FileRecord {
         private String contentHash;
         private Status status;
         private int    chunkCount;
+        private long   tokenCount;
         private Instant lastIndexedAt;
         private String errorMessage;
 
@@ -76,6 +80,7 @@ public final class FileRecord {
         public Builder contentHash(String v)     { this.contentHash = v; return this; }
         public Builder status(Status v)          { this.status = v; return this; }
         public Builder chunkCount(int v)         { this.chunkCount = v; return this; }
+        public Builder tokenCount(long v)        { this.tokenCount = v; return this; }
         public Builder lastIndexedAt(Instant v)  { this.lastIndexedAt = v; return this; }
         public Builder errorMessage(String v)    { this.errorMessage = v; return this; }
 

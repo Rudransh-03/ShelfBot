@@ -30,7 +30,8 @@ public final class FileScanner {
     // Directory names that should never be indexed regardless of where they appear.
     // Hidden directories (anything starting with ".") are skipped separately, so
     // entries like ".git", ".venv", ".cache", ".next" do not need to be listed here.
-    private static final Set<String> SKIP_DIRECTORIES = Set.of(
+    // Exposed package-private so the FileWatcher applies the same exclusions.
+    static final Set<String> SKIP_DIRECTORIES = Set.of(
             "node_modules",
             "target",          // Maven build output
             "build",           // Gradle / generic build output

@@ -33,6 +33,26 @@ public final class IngestionPipeline {
 
     private static final Logger log = LoggerFactory.getLogger(IngestionPipeline.class);
 
+    // ── Budget caps ────────────────────────────────────────────────────────────
+    // text-embedding-3-small is billed per token. We track an *estimated* token
+    // count (chars/4) per file and refuse to index anything that would either
+    // (a) eat too much of the user's overall budget in one go, or
+    // (b) push the cumulative total past the per-user ceiling.
+    //
+    // The estimate is intentionally rough — we only need it to bound the worst
+    // case, not to bill the user. ~4 chars/token is the OpenAI rule of thumb
+    // for English text and slightly overestimates for code/CJK, which is the
+    // safe direction.
+
+    /** Max estimated tokens any single file may contribute. ≈ 1,000 pages. */
+    public static final long MAX_TOKENS_PER_FILE = 500_000L;
+
+    /** Max estimated tokens an entire user library may contribute. ≈ 80,000 pages. */
+    public static final long MAX_TOKENS_TOTAL    = 40_000_000L;
+
+    /** Chars-per-token used for the rough estimate. */
+    private static final int CHARS_PER_TOKEN = 4;
+
     private final AppConfig             config;
     private final IndexMetadataStore    metadataStore;
     private final FileScanner           fileScanner;
@@ -99,9 +119,9 @@ public final class IngestionPipeline {
             log.info("[{}/{}] Processing: {}", i + 1, toProcess.size(), file.getFileName());
 
             try {
-                int chunkCount = processFile(file);
+                ProcessResult result = processFile(file);
 
-                if (chunkCount == 0) {
+                if (result == null || result.chunkCount == 0) {
                     log.warn("  ✗ No text extracted from '{}'. Skipping.", file.getFileName());
                     recordFailed(file, "No text could be extracted");
                     failedCount++;
@@ -109,11 +129,17 @@ public final class IngestionPipeline {
                     continue;
                 }
 
-                recordSuccess(file, chunkCount);
+                recordSuccess(file, result.chunkCount, result.tokenCount);
                 processedCount++;
-                totalChunks += chunkCount;
-                log.info("  ✓ {} chunks embedded and stored for '{}'", chunkCount, file.getFileName());
+                totalChunks += result.chunkCount;
+                log.info("  ✓ {} chunks ({} tokens) embedded for '{}'",
+                        result.chunkCount, result.tokenCount, file.getFileName());
 
+            } catch (BudgetExceededException e) {
+                log.warn("  ⚠ Skipping '{}': {}", file.getFileName(), e.getMessage());
+                recordFailed(file, e.getMessage());
+                failedCount++;
+                failedPaths.add(file.toString());
             } catch (Exception e) {
                 log.error("  ✗ Failed '{}': {}", file.getFileName(), e.getMessage(), e);
                 recordFailed(file, e.getMessage());
@@ -140,28 +166,148 @@ public final class IngestionPipeline {
         return result;
     }
 
-    private int processFile(Path file) throws Exception {
+    // -------------------------------------------------------------------------
+    // Single-file operations — used by the live FileWatcher to react to
+    // individual filesystem events without going through a full scan.
+    // -------------------------------------------------------------------------
+
+    /**
+     * Indexes one file end-to-end (extract → chunk → embed → upsert →
+     * metadata update). Returns the number of chunks stored, or 0 if the
+     * file was empty / unsupported.
+     *
+     * If the file is already up-to-date (timestamp + hash match the
+     * metadata store), no work is performed and 0 is returned — this makes
+     * the watcher idempotent against duplicate events.
+     */
+    public int indexOne(Path file) {
+        try {
+            BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class);
+            String absolutePath  = file.toAbsolutePath().toString();
+            long   lastModified  = attrs.lastModifiedTime().toMillis();
+
+            if (metadataStore.isUpToDateByTimestamp(absolutePath, lastModified)) {
+                return 0;
+            }
+
+            // Timestamp moved — confirm content actually changed before paying for embeddings.
+            String hash = com.localfilebrain.util.FileHashUtil.sha256(file);
+            if (metadataStore.isUpToDateByHash(absolutePath, hash)) {
+                metadataStore.updateTimestamp(absolutePath, lastModified);
+                return 0;
+            }
+
+            ProcessResult result = processFile(file);
+            if (result == null || result.chunkCount == 0) {
+                recordFailed(file, "No text could be extracted");
+                return 0;
+            }
+            recordSuccess(file, result.chunkCount, result.tokenCount);
+            log.info("[watcher] re-indexed '{}' ({} chunks, {} tokens)",
+                    file.getFileName(), result.chunkCount, result.tokenCount);
+            return result.chunkCount;
+
+        } catch (BudgetExceededException e) {
+            log.warn("[watcher] skipped '{}': {}", file.getFileName(), e.getMessage());
+            recordFailed(file, e.getMessage());
+            return 0;
+        } catch (Exception e) {
+            log.warn("[watcher] failed to index '{}': {}", file, e.getMessage());
+            recordFailed(file, e.getMessage());
+            return 0;
+        }
+    }
+
+    /**
+     * Removes a file from both ChromaDB and the metadata store. Safe to
+     * call for files that were never indexed — both stores are no-ops in
+     * that case.
+     */
+    public void removeFile(Path file) {
+        String absolutePath = file.toAbsolutePath().toString();
+        try {
+            chromaClient.deleteBySourceFile(absolutePath);
+            metadataStore.delete(absolutePath);
+            log.info("[watcher] removed '{}' from index", file.getFileName());
+        } catch (Exception e) {
+            log.warn("[watcher] failed to remove '{}': {}", file, e.getMessage());
+        }
+    }
+
+    private ProcessResult processFile(Path file) throws Exception {
         TextExtractor.ExtractionResult extraction = textExtractor.extract(file);
-        if (extraction.isEmpty()) return 0;
+        if (extraction.isEmpty()) return null;
+
+        String absolutePath = file.toAbsolutePath().toString();
+
+        // Cheap budget check from the raw extracted text length — done BEFORE
+        // any work (chunking, OpenAI API call) so we never burn money on a
+        // file we're going to refuse anyway.
+        long estimatedTokens = Math.max(1L, extraction.text().length() / CHARS_PER_TOKEN);
+        enforceBudget(absolutePath, estimatedTokens);
 
         BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class);
         long lastModifiedMs = attrs.lastModifiedTime().toMillis();
 
         List<DocumentChunk> chunks = textChunker.chunk(
                 extraction.text(), file, extraction.mimeType(), lastModifiedMs);
-        if (chunks.isEmpty()) return 0;
+        if (chunks.isEmpty()) return null;
 
-        chromaClient.deleteBySourceFile(file.toAbsolutePath().toString());
+        chromaClient.deleteBySourceFile(absolutePath);
 
         List<String>  texts      = chunks.stream().map(DocumentChunk::getText).toList();
         List<float[]> embeddings = embeddingClient.embedBatch(texts);
 
         chromaClient.upsert(chunks, embeddings);
 
-        return chunks.size();
+        // Use the actual chunked text length for storage — slightly more
+        // accurate than the pre-chunk estimate (the chunker may trim
+        // whitespace, add overlap, etc.).
+        long actualChars = chunks.stream().mapToLong(c -> c.getText() == null ? 0 : c.getText().length()).sum();
+        long actualTokens = Math.max(1L, actualChars / CHARS_PER_TOKEN);
+
+        return new ProcessResult(chunks.size(), actualTokens);
     }
 
-    private void recordSuccess(Path file, int chunkCount) {
+    /**
+     * Throws {@link BudgetExceededException} if indexing {@code file} would
+     * blow past either the per-file or the per-user token cap. Uses the
+     * stored token count for this file (if any) so that re-indexing only
+     * charges the *delta* against the user's budget.
+     */
+    private void enforceBudget(String absolutePath, long estimatedTokens) {
+        if (estimatedTokens > MAX_TOKENS_PER_FILE) {
+            throw new BudgetExceededException(String.format(
+                    "File too large to index (~%s tokens; max %s per file). "
+                  + "Try splitting the document.",
+                    formatTokens(estimatedTokens), formatTokens(MAX_TOKENS_PER_FILE)));
+        }
+
+        long existing  = metadataStore.getTokenCountForFile(absolutePath);
+        long total     = metadataStore.sumIndexedTokens();
+        long projected = total - existing + estimatedTokens;
+
+        if (projected > MAX_TOKENS_TOTAL) {
+            throw new BudgetExceededException(String.format(
+                    "Indexing limit reached (%s of %s tokens used). "
+                  + "Delete some files in the Library to free up budget.",
+                    formatTokens(total), formatTokens(MAX_TOKENS_TOTAL)));
+        }
+    }
+
+    private static String formatTokens(long n) {
+        if (n >= 1_000_000) return String.format("%.1fM", n / 1_000_000.0);
+        if (n >= 1_000)     return String.format("%.0fK", n / 1_000.0);
+        return Long.toString(n);
+    }
+
+    private record ProcessResult(int chunkCount, long tokenCount) {}
+
+    public static class BudgetExceededException extends RuntimeException {
+        public BudgetExceededException(String message) { super(message); }
+    }
+
+    private void recordSuccess(Path file, int chunkCount, long tokenCount) {
         try {
             BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class);
             String hash = FileHashUtil.sha256(file);
@@ -174,6 +320,7 @@ public final class IngestionPipeline {
                     .contentHash(hash)
                     .status(FileRecord.Status.INDEXED)
                     .chunkCount(chunkCount)
+                    .tokenCount(tokenCount)
                     .lastIndexedAt(Instant.now())
                     .build());
         } catch (IOException e) {

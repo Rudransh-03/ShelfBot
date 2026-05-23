@@ -132,7 +132,7 @@ function TypingIndicator() {
 }
 
 export default function Chat({ active }) {
-  const { api, connected, toast } = useApp()
+  const { api, connected, toast, refreshAuth } = useApp()
   const [messages, setMessages]   = useState([])
   const [input,    setInput]      = useState('')
   const [loading,  setLoading]    = useState(false)
@@ -163,8 +163,11 @@ export default function Chat({ active }) {
       setMessages(m => [...m, { role: 'ai', text: e.message, variant: 'error' }])
     } finally {
       setLoading(false)
+      // Refresh /me so the daily-usage counter in Settings updates within
+      // a second of each query, not on the slow 30s poller.
+      refreshAuth()
     }
-  }, [api, connected, loading])
+  }, [api, connected, loading, refreshAuth])
 
   const handleKey = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(input) }

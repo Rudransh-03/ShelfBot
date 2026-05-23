@@ -22,6 +22,8 @@
         <jackson.version>2.17.0</jackson.version>
         <sqlite.version>3.45.2.0</sqlite.version>
         <lucene.version>9.11.1</lucene.version>
+        <onnxruntime.version>1.19.2</onnxruntime.version>
+        <djl.version>0.30.0</djl.version>
         <junit.version>5.10.2</junit.version>
     </properties>
 
@@ -51,6 +53,23 @@
             <groupId>org.apache.lucene</groupId>
             <artifactId>lucene-core</artifactId>
             <version>${lucene.version}</version>
+        </dependency>
+
+        <!-- ONNX Runtime: runs the local embedding model (BGE) on CPU.
+             Cross-platform binaries (macOS x64/arm64, Linux x64, Windows x64)
+             ship inside this single artifact. -->
+        <dependency>
+            <groupId>com.microsoft.onnxruntime</groupId>
+            <artifactId>onnxruntime</artifactId>
+            <version>${onnxruntime.version}</version>
+        </dependency>
+
+        <!-- HuggingFace tokenizer (via DJL) for the BGE model. Tiny Java wrapper
+             around the same Rust tokenizer the HuggingFace Python lib uses. -->
+        <dependency>
+            <groupId>ai.djl.huggingface</groupId>
+            <artifactId>tokenizers</artifactId>
+            <version>${djl.version}</version>
         </dependency>
 
         <!-- Jackson: JSON serialization for chunk output / metadata. FREE / Apache 2.0 -->

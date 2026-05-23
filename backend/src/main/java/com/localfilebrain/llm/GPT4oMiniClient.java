@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.localfilebrain.auth.AuthTokenStore;
+import com.localfilebrain.config.AppConfig;
 import com.localfilebrain.query.ConversationHistory;
 import com.localfilebrain.storage.VectorStore;
 import org.slf4j.Logger;
@@ -20,9 +22,10 @@ public final class GPT4oMiniClient {
 
     private static final Logger log = LoggerFactory.getLogger(GPT4oMiniClient.class);
 
-    private static final String ENDPOINT   = "https://api.openai.com/v1/chat/completions";
-    private static final String MODEL      = "gpt-4o-mini";
-    private static final int    MAX_TOKENS = 1000;
+    private static final String DIRECT_ENDPOINT = "https://api.openai.com/v1/chat/completions";
+    private static final String PROXY_PATH      = "/proxy/chat/completions";
+    private static final String MODEL           = "gpt-4o-mini";
+    private static final int    MAX_TOKENS      = 1000;
 
     private static final String SYSTEM_PROMPT = """
         You are a personal document assistant. You answer questions strictly based on \
@@ -51,15 +54,56 @@ public final class GPT4oMiniClient {
           "compare with the previous"), use the conversation history to understand the reference.
         """;
 
-    private final String       apiKey;
-    private final ObjectMapper mapper;
+    private final String         apiKey;       // direct mode only
+    private final String         endpoint;
+    private final boolean        proxyMode;
+    private final AuthTokenStore tokenStore;   // proxy mode only
+    private final ObjectMapper   mapper;
 
+    /** Legacy direct-OpenAI constructor for tests / api.mode=direct. */
     public GPT4oMiniClient(String apiKey) {
         if (apiKey == null || apiKey.isBlank()) {
             throw new IllegalArgumentException("OpenAI API key must not be blank");
         }
-        this.apiKey  = apiKey;
-        this.mapper  = new ObjectMapper();
+        this.apiKey     = apiKey;
+        this.endpoint   = DIRECT_ENDPOINT;
+        this.proxyMode  = false;
+        this.tokenStore = null;
+        this.mapper     = new ObjectMapper();
+    }
+
+    /** Preferred constructor — routes through the auth proxy by default. */
+    public GPT4oMiniClient(AppConfig config, AuthTokenStore tokenStore) {
+        this.mapper = new ObjectMapper();
+        if ("proxy".equals(config.getApiMode())) {
+            this.proxyMode  = true;
+            this.endpoint   = config.getProxyUrl() + PROXY_PATH;
+            this.tokenStore = tokenStore;
+            this.apiKey     = null;
+            log.info("GPT4oMiniClient → proxy mode ({})", endpoint);
+        } else {
+            String key = config.getOpenAiApiKey();
+            if (key == null || key.isBlank()) {
+                throw new IllegalArgumentException(
+                        "api.mode=direct but openai.api.key is not set");
+            }
+            this.proxyMode  = false;
+            this.endpoint   = DIRECT_ENDPOINT;
+            this.tokenStore = null;
+            this.apiKey     = key;
+            log.info("GPT4oMiniClient → direct mode (api.openai.com)");
+        }
+    }
+
+    private String authHeader() {
+        if (proxyMode) {
+            String t = tokenStore == null ? null : tokenStore.getToken();
+            if (t == null) {
+                throw new LLMException("Not signed in. Sign in to ShelfBot before asking questions.");
+            }
+            return "Bearer " + t;
+        }
+        return "Bearer " + apiKey;
     }
 
     public String answer(
@@ -71,10 +115,10 @@ public final class GPT4oMiniClient {
             byte[] requestBytes = mapper.writeValueAsBytes(buildRequest(question, chunks, history));
             log.debug("Calling GPT-4o mini...");
 
-            HttpURLConnection conn = (HttpURLConnection) new URL(ENDPOINT).openConnection();
+            HttpURLConnection conn = (HttpURLConnection) new URL(endpoint).openConnection();
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json");
-            conn.setRequestProperty("Authorization", "Bearer " + apiKey);
+            conn.setRequestProperty("Authorization", authHeader());
             conn.setConnectTimeout(30_000);
             conn.setReadTimeout(60_000);
             conn.setDoOutput(true);
@@ -89,6 +133,25 @@ public final class GPT4oMiniClient {
             String responseBody = is == null ? "" : new String(is.readAllBytes(), StandardCharsets.UTF_8);
             conn.disconnect();
 
+            if (status == 429) {
+                // Daily limit from the auth proxy. Body shape:
+                // {"error":"Daily query limit reached.","used":3,"limit":3,"remaining":0}
+                String friendly = "You've hit your daily query limit. Come back tomorrow or upgrade your plan.";
+                try {
+                    JsonNode err = mapper.readTree(responseBody);
+                    int used  = err.path("used").asInt(-1);
+                    int limit = err.path("limit").asInt(-1);
+                    if (limit > 0) {
+                        friendly = String.format(
+                                "Daily query limit reached (%d of %d used). Resets at midnight UTC.",
+                                used, limit);
+                    }
+                } catch (Exception ignored) { /* keep default friendly message */ }
+                throw new LLMException(friendly);
+            }
+            if (status == 401 || status == 403) {
+                throw new LLMException("Your session has expired. Please sign out and sign back in.");
+            }
             if (status != 200) {
                 throw new LLMException("GPT-4o mini API error (" + status + "): " + responseBody);
             }

@@ -6,6 +6,7 @@ import LoadingOverlay from './components/LoadingOverlay'
 import ToastContainer from './components/Toast'
 import UpdateBanner   from './components/UpdateBanner'
 import WelcomeModal   from './components/WelcomeModal'
+import Login          from './components/Login'
 import Chat           from './views/Chat'
 import Library        from './views/Library'
 import Settings       from './views/Settings'
@@ -15,7 +16,7 @@ import Settings       from './views/Settings'
 // ─────────────────────────────────────────────────────────────────────────────
 
 function Shell() {
-  const { setApiBase, setConnected, connected } = useApp()
+  const { setApiBase, setConnected, connected, auth } = useApp()
   const [loadMsg, setLoadMsg] = useState('Starting up…')
   const [loaded,  setLoaded]  = useState(false)
   const [view,    setView]    = useState('chat')
@@ -71,6 +72,10 @@ function Shell() {
 
       <ToastContainer />
       <WelcomeModal />
+      {/* Gate the entire UI behind sign-in. Login renders on top of (but
+          outside of) the main shell so even if the backend hasn't connected
+          yet, the user can already start signing in. */}
+      {auth.checked && !auth.authenticated && <Login />}
     </>
   )
 }

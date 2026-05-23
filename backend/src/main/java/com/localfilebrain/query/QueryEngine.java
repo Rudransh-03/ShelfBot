@@ -1,7 +1,9 @@
 package com.localfilebrain.query;
 
+import com.localfilebrain.auth.AuthTokenStore;
 import com.localfilebrain.config.AppConfig;
-import com.localfilebrain.embedding.OpenAIEmbeddingClient;
+import com.localfilebrain.embedding.EmbeddingClient;
+import com.localfilebrain.embedding.EmbeddingClientFactory;
 import com.localfilebrain.llm.GPT4oMiniClient;
 import com.localfilebrain.storage.VectorStore;
 import com.localfilebrain.storage.VectorStore.SearchResult;
@@ -75,26 +77,44 @@ public final class QueryEngine {
             "later", "ttyl", "take care"
     );
 
-    private final OpenAIEmbeddingClient embeddingClient;
-    private final VectorStore           vectorStore;
-    private final GPT4oMiniClient       llmClient;
-    private final ConversationHistory   history;
-    private final boolean               ownsVectorStore;
+    private final EmbeddingClient     embeddingClient;
+    private final VectorStore         vectorStore;
+    private final GPT4oMiniClient     llmClient;
+    private final ConversationHistory history;
+    private final boolean             ownsVectorStore;
+    private final boolean             ownsEmbeddingClient;
 
     public QueryEngine(AppConfig config) {
-        this(config, null);
+        this(config, null, null, new AuthTokenStore());
+    }
+
+    public QueryEngine(AppConfig config, VectorStore sharedStore) {
+        this(config, sharedStore, null, new AuthTokenStore());
+    }
+
+    public QueryEngine(AppConfig config, VectorStore sharedStore, EmbeddingClient sharedEmbedding) {
+        this(config, sharedStore, sharedEmbedding, new AuthTokenStore());
     }
 
     /**
-     * Accepts a shared {@link VectorStore} so the indexer (which owns the
-     * Lucene IndexWriter) and the query engine (read-only) operate on the
-     * same index without competing for the writer lock.
+     * Accepts a shared {@link VectorStore}, {@link EmbeddingClient}, and
+     * {@link AuthTokenStore} so the indexer and the query engine operate
+     * on the same instances. Critical: the embedding model used to query
+     * MUST match the one that wrote the index, or the cosine search
+     * returns nonsense. The token store is what binds outgoing OpenAI
+     * calls to the currently signed-in user.
      */
-    public QueryEngine(AppConfig config, VectorStore sharedStore) {
-        this.embeddingClient = new OpenAIEmbeddingClient(
-                config.getOpenAiApiKey(),
-                config.getEmbeddingBatchSize()
-        );
+    public QueryEngine(AppConfig config,
+                       VectorStore sharedStore,
+                       EmbeddingClient sharedEmbedding,
+                       AuthTokenStore tokenStore) {
+        if (sharedEmbedding != null) {
+            this.embeddingClient     = sharedEmbedding;
+            this.ownsEmbeddingClient = false;
+        } else {
+            this.embeddingClient     = EmbeddingClientFactory.create(config, tokenStore);
+            this.ownsEmbeddingClient = true;
+        }
         if (sharedStore != null) {
             this.vectorStore     = sharedStore;
             this.ownsVectorStore = false;
@@ -102,12 +122,13 @@ public final class QueryEngine {
             this.vectorStore     = new VectorStore(config.getVectorIndexPath());
             this.ownsVectorStore = true;
         }
-        this.llmClient = new GPT4oMiniClient(config.getOpenAiApiKey());
+        this.llmClient = new GPT4oMiniClient(config, tokenStore);
         this.history   = new ConversationHistory(5);
     }
 
     public void close() {
-        if (ownsVectorStore) vectorStore.close();
+        if (ownsVectorStore)     vectorStore.close();
+        if (ownsEmbeddingClient) embeddingClient.close();
     }
 
     public QueryResult query(String question) {

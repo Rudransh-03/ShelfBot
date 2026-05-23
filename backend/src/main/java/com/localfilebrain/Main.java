@@ -1,7 +1,10 @@
 package com.localfilebrain;
 
 import com.localfilebrain.api.ApiServer;
+import com.localfilebrain.auth.AuthTokenStore;
 import com.localfilebrain.config.AppConfig;
+import com.localfilebrain.embedding.EmbeddingClient;
+import com.localfilebrain.embedding.EmbeddingClientFactory;
 import com.localfilebrain.ingestion.FileWatcher;
 import com.localfilebrain.ingestion.IndexMetadataStore;
 import com.localfilebrain.ingestion.IngestionPipeline;
@@ -10,6 +13,7 @@ import com.localfilebrain.storage.VectorStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Scanner;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -29,9 +33,11 @@ public final class Main {
     private static final String WHITE   = "\u001B[97m";
 
     private static QueryEngine queryEngine;
-    // Lazily-created shared vector store for CLI mode. The Electron-driven
-    // server mode owns its own; this one only exists for the interactive menu.
-    private static VectorStore cliVectorStore;
+    // Lazily-created shared vector store / embedding client for CLI mode.
+    // The Electron-driven server mode owns its own; these only exist for
+    // the interactive menu.
+    private static VectorStore     cliVectorStore;
+    private static EmbeddingClient cliEmbedding;
 
     private static synchronized VectorStore cliVectorStore(AppConfig config) {
         if (cliVectorStore == null) {
@@ -41,6 +47,16 @@ public final class Main {
             }));
         }
         return cliVectorStore;
+    }
+
+    private static synchronized EmbeddingClient cliEmbedding(AppConfig config) {
+        if (cliEmbedding == null) {
+            cliEmbedding = EmbeddingClientFactory.create(config);
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                if (cliEmbedding != null) cliEmbedding.close();
+            }));
+        }
+        return cliEmbedding;
     }
 
     public static void main(String[] args) throws InterruptedException {
@@ -106,11 +122,35 @@ public final class Main {
             metadataStore = new IndexMetadataStore(Paths.get("shelfbot-metadata.db"));
         }
 
+        // Holds the JWT issued by the proxy after sign-in. The Electron
+        // layer pushes the token here via POST /api/auth; OpenAI clients
+        // read from it whenever they need an Authorization header.
+        final AuthTokenStore tokenStore = new AuthTokenStore();
+
+        // Single shared embedding client. Local-by-default; downloads the BGE
+        // model on first launch (~130 MB) and caches it under ~/.shelfbot/models.
+        // The OpenAI fallback path is still available via embedding.provider=openai.
+        // Lazily — if the local model can't load (e.g. no network on first run)
+        // we fall back to OpenAI so the app still works.
+        EmbeddingClient embeddingClient = null;
+        try {
+            embeddingClient = EmbeddingClientFactory.create(config, tokenStore);
+        } catch (Exception e) {
+            log.warn("Could not load configured embedding backend ({}): {}", config.getEmbeddingProvider(), e.getMessage());
+        }
+
         // Single, shared Lucene index. Owned by Main for the lifetime of the
         // server. Every consumer (ApiServer's DELETE handler, QueryEngine,
         // IngestionPipeline used by the watcher + manual jobs) is wired to
         // this same instance because Lucene only allows one writer per dir.
         final VectorStore vectorStore = new VectorStore(config.getVectorIndexPath());
+
+        // If the embedding backend changed since the last run (e.g. user
+        // flipped openai ↔ local), the existing vectors are in the wrong
+        // dimension / vector space. Wipe and re-index.
+        if (embeddingClient != null) {
+            resetIfEmbeddingChanged(config, metadataStore, vectorStore, embeddingClient);
+        }
 
         // Self-heal the metadata/vector-store drift case: if the metadata DB
         // claims files are indexed but the vector store is actually empty
@@ -119,18 +159,21 @@ public final class Main {
         // next scan re-processes everything instead of skipping.
         resetMetadataIfDrifted(metadataStore, vectorStore);
 
-        // QueryEngine requires a valid OpenAI key; it may not be set yet —
-        // ApiServer initialises it lazily on the first query request.
+        final EmbeddingClient finalEmbedding = embeddingClient;
+
+        // QueryEngine requires a valid OpenAI key (for the answer LLM, not
+        // necessarily embeddings); it may not be set yet — ApiServer
+        // initialises it lazily on the first query request.
         QueryEngine queryEngine = null;
         try {
-            queryEngine = new QueryEngine(config, vectorStore);
+            queryEngine = new QueryEngine(config, vectorStore, finalEmbedding, tokenStore);
         } catch (Exception e) {
             log.warn("QueryEngine not ready ({}). It will be initialised on first query.", e.getMessage());
         }
 
         final IndexMetadataStore finalStore = metadataStore;
         try {
-            ApiServer server = new ApiServer(port, config, finalStore, vectorStore, queryEngine);
+            ApiServer server = new ApiServer(port, config, finalStore, vectorStore, finalEmbedding, tokenStore, queryEngine);
             server.start();
 
             // Signal to Electron that the server is ready (read from stdout)
@@ -138,18 +181,15 @@ public final class Main {
             System.out.flush();
 
             // Live file watcher — keeps the index in sync as the user edits
-            // files. Requires a working OpenAI key (for re-embedding changed
-            // files); if absent, we skip the watcher and the user can still
-            // re-index manually after configuring the key in Settings.
-            final FileWatcher watcher = tryStartWatcher(config, finalStore, vectorStore);
+            // files. Skips silently if the embedding/llm config isn't ready;
+            // the user can still re-index manually after fixing config.
+            final FileWatcher watcher = tryStartWatcher(config, finalStore, vectorStore, finalEmbedding);
 
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 if (watcher != null) watcher.close();
                 server.stop();
-                // Close the shared store before the metadata DB so any final
-                // commit lands before we tear down dependencies it doesn't
-                // actually have, but ordering here is defensive anyway.
                 vectorStore.close();
+                if (finalEmbedding != null) finalEmbedding.close();
                 finalStore.close();
             }));
 
@@ -168,9 +208,12 @@ public final class Main {
      * failure is logged and swallowed — the API server still runs, and
      * the user can re-index manually via the UI.
      */
-    private static FileWatcher tryStartWatcher(AppConfig config, IndexMetadataStore store, VectorStore vectorStore) {
+    private static FileWatcher tryStartWatcher(AppConfig config,
+                                               IndexMetadataStore store,
+                                               VectorStore vectorStore,
+                                               EmbeddingClient embeddingClient) {
         try {
-            IngestionPipeline pipeline = new IngestionPipeline(config, store, vectorStore);
+            IngestionPipeline pipeline = new IngestionPipeline(config, store, vectorStore, embeddingClient);
             FileWatcher watcher = new FileWatcher(config, pipeline);
             watcher.start();
             return watcher;
@@ -219,10 +262,82 @@ public final class Main {
         System.out.println();
         AppConfig config = AppConfig.load();
         try (IndexMetadataStore metadataStore = new IndexMetadataStore(config.getMetadataDbPath())) {
-            VectorStore vec = cliVectorStore(config);
+            VectorStore     vec       = cliVectorStore(config);
+            EmbeddingClient embedding = cliEmbedding(config);
+            resetIfEmbeddingChanged(config, metadataStore, vec, embedding);
             resetMetadataIfDrifted(metadataStore, vec);
-            IngestionPipeline pipeline = new IngestionPipeline(config, metadataStore, vec);
+            IngestionPipeline pipeline = new IngestionPipeline(config, metadataStore, vec, embedding);
             pipeline.run();
+        }
+    }
+
+    /**
+     * If the embedding backend has changed since the index was last written,
+     * the existing vectors are in the wrong space (and usually the wrong
+     * dimension — 1536 for OpenAI vs 384 for local). Wipe the Lucene index
+     * AND clear the INDEXED metadata rows so the next scan re-embeds
+     * everything with the new model.
+     *
+     * We persist the active model id in a tiny {@code .embedding-meta}
+     * marker file next to the index. First-run writes it; subsequent runs
+     * compare and act.
+     */
+    private static void resetIfEmbeddingChanged(AppConfig config,
+                                                IndexMetadataStore meta,
+                                                VectorStore vec,
+                                                EmbeddingClient embedding) {
+        Path indexDir   = config.getVectorIndexPath();
+        Path markerFile = indexDir.resolve(".embedding-meta");
+        String current  = embedding.modelId();
+        String previous = null;
+        try {
+            if (java.nio.file.Files.exists(markerFile)) {
+                previous = java.nio.file.Files.readString(markerFile).trim();
+            }
+        } catch (Exception e) {
+            log.warn("Could not read embedding marker ({}); treating as first run.", e.getMessage());
+        }
+
+        if (previous == null) {
+            // No marker yet. If the index already has vectors, they were
+            // written by an older build of the app that didn't track the
+            // embedding model — we can't safely query them with the current
+            // model (likely different dimension / vector space). Wipe so
+            // the next scan re-embeds with the active model.
+            int existing = vec.count();
+            if (existing > 0) {
+                log.warn("Existing index has {} vectors but no embedding marker. "
+                      + "Wiping for safety (pre-marker build); files will be re-embedded with '{}'.",
+                        existing, current);
+                vec.deleteAll();
+                meta.clearAllIndexedRecords();
+            }
+            writeMarker(markerFile, current);
+            return;
+        }
+        if (previous.equals(current)) return;
+
+        log.warn("Embedding backend changed: '{}' → '{}'. Wiping Lucene index "
+               + "and clearing INDEXED metadata so every file is re-embedded.", previous, current);
+        try {
+            // Drop every doc in the index. Safer than nuking the directory
+            // because the shared writer is open inside this process.
+            int before = vec.count();
+            vec.deleteAll();
+            log.info("Cleared {} vectors from the index.", before);
+        } catch (Exception e) {
+            log.error("Failed to clear vector store on embedding change: {}", e.getMessage(), e);
+        }
+        meta.clearAllIndexedRecords();
+        writeMarker(markerFile, current);
+    }
+
+    private static void writeMarker(Path markerFile, String content) {
+        try {
+            java.nio.file.Files.createDirectories(markerFile.getParent());
+            java.nio.file.Files.writeString(markerFile, content);
+        } catch (Exception e) {
+            log.warn("Could not write embedding marker '{}': {}", markerFile, e.getMessage());
         }
     }
 
@@ -271,7 +386,7 @@ public final class Main {
         AppConfig config = AppConfig.load();
 
         if (queryEngine == null) {
-            queryEngine = new QueryEngine(config, cliVectorStore(config));
+            queryEngine = new QueryEngine(config, cliVectorStore(config), cliEmbedding(config));
             System.out.println(DIM + "  Ready  ·  conversation history on (last 5 exchanges)" + RESET);
         }
 

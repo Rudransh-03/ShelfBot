@@ -43,10 +43,22 @@ const CloseIcon = () => (
 )
 
 export default function Settings({ active }) {
-  const { api, connected, apiBase, toast } = useApp()
+  const { api, connected, apiBase, toast, stats, auth, logout, refreshAuth } = useApp()
+
+  useEffect(() => {
+    if (active) refreshAuth()
+  }, [active, refreshAuth])
   const [rootPaths,       setRootPaths]       = useState([])
   const [vectorIndexPath, setVectorIndexPath] = useState('—')
   const [dirty,           setDirty]           = useState(false)
+
+  const embeddingModel = stats?.embeddingModel ?? 'unknown'
+  const embeddingIsLocal = embeddingModel.startsWith('local:')
+  const embeddingLabel = embeddingIsLocal
+    ? `On-device · ${embeddingModel.slice('local:'.length)}`
+    : embeddingModel.startsWith('openai:')
+      ? `OpenAI · ${embeddingModel.slice('openai:'.length)}`
+      : embeddingModel
 
   useEffect(() => {
     if (!active || !connected || !api) return
@@ -191,7 +203,52 @@ export default function Settings({ active }) {
                 Embedded · {vectorIndexPath}
               </span>
             </div>
+            <div className="svc-row">
+              <span className="svc-name">
+                <ServerIcon />
+                Embedding model
+              </span>
+              <span className="svc-val" title={embeddingModel}>
+                <span className={`dot ${embeddingIsLocal ? 'g' : 'a'}`} />
+                {embeddingLabel}
+              </span>
+            </div>
           </div>
+        </div>
+
+        {/* Account */}
+        <div className="scard">
+          <div className="scard-title">Account</div>
+          <div className="scard-sub">
+            Your sign-in unlocks the daily query quota on the proxy server.
+          </div>
+          <div className="svc-list">
+            <div className="svc-row">
+              <span className="svc-name">Signed in as</span>
+              <span className="svc-val">
+                <span className="dot g" />
+                {auth?.email || '—'}
+              </span>
+            </div>
+            {auth?.usage && (
+              <div className="svc-row">
+                <span className="svc-name">Today's queries</span>
+                <span className="svc-val">
+                  {auth.usage.used} / {auth.usage.limit}
+                </span>
+              </div>
+            )}
+          </div>
+          <button
+            className="btn-ghost"
+            style={{ marginTop: 14 }}
+            onClick={async () => {
+              await logout()
+              toast('Signed out', 'i')
+            }}
+          >
+            Sign out
+          </button>
         </div>
 
         {/* About */}

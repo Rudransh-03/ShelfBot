@@ -1,7 +1,9 @@
 package com.localfilebrain.api;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.localfilebrain.auth.AuthTokenStore;
 import com.localfilebrain.config.AppConfig;
+import com.localfilebrain.embedding.EmbeddingClient;
 import com.localfilebrain.ingestion.IndexMetadataStore;
 import com.localfilebrain.ingestion.IngestionPipeline;
 import com.localfilebrain.model.FileRecord;
@@ -48,6 +50,8 @@ public final class ApiServer {
     private volatile AppConfig       config;
     private final IndexMetadataStore metadataStore;
     private final VectorStore        vectorStore;
+    private final EmbeddingClient    embeddingClient;
+    private final AuthTokenStore     tokenStore;
 
     // QueryEngine is created lazily so the server still starts even when the
     // OpenAI key is not yet configured.
@@ -71,11 +75,15 @@ public final class ApiServer {
                      AppConfig config,
                      IndexMetadataStore metadataStore,
                      VectorStore vectorStore,
+                     EmbeddingClient embeddingClient,
+                     AuthTokenStore tokenStore,
                      QueryEngine queryEngine) throws IOException {
-        this.config        = config;
-        this.metadataStore = metadataStore;
-        this.vectorStore   = vectorStore;
-        this.queryEngine   = queryEngine;   // may be null if config incomplete
+        this.config          = config;
+        this.metadataStore   = metadataStore;
+        this.vectorStore     = vectorStore;
+        this.embeddingClient = embeddingClient;
+        this.tokenStore      = tokenStore;
+        this.queryEngine     = queryEngine;   // may be null if config incomplete
 
         this.server = HttpServer.create(new InetSocketAddress("localhost", port), 64);
         this.server.setExecutor(Executors.newCachedThreadPool(r -> {
@@ -113,6 +121,54 @@ public final class ApiServer {
         server.createContext("/api/conversation", this::handleConversation);
         server.createContext("/api/config",       this::handleConfig);
         server.createContext("/api/files",        this::handleFiles);
+        server.createContext("/api/auth",         this::handleAuth);
+    }
+
+    /**
+     * Auth-token bridge between the Electron UI and the Java backend.
+     *   GET    /api/auth          → { authenticated, email? }
+     *   POST   /api/auth          → { token, email } stores the JWT
+     *   DELETE /api/auth          → clears the token (logout)
+     */
+    private void handleAuth(HttpExchange ex) throws IOException {
+        if (preflight(ex)) return;
+
+        if (isMethod(ex, "GET")) {
+            sendJson(ex, 200, map(
+                "authenticated", tokenStore.isAuthenticated(),
+                "email",         tokenStore.getUserEmail()
+            ));
+            return;
+        }
+
+        if (isMethod(ex, "POST")) {
+            try {
+                Map<?, ?> body  = readJson(ex);
+                String    token = (String) body.get("token");
+                String    email = (String) body.get("email");
+                if (token == null || token.isBlank()) {
+                    sendError(ex, 400, "token is required");
+                    return;
+                }
+                tokenStore.setToken(token, email);
+                // Reset the lazy QueryEngine so the next query picks up the
+                // new token instead of capturing a stale "Not signed in".
+                this.queryEngine = null;
+                sendJson(ex, 200, map("ok", true, "email", email));
+            } catch (Exception e) {
+                sendError(ex, 500, e.getMessage());
+            }
+            return;
+        }
+
+        if (isMethod(ex, "DELETE")) {
+            tokenStore.clear();
+            this.queryEngine = null;
+            sendJson(ex, 200, map("ok", true));
+            return;
+        }
+
+        methodNotAllowed(ex);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -140,6 +196,8 @@ public final class ApiServer {
             String       rootPath     = rootPaths.isEmpty() ? "" : rootPaths.get(0);
             List<String> accessIssues = findUnreadableRoots(rootPaths);
 
+            String embeddingModel = embeddingClient != null ? embeddingClient.modelId() : "unknown";
+
             sendJson(ex, 200, map(
                 "indexedFiles",       indexed,
                 "failedFiles",        failed,
@@ -151,7 +209,11 @@ public final class ApiServer {
                 "tokensLimit",        IngestionPipeline.MAX_TOKENS_TOTAL,
                 "tokensLimitPerFile", IngestionPipeline.MAX_TOKENS_PER_FILE,
                 "accessIssues",       accessIssues,
-                "platform",           System.getProperty("os.name", "").toLowerCase()
+                "platform",           System.getProperty("os.name", "").toLowerCase(),
+                "embeddingModel",     embeddingModel,
+                "apiMode",            config.getApiMode(),
+                "authenticated",      tokenStore.isAuthenticated(),
+                "userEmail",          tokenStore.getUserEmail()
             ));
         } catch (Exception e) {
             log.error("status error", e);
@@ -199,7 +261,9 @@ public final class ApiServer {
         bgExecutor.submit(() -> {
             try {
                 AppConfig fresh = AppConfig.load();
-                IngestionPipeline pipeline = new IngestionPipeline(fresh, metadataStore, vectorStore);
+                IngestionPipeline pipeline = new IngestionPipeline(fresh, metadataStore, vectorStore, embeddingClient);
+                // Note: embeddingClient already wraps tokenStore via Main, so
+                // proxy-mode embedding calls see the active JWT automatically.
                 IngestionResult result = pipeline.run((processed, total, failed, currentFile) ->
                         currentProgress.set(new IndexingProgress(processed, total, failed, currentFile))
                 );
@@ -391,7 +455,7 @@ public final class ApiServer {
         synchronized (this) {
             if (queryEngine == null) {
                 AppConfig fresh = AppConfig.load();
-                queryEngine = new QueryEngine(fresh, vectorStore);
+                queryEngine = new QueryEngine(fresh, vectorStore, embeddingClient, tokenStore);
             }
         }
         return queryEngine;

@@ -22,6 +22,36 @@ export function AppProvider({ children }) {
   const [lastJob,  setLastJob]  = useState(null) // { ok, data?, msg? }
   const [progress, setProgress] = useState(null) // { processed, total, failed, currentFile }
 
+  // Auth state
+  const [auth, setAuth] = useState({ checked: false, authenticated: false, email: null, usage: null })
+
+  const refreshAuth = useCallback(async () => {
+    const E = window.electron
+    if (!E?.authMe) { setAuth({ checked: true, authenticated: false }); return null }
+    const r = await E.authMe()
+    setAuth({
+      checked: true,
+      authenticated: !!r?.authenticated,
+      email: r?.email ?? null,
+      usage: r?.usage ?? null,
+    })
+    return r
+  }, [])
+
+  const login = useCallback(async (email) => {
+    const E = window.electron
+    if (!E?.authLogin) return { ok: false, error: 'Desktop app required' }
+    const r = await E.authLogin(email)
+    if (r.ok) await refreshAuth()
+    return r
+  }, [refreshAuth])
+
+  const logout = useCallback(async () => {
+    const E = window.electron
+    if (E?.authLogout) await E.authLogout()
+    setAuth({ checked: true, authenticated: false, email: null, usage: null })
+  }, [])
+
   const busyTimer = useRef(null)
   const idleTimer = useRef(null)
 
@@ -88,16 +118,39 @@ export function AppProvider({ children }) {
 
   // On connect: fetch status immediately, then keep a slow background refresh
   // running so lastIndexed stays current (this is what the future file watcher
-  // will piggyback on for free).
+  // will piggyback on for free). The same tick also refreshes /me so the
+  // daily-usage counter in Settings stays accurate without polling per query.
   useEffect(() => {
     if (!connected || !api) return
     loadStats()
-    idleTimer.current = setInterval(() => { if (!indexing) loadStats() }, IDLE_POLL_MS)
+    idleTimer.current = setInterval(() => {
+      if (!indexing) loadStats()
+      refreshAuth()
+    }, IDLE_POLL_MS)
     return () => {
       if (idleTimer.current) clearInterval(idleTimer.current)
       idleTimer.current = null
     }
-  }, [connected, api, loadStats, indexing])
+  }, [connected, api, loadStats, refreshAuth, indexing])
+
+  // Boot: check whether we have a valid saved token before showing the UI.
+  // Runs once after the API base is set so the bootstrap can also push the
+  // active JWT into the Java backend before any query goes through.
+  useEffect(() => {
+    const E = window.electron
+    if (!E?.authBootstrap) {
+      setAuth({ checked: true, authenticated: false })
+      return
+    }
+    E.authBootstrap().then(r => {
+      setAuth({
+        checked: true,
+        authenticated: !!r?.authenticated,
+        email: r?.email ?? null,
+        usage: r?.usage ?? null,
+      })
+    })
+  }, [])
 
   // On unmount: make sure the busy timer is also cleared
   useEffect(() => () => {
@@ -111,6 +164,7 @@ export function AppProvider({ children }) {
       toast, toasts,
       stats, indexing, progress, lastJob,
       loadStats, triggerIndex,
+      auth, login, logout, refreshAuth,
     }}>
       {children}
     </AppCtx.Provider>

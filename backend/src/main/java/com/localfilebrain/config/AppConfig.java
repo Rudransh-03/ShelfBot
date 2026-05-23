@@ -153,15 +153,62 @@ public final class AppConfig {
     }
 
     // -------------------------------------------------------------------------
-    // Embedding (OpenAI)
+    // Embedding
     // -------------------------------------------------------------------------
 
+    /**
+     * Which embedding backend to use. "local" (default) runs bge-small-en-v1.5
+     * on-device so file contents never leave the machine during indexing.
+     * "openai" falls back to the cloud embedding API and still requires an
+     * OpenAI key (which is needed for the answer LLM regardless).
+     */
+    public String getEmbeddingProvider() {
+        String v = getOrDefault("embedding.provider", "local").toLowerCase();
+        return v.equals("openai") ? "openai" : "local";
+    }
+
+    /** Where the local model files are cached. Defaults to ~/.shelfbot/models/ . */
+    public Path getLocalEmbeddingModelPath() {
+        String def = Paths.get(System.getProperty("user.home"), ".shelfbot", "models", "bge-small-en-v1.5")
+                .toString();
+        return Paths.get(getOrDefault("embedding.model.path", def));
+    }
+
+    /**
+     * Returns the OpenAI key, or an empty string when none is configured
+     * (the common case for proxy mode — the key lives on the proxy server
+     * and never reaches the desktop). Callers that genuinely need a key
+     * (i.e. direct-mode clients) should check for blank.
+     */
     public String getOpenAiApiKey() {
-        return require("openai.api.key");
+        return getOrDefault("openai.api.key", "");
     }
 
     public int getEmbeddingBatchSize() {
         return getInt("embedding.batch.size", 100);
+    }
+
+    // -------------------------------------------------------------------------
+    // Auth proxy
+    // -------------------------------------------------------------------------
+
+    /**
+     * "proxy" (default) routes every OpenAI call through our auth proxy
+     * server — the desktop app must hold a valid JWT obtained at sign-in.
+     * "direct" calls api.openai.com straight from the user's machine using
+     * the legacy {@code openai.api.key} config entry; useful only in
+     * developer / offline scenarios because it ships your API key on the
+     * user's device.
+     */
+    public String getApiMode() {
+        String v = getOrDefault("api.mode", "proxy").toLowerCase();
+        return v.equals("direct") ? "direct" : "proxy";
+    }
+
+    /** Base URL of the auth proxy ({@code http://localhost:8787} in dev). */
+    public String getProxyUrl() {
+        String url = getOrDefault("api.proxy.url", "http://localhost:8787");
+        return url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
     }
 
     // -------------------------------------------------------------------------

@@ -10,6 +10,13 @@ ui/node_modules/
 ui/out/
 ui/dist/
 
+# ── Proxy ─────────────────────────────────────────
+proxy/node_modules/
+proxy/.env
+proxy/*.db
+proxy/*.db-shm
+proxy/*.db-wal
+
 # ── Root-level build / runtime artifacts ─────────
 target/
 chroma-data/
@@ -22,6 +29,7 @@ lib/
 # ── Secrets / env ────────────────────────────────
 .env
 .env.*
+!.env.example
 config.properties
 
 # ── IDE / OS ──────────────────────────────────────

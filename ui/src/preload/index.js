@@ -14,4 +14,10 @@ contextBridge.exposeInMainWorld('electron', {
   onUpdateStatus:    (cb) => ipcRenderer.on('update-status', (_e, s) => cb(s)),
   installUpdate:     ()   => ipcRenderer.invoke('updater:install'),
   checkForUpdates:   ()   => ipcRenderer.invoke('updater:check'),
+
+  // Auth
+  authBootstrap:  ()       => ipcRenderer.invoke('auth:bootstrap'),
+  authLogin:      (email)  => ipcRenderer.invoke('auth:login', { email }),
+  authLogout:     ()       => ipcRenderer.invoke('auth:logout'),
+  authMe:         ()       => ipcRenderer.invoke('auth:me'),
 })

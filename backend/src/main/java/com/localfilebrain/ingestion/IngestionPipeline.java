@@ -1,7 +1,9 @@
 package com.localfilebrain.ingestion;
 
+import com.localfilebrain.auth.AuthTokenStore;
 import com.localfilebrain.config.AppConfig;
-import com.localfilebrain.embedding.OpenAIEmbeddingClient;
+import com.localfilebrain.embedding.EmbeddingClient;
+import com.localfilebrain.embedding.EmbeddingClientFactory;
 import com.localfilebrain.model.DocumentChunk;
 import com.localfilebrain.model.FileRecord;
 import com.localfilebrain.model.IngestionResult;
@@ -33,55 +35,75 @@ public final class IngestionPipeline {
 
     private static final Logger log = LoggerFactory.getLogger(IngestionPipeline.class);
 
-    // ── Budget caps ────────────────────────────────────────────────────────────
-    // text-embedding-3-small is billed per token. We track an *estimated* token
-    // count (chars/4) per file and refuse to index anything that would either
-    // (a) eat too much of the user's overall budget in one go, or
-    // (b) push the cumulative total past the per-user ceiling.
-    //
-    // The estimate is intentionally rough — we only need it to bound the worst
-    // case, not to bill the user. ~4 chars/token is the OpenAI rule of thumb
-    // for English text and slightly overestimates for code/CJK, which is the
-    // safe direction.
+    // ── Indexing size caps ─────────────────────────────────────────────────────
+    // These were originally OpenAI-cost guards. Now that embeddings run locally
+    // via BGE (zero per-token cost), the caps mainly bound on-disk index size
+    // and indexing time. We've kept the per-file cap small so a single 5,000-
+    // page PDF can't dominate, but raised the per-user total significantly
+    // because there's no longer a $ ceiling to defend.
 
     /** Max estimated tokens any single file may contribute. ≈ 1,000 pages. */
     public static final long MAX_TOKENS_PER_FILE = 500_000L;
 
-    /** Max estimated tokens an entire user library may contribute. ≈ 80,000 pages. */
-    public static final long MAX_TOKENS_TOTAL    = 40_000_000L;
+    /**
+     * Max estimated tokens an entire user library may contribute.
+     * ≈ 400,000 pages. With local embeddings this is purely a sanity check
+     * to prevent runaway indexing into the wrong folder (e.g. accidentally
+     * pointing the app at the system root). Disk usage at the cap is on
+     * the order of ~5 GB of Lucene segments + chunk text.
+     */
+    public static final long MAX_TOKENS_TOTAL    = 200_000_000L;
 
     /** Chars-per-token used for the rough estimate. */
     private static final int CHARS_PER_TOKEN = 4;
 
-    private final AppConfig             config;
-    private final IndexMetadataStore    metadataStore;
-    private final FileScanner           fileScanner;
-    private final TextExtractor         textExtractor;
-    private final TextChunker           textChunker;
-    private final OpenAIEmbeddingClient embeddingClient;
-    private final VectorStore           vectorStore;
-    private final boolean               ownsVectorStore;
+    private final AppConfig          config;
+    private final IndexMetadataStore metadataStore;
+    private final FileScanner        fileScanner;
+    private final TextExtractor      textExtractor;
+    private final TextChunker        textChunker;
+    private final EmbeddingClient    embeddingClient;
+    private final VectorStore        vectorStore;
+    private final boolean            ownsVectorStore;
+    private final boolean            ownsEmbeddingClient;
 
     public IngestionPipeline(AppConfig config, IndexMetadataStore metadataStore) {
-        this(config, metadataStore, null);
+        this(config, metadataStore, null, null);
+    }
+
+    public IngestionPipeline(AppConfig config, IndexMetadataStore metadataStore, VectorStore sharedStore) {
+        this(config, metadataStore, sharedStore, null);
     }
 
     /**
-     * Lets callers (Main / ApiServer) inject a shared {@link VectorStore} so
-     * the live FileWatcher, the manual indexing job, and the query path all
-     * write/read through the same Lucene IndexWriter — Lucene only permits
-     * one writer per index directory.
+     * Lets callers (Main / ApiServer) inject a shared {@link VectorStore} and
+     * {@link EmbeddingClient} so the live FileWatcher, the manual indexing
+     * job, and the query path all use the same instances — Lucene allows one
+     * writer per directory, and the local ONNX embedding session is
+     * expensive enough that we never want two.
      */
-    public IngestionPipeline(AppConfig config, IndexMetadataStore metadataStore, VectorStore sharedStore) {
-        this.config          = config;
-        this.metadataStore   = metadataStore;
-        this.fileScanner     = new FileScanner(config, metadataStore);
-        this.textExtractor   = new TextExtractor();
-        this.textChunker     = new TextChunker(config);
-        this.embeddingClient = new OpenAIEmbeddingClient(
-                config.getOpenAiApiKey(),
-                config.getEmbeddingBatchSize()
-        );
+    public IngestionPipeline(AppConfig config,
+                             IndexMetadataStore metadataStore,
+                             VectorStore sharedStore,
+                             EmbeddingClient sharedEmbedding) {
+        this.config        = config;
+        this.metadataStore = metadataStore;
+        this.fileScanner   = new FileScanner(config, metadataStore);
+        this.textExtractor = new TextExtractor();
+        this.textChunker   = new TextChunker(config);
+
+        if (sharedEmbedding != null) {
+            this.embeddingClient     = sharedEmbedding;
+            this.ownsEmbeddingClient = false;
+        } else {
+            // No shared embedding — fall back to a freshly built one.
+            // Pass a transient (empty) token store; the caller really should
+            // hand us a shared embedding client in proxy mode so the active
+            // JWT is visible.
+            this.embeddingClient     = EmbeddingClientFactory.create(config, new AuthTokenStore());
+            this.ownsEmbeddingClient = true;
+        }
+
         if (sharedStore != null) {
             this.vectorStore     = sharedStore;
             this.ownsVectorStore = false;
@@ -97,7 +119,8 @@ public final class IngestionPipeline {
      * times.
      */
     public void close() {
-        if (ownsVectorStore) vectorStore.close();
+        if (ownsVectorStore)     vectorStore.close();
+        if (ownsEmbeddingClient) embeddingClient.close();
     }
 
     public IngestionResult run() {

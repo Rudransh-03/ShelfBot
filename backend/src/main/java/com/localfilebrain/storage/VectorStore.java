@@ -169,6 +169,23 @@ public final class VectorStore implements AutoCloseable {
     }
 
     /**
+     * Wipes every document from the index. Used by the startup migration
+     * path when the embedding backend (and therefore vector dimensionality)
+     * has changed and the existing vectors would be incompatible with new
+     * queries.
+     */
+    public synchronized void deleteAll() {
+        try {
+            writer.deleteAll();
+            writer.commit();
+            searchers.maybeRefresh();
+            log.warn("Vector store wiped (deleteAll)");
+        } catch (IOException e) {
+            throw new VectorStoreException("Failed to wipe vector store", e);
+        }
+    }
+
+    /**
      * Deletes every chunk that came from a given source file. Called before
      * re-indexing a changed file and when the user removes a file from the
      * Library list.

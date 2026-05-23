@@ -62,7 +62,7 @@ export default function UpdateBanner() {
       <div className="update-banner-icon"><SparkIcon /></div>
       <div className="update-banner-body">
         <div className="update-banner-title">
-          ShelfBot {state.version ? `v${state.version}` : 'update'} is ready
+          Rudo {state.version ? `v${state.version}` : 'update'} is ready
         </div>
         <div className="update-banner-sub">Restart to install — takes a few seconds.</div>
       </div>

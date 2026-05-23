@@ -258,7 +258,7 @@ public final class QueryEngine {
         if (normalised.isEmpty()) return null;
 
         if (GREETINGS.contains(normalised)) {
-            return "Hi! I'm ShelfBot — ask me anything about the files you've indexed.";
+            return "Hi! I'm Rudo — ask me anything about the files you've indexed.";
         }
         if (THANKS.contains(normalised)) {
             return "You're welcome! Let me know if there's anything else you'd like to look up.";

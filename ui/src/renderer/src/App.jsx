@@ -6,7 +6,7 @@ import LoadingOverlay from './components/LoadingOverlay'
 import ToastContainer from './components/Toast'
 import UpdateBanner   from './components/UpdateBanner'
 import WelcomeModal   from './components/WelcomeModal'
-import Login          from './components/Login'
+import BackgroundFX   from './components/BackgroundFX'
 import Chat           from './views/Chat'
 import Library        from './views/Library'
 import Settings       from './views/Settings'
@@ -16,10 +16,22 @@ import Settings       from './views/Settings'
 // ─────────────────────────────────────────────────────────────────────────────
 
 function Shell() {
-  const { setApiBase, setConnected, connected, auth } = useApp()
-  const [loadMsg, setLoadMsg] = useState('Starting up…')
-  const [loaded,  setLoaded]  = useState(false)
-  const [view,    setView]    = useState('chat')
+  const { setApiBase, setConnected, connected } = useApp()
+  const [loadMsg,   setLoadMsg]   = useState('Starting up…')
+  const [loaded,    setLoaded]    = useState(false)
+  const [view,      setView]      = useState('chat')
+  const [collapsed, setCollapsed] = useState(
+    // Remember the user's preference between sessions
+    () => localStorage.getItem('rudo.sidebar.collapsed') === 'true'
+  )
+
+  function toggleCollapsed() {
+    setCollapsed(c => {
+      const next = !c
+      try { localStorage.setItem('rudo.sidebar.collapsed', String(next)) } catch {}
+      return next
+    })
+  }
 
   async function initBackend(port) {
     const base = `http://localhost:${port}`
@@ -51,16 +63,19 @@ function Shell() {
 
   return (
     <>
+      <BackgroundFX />
       <LoadingOverlay visible={!loaded} msg={loadMsg} />
 
       <div className="app">
         <TitleBar connected={connected} />
         <UpdateBanner />
-        <div className="main-area">
+        <div className={`main-area${collapsed ? ' sidebar-collapsed' : ''}`}>
           <Sidebar
             active={view}
             onNav={setView}
             connected={connected}
+            collapsed={collapsed}
+            onToggle={toggleCollapsed}
           />
           <div className="content">
             <Chat    active={view === 'chat'} />
@@ -72,10 +87,6 @@ function Shell() {
 
       <ToastContainer />
       <WelcomeModal />
-      {/* Gate the entire UI behind sign-in. Login renders on top of (but
-          outside of) the main shell so even if the backend hasn't connected
-          yet, the user can already start signing in. */}
-      {auth.checked && !auth.authenticated && <Login />}
     </>
   )
 }

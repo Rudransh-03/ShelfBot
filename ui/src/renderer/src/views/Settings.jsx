@@ -43,7 +43,7 @@ const CloseIcon = () => (
 )
 
 export default function Settings({ active }) {
-  const { api, connected, apiBase, toast, stats, auth, logout, refreshAuth } = useApp()
+  const { api, connected, apiBase, toast, stats, auth, refreshAuth } = useApp()
 
   useEffect(() => {
     if (active) refreshAuth()
@@ -117,7 +117,7 @@ export default function Settings({ active }) {
       <div className="view-header">
         <div>
           <h1 className="view-title">Settings</h1>
-          <div className="view-subtitle">Configure ShelfBot to fit your workflow.</div>
+          <div className="view-subtitle">Configure Rudo to fit your workflow.</div>
         </div>
       </div>
       <div className="view-divider" />
@@ -127,7 +127,7 @@ export default function Settings({ active }) {
         <div className="scard">
           <div className="scard-title">Indexed folders</div>
           <div className="scard-sub">
-            ShelfBot recursively indexes all supported files
+            Rudo recursively indexes all supported files
             (PDF, DOCX, TXT, MD, XLSX, …) inside every folder listed below.
             Add as many as you need — your Desktop, Downloads, Documents, project folders, anything.
           </div>
@@ -180,7 +180,7 @@ export default function Settings({ active }) {
         <div className="scard">
           <div className="scard-title">Services</div>
           <div className="scard-sub">
-            Backend processes ShelfBot is connected to.
+            Backend processes Rudo is connected to.
           </div>
           <div className="svc-list">
             <div className="svc-row">
@@ -216,18 +216,18 @@ export default function Settings({ active }) {
           </div>
         </div>
 
-        {/* Account */}
+        {/* Plan */}
         <div className="scard">
-          <div className="scard-title">Account</div>
+          <div className="scard-title">Plan</div>
           <div className="scard-sub">
-            Your sign-in unlocks the daily query quota on the proxy server.
+            Your subscription is bound to this device. Upgrade to lift the daily query cap.
           </div>
           <div className="svc-list">
             <div className="svc-row">
-              <span className="svc-name">Signed in as</span>
+              <span className="svc-name">Tier</span>
               <span className="svc-val">
-                <span className="dot g" />
-                {auth?.email || '—'}
+                <span className={`dot ${auth?.plan === 'pro' ? 'g' : 'a'}`} />
+                {auth?.plan === 'pro' ? 'Pro' : 'Free'}
               </span>
             </div>
             {auth?.usage && (
@@ -238,17 +238,26 @@ export default function Settings({ active }) {
                 </span>
               </div>
             )}
+            {auth?.offline && (
+              <div className="svc-row">
+                <span className="svc-name">Connection</span>
+                <span className="svc-val">
+                  <span className="dot a" />
+                  Proxy offline — using cached session
+                </span>
+              </div>
+            )}
           </div>
-          <button
-            className="btn-ghost"
-            style={{ marginTop: 14 }}
-            onClick={async () => {
-              await logout()
-              toast('Signed out', 'i')
-            }}
-          >
-            Sign out
-          </button>
+          {auth?.plan !== 'pro' && (
+            <button
+              className="btn-primary"
+              style={{ marginTop: 14 }}
+              disabled
+              title="Coming soon"
+            >
+              Upgrade to Pro
+            </button>
+          )}
         </div>
 
         {/* About */}
@@ -260,7 +269,7 @@ export default function Settings({ active }) {
               <BookshelfIcon size={28} color="#e8c995" />
             </div>
             <div className="about-info">
-              <h3>ShelfBot <span className="ver-badge">v1.0.0</span></h3>
+              <h3>Rudo <span className="ver-badge">v1.0.0</span></h3>
               <p>Ask anything. Your files have the answer.</p>
             </div>
           </div>

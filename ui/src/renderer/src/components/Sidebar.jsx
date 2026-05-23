@@ -1,4 +1,5 @@
 import BookshelfIcon from './BookshelfIcon'
+import Mascot       from './Mascot'
 import { useApp } from '../context/AppContext'
 
 const RescanIcon = () => (
@@ -6,6 +7,14 @@ const RescanIcon = () => (
     <polyline points="23 4 23 10 17 10"/>
     <polyline points="1 20 1 14 7 14"/>
     <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+  </svg>
+)
+
+const HamburgerIcon = () => (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <line x1="3" y1="6"  x2="21" y2="6"/>
+    <line x1="3" y1="12" x2="21" y2="12"/>
+    <line x1="3" y1="18" x2="21" y2="18"/>
   </svg>
 )
 
@@ -52,8 +61,13 @@ const ITEMS = [
   },
 ]
 
-export default function Sidebar({ active, onNav, connected }) {
+export default function Sidebar({ active, onNav, connected, collapsed = false, onToggle }) {
   const { stats, indexing, triggerIndex } = useApp()
+
+  // Rudo's mood from sidebar's POV: thinking while indexing, sleeping
+  // when backend is offline, idle otherwise. Keeps a tiny sign of life
+  // visible in the nav even when the user is on Settings.
+  const mascotState = !connected ? 'sleeping' : indexing ? 'thinking' : 'idle'
 
   // What the badge says:
   //   • during a job  → "Indexing…" (live)
@@ -70,56 +84,92 @@ export default function Sidebar({ active, onNav, connected }) {
       : 'Files have not been indexed yet. Click the refresh icon to start.'
 
   return (
-    <nav className="sidebar">
-      <div className="sb-brand">
-        <div className="sb-brand-mark">
-          <BookshelfIcon size={16} color="#d4a574" />
-        </div>
-        <div className="sb-brand-name">ShelfBot</div>
+    <nav className={`sidebar${collapsed ? ' collapsed' : ''}`}>
+      <div className="sb-header">
+        <button
+          className="sb-burger"
+          onClick={onToggle}
+          aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          title={collapsed ? 'Expand' : 'Collapse'}
+        >
+          <HamburgerIcon />
+        </button>
+        {!collapsed && (
+          <div className="sb-brand">
+            <Mascot size="sm" state={mascotState} className="sb-brand-mascot" />
+            <div className="sb-brand-name">Rudo</div>
+          </div>
+        )}
       </div>
 
-      <div className="sb-section">Workspace</div>
+      {!collapsed && <div className="sb-section">Workspace</div>}
 
       {ITEMS.map(item => (
         <button
           key={item.id}
           className={`nav-item${active === item.id ? ' active' : ''}`}
           onClick={() => onNav(item.id)}
+          title={collapsed ? item.label : undefined}
         >
           {item.icon}
-          <span>{item.label}</span>
+          {!collapsed && <span>{item.label}</span>}
         </button>
       ))}
 
       <div className="nav-spacer" />
 
-      <div className="sb-sync-row" title={syncedTooltip}>
-        <div className={`sb-sync-icon${indexing ? ' busy' : ''}`}>
-          <RescanIcon />
-        </div>
-        <div className="sb-sync-text">
-          <div className="sb-status-sublabel">Synced</div>
-          <div className="sb-sync-label">{syncedLabel}</div>
-        </div>
-        <button
-          type="button"
-          className="sb-sync-btn"
-          onClick={triggerIndex}
-          disabled={!connected || indexing}
-          title="Re-index now"
-          aria-label="Re-index now"
-        >
-          <RescanIcon />
-        </button>
-      </div>
+      {collapsed ? (
+        // Collapsed mode: just a single re-index icon button + a backend
+        // status dot. Both keep the user informed without taking width.
+        <>
+          <button
+            type="button"
+            className={`nav-item nav-item-iconish${indexing ? ' busy' : ''}`}
+            onClick={triggerIndex}
+            disabled={!connected || indexing}
+            title={`${indexing ? 'Indexing…' : `Synced ${syncedLabel}`} · click to re-index`}
+            aria-label="Re-index now"
+          >
+            <RescanIcon />
+          </button>
+          <div
+            className="sb-collapsed-status"
+            title={connected ? 'Backend connected' : 'Backend offline'}
+          >
+            <div className={`sb-status-dot${connected ? ' on' : ' err'}`} />
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="sb-sync-row" title={syncedTooltip}>
+            <div className={`sb-sync-icon${indexing ? ' busy' : ''}`}>
+              <RescanIcon />
+            </div>
+            <div className="sb-sync-text">
+              <div className="sb-status-sublabel">Synced</div>
+              <div className="sb-sync-label">{syncedLabel}</div>
+            </div>
+            <button
+              type="button"
+              className="sb-sync-btn"
+              onClick={triggerIndex}
+              disabled={!connected || indexing}
+              title="Re-index now"
+              aria-label="Re-index now"
+            >
+              <RescanIcon />
+            </button>
+          </div>
 
-      <div className="sb-status-row" title={connected ? 'Backend connected' : 'Backend offline'}>
-        <div className={`sb-status-dot${connected ? ' on' : ' err'}`} />
-        <div>
-          <div className="sb-status-label">{connected ? 'Connected' : 'Offline'}</div>
-          <div className="sb-status-sublabel">Backend</div>
-        </div>
-      </div>
+          <div className="sb-status-row" title={connected ? 'Backend connected' : 'Backend offline'}>
+            <div className={`sb-status-dot${connected ? ' on' : ' err'}`} />
+            <div>
+              <div className="sb-status-label">{connected ? 'Connected' : 'Offline'}</div>
+              <div className="sb-status-sublabel">Backend</div>
+            </div>
+          </div>
+        </>
+      )}
     </nav>
   )
 }

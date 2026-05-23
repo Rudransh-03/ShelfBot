@@ -122,10 +122,10 @@ export default function WelcomeModal() {
             <div className="welcome-hero">
               <BookshelfIcon size={36} color="#e8c995" />
             </div>
-            <h2 className="welcome-title">Welcome to ShelfBot</h2>
+            <h2 className="welcome-title">Welcome to Rudo</h2>
             <p className="welcome-sub">
               Ask questions about the files on your device — resumes, notes, PDFs, anything —
-              and ShelfBot finds the answer across all of them, instantly.
+              and Rudo finds the answer across all of them, instantly.
             </p>
             <div className="welcome-actions">
               <button className="btn-primary welcome-next" onClick={() => setStep(1)}>
@@ -142,7 +142,7 @@ export default function WelcomeModal() {
           <div className="welcome-step">
             <h2 className="welcome-title">Pick folders to index</h2>
             <p className="welcome-sub">
-              ShelfBot reads files inside these folders (and their subfolders) so it can answer your questions.
+              Rudo reads files inside these folders (and their subfolders) so it can answer your questions.
               You can change this anytime from Settings.
             </p>
 
@@ -209,7 +209,7 @@ export default function WelcomeModal() {
               <div className="welcome-bullet">
                 <CheckIcon />
                 <span>
-                  ShelfBot watches your folders and stays in sync automatically as files change.
+                  Rudo watches your folders and stays in sync automatically as files change.
                 </span>
               </div>
             </div>

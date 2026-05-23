@@ -1,33 +1,36 @@
-// JWT signing/verification + the auth middleware that protects /proxy/* routes.
+// JWT signing + the middleware that protects /proxy/* routes.
 //
-// For now we use a stub email-only login so the rest of the system can be
-// validated end-to-end before Google OAuth credentials are provisioned. When
-// you set up Google Cloud Console credentials, the change is:
+// In #11.5 we moved off email-based identity entirely. The unit of identity
+// is now the device — see db.js. JWT claims:
 //
-//   1. Add /auth/google + /auth/google/callback routes that do the OAuth
-//      dance with Google.
-//   2. The callback verifies Google's id_token, extracts the email, and
-//      calls `issueToken(email)` — the same function used here.
+//   sub:  numeric devices.id   (PRIMARY KEY)
+//   did:  device_id            (the machine fingerprint; for debug/log only)
+//   plan: 'free' | 'pro'       (captured at token issuance — rate limit uses
+//                              the LIVE plan from the DB row, so a plan
+//                              upgrade takes effect immediately without
+//                              waiting for token rotation)
 //
-// Everything downstream of `issueToken` (DB, JWT format, middleware) is
-// already production-shaped and won't change.
+// We never bind a user's identity (email/name/phone) into the JWT — there
+// isn't one. If a person uses two machines they get two devices, each with
+// their own quota. If they want to share a Pro plan across machines they
+// activate the same license key on both (added in #12).
 
 import jwt from 'jsonwebtoken'
 
 export function makeAuth({ db, jwtSecret, jwtTtlSeconds }) {
 
-  /** Creates or updates the user, signs and returns a JWT bound to them. */
-  function issueToken(email) {
-    const user = db.upsertUser(email)
-    const token = jwt.sign(
-      { sub: user.id, email: user.email },
+  /** Registers a device (idempotent) and returns a fresh JWT bound to it. */
+  function registerDevice(deviceId) {
+    const device = db.upsertDevice(deviceId)
+    const token  = jwt.sign(
+      { sub: device.id, did: device.device_id, plan: device.plan },
       jwtSecret,
       { expiresIn: jwtTtlSeconds }
     )
-    return { token, user, expiresIn: jwtTtlSeconds }
+    return { token, device, expiresIn: jwtTtlSeconds }
   }
 
-  /** Express middleware: pulls JWT from Authorization header, attaches req.user. */
+  /** Express middleware. On success, attaches req.device with the live row. */
   function requireAuth(req, res, next) {
     const header = req.headers.authorization || ''
     if (!header.startsWith('Bearer ')) {
@@ -36,16 +39,16 @@ export function makeAuth({ db, jwtSecret, jwtTtlSeconds }) {
     const token = header.slice('Bearer '.length).trim()
     try {
       const payload = jwt.verify(token, jwtSecret)
-      const user = db.findUserById(payload.sub)
-      if (!user) return res.status(401).json({ error: 'User no longer exists' })
-      req.user = user
+      // Always re-read the device row so the live plan (post-upgrade)
+      // is used for rate limiting, not the value frozen in the token.
+      const device = db.findDeviceById(payload.sub)
+      if (!device) return res.status(401).json({ error: 'Device no longer registered' })
+      req.device = device
       next()
     } catch (e) {
-      // Invalid signature, expired, malformed — all surface as 401 so the
-      // app knows to redirect to login.
       return res.status(401).json({ error: 'Invalid or expired token: ' + e.message })
     }
   }
 
-  return { issueToken, requireAuth }
+  return { registerDevice, requireAuth }
 }

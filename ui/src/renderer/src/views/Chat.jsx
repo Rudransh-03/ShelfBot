@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useApp } from '../context/AppContext'
 import BookshelfIcon from '../components/BookshelfIcon'
+import Mascot       from '../components/Mascot'
 
 const SUGGESTIONS = [
   {
@@ -119,11 +120,12 @@ function TypingIndicator() {
     <div className="msg-row ai">
       <AiAvatar />
       <div className="msg-content">
-        <div className="msg-bubble">
+        <div className="msg-bubble typing-bubble">
           <div className="typing-wrap">
             <span className="tdot" />
             <span className="tdot" />
             <span className="tdot" />
+            <span className="typing-label">Rudo is thinking</span>
           </div>
         </div>
       </div>
@@ -136,7 +138,37 @@ export default function Chat({ active }) {
   const [messages, setMessages]   = useState([])
   const [input,    setInput]      = useState('')
   const [loading,  setLoading]    = useState(false)
-  const msgsRef = useRef(null)
+  const [justAnswered, setJustAnswered] = useState(false)
+  const msgsRef  = useRef(null)
+  const inputRef = useRef(null)
+
+  // Keep focus in the chat input whenever this view is active. So:
+  //   • on view mount / activation → cursor lands in the input
+  //   • after submitting a prompt   → cursor returns to the input even
+  //     though the answer is still loading. We don't disable the input
+  //     during loading anymore (see disabled prop below), so the user
+  //     can immediately type their next question and it'll send the
+  //     moment the current one finishes.
+  useEffect(() => {
+    if (active && inputRef.current) {
+      // Defer one tick so React has actually mounted the input before
+      // we try to grab focus (otherwise focus() silently no-ops).
+      setTimeout(() => inputRef.current?.focus(), 0)
+    }
+  }, [active])
+
+  // Pick the right Rudo mood based on chat state.
+  //   loading      → thinking (orbit dots, eyes closed)
+  //   justAnswered → happy for 2s (eyes squint, brief bounce)
+  //   input typed  → listening (tech-colored aura)
+  //   else         → idle (gentle breathing)
+  const mascotState = loading
+    ? 'thinking'
+    : justAnswered
+      ? 'happy'
+      : input.trim().length > 0
+        ? 'listening'
+        : 'idle'
 
   useEffect(() => {
     if (msgsRef.current) {
@@ -150,6 +182,11 @@ export default function Chat({ active }) {
     setInput('')
     setMessages(m => [...m, { role: 'user', text: question }])
     setLoading(true)
+    // Return focus to the input the moment the user submits so they can
+    // start typing the next prompt without clicking back into the field.
+    // We still gate the actual send below on !loading so we don't fire
+    // two requests in parallel.
+    setTimeout(() => inputRef.current?.focus(), 0)
 
     try {
       const res = await api.query(question)
@@ -163,6 +200,8 @@ export default function Chat({ active }) {
       setMessages(m => [...m, { role: 'ai', text: e.message, variant: 'error' }])
     } finally {
       setLoading(false)
+      setJustAnswered(true)
+      setTimeout(() => setJustAnswered(false), 2200)
       // Refresh /me so the daily-usage counter in Settings updates within
       // a second of each query, not on the slow 30s poller.
       refreshAuth()
@@ -219,15 +258,13 @@ export default function Chat({ active }) {
 
       {!hasMessages ? (
         <div className="chat-empty">
-          <div className="empty-icon">
-            <BookshelfIcon size={28} color="#e8c995" />
-          </div>
+          <Mascot size="lg" state={mascotState} label="Rudo" />
           <div className="empty-title">
-            Your library, <em>in conversation</em>
+            Hi, I'm <em>Rudo</em>.
           </div>
           <div className="empty-sub">
-            ShelfBot reads across your indexed documents and answers in context.
-            Begin with one of these, or ask anything.
+            I read across every file you've indexed and answer in context — pick a prompt or
+            ask me anything.
           </div>
           <div className="suggestions">
             {SUGGESTIONS.map(s => (
@@ -262,14 +299,23 @@ export default function Chat({ active }) {
 
       <div className="chat-input-area">
         <div className="input-row">
+          {/* Small live-reacting Rudo next to the input. Only shown when the
+              user is mid-conversation so it doesn't compete with the big hero. */}
+          {hasMessages && (
+            <Mascot size="md" state={mascotState} className="chat-input-mascot" />
+          )}
           <div className="input-box">
             <input
+              ref={inputRef}
               type="text"
-              placeholder="Ask your library anything…"
+              placeholder={loading ? 'Type the next one — I\'ll answer when ready' : 'Ask your library anything…'}
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={handleKey}
-              disabled={!connected || loading}
+              // Stays enabled during loading so the cursor lives here
+              // and the next prompt can be typed. Only disabled when the
+              // backend is fully unreachable.
+              disabled={!connected}
             />
           </div>
           <button

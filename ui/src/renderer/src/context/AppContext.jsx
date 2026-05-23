@@ -22,34 +22,42 @@ export function AppProvider({ children }) {
   const [lastJob,  setLastJob]  = useState(null) // { ok, data?, msg? }
   const [progress, setProgress] = useState(null) // { processed, total, failed, currentFile }
 
-  // Auth state
-  const [auth, setAuth] = useState({ checked: false, authenticated: false, email: null, usage: null })
+  // Device-identity state. Mirrors what /device/bootstrap returns.
+  //   checked        — false until bootstrap completes
+  //   registered     — does this install have a valid JWT?
+  //   plan           — 'free' | 'pro'
+  //   usage          — {used, limit, remaining} or null while loading
+  //   offline        — couldn't reach the proxy; cached token in use
+  const [auth, setAuth] = useState({
+    checked: false, registered: false, plan: 'free', usage: null, offline: false,
+  })
 
   const refreshAuth = useCallback(async () => {
     const E = window.electron
-    if (!E?.authMe) { setAuth({ checked: true, authenticated: false }); return null }
-    const r = await E.authMe()
-    setAuth({
-      checked: true,
-      authenticated: !!r?.authenticated,
-      email: r?.email ?? null,
-      usage: r?.usage ?? null,
-    })
+    if (!E?.deviceMe) { setAuth(s => ({ ...s, checked: true })); return null }
+    const r = await E.deviceMe()
+    if (r?.authenticated) {
+      setAuth({
+        checked: true, registered: true,
+        plan: r.plan ?? 'free',
+        usage: r.usage ?? null,
+        offline: false,
+      })
+    } else {
+      setAuth(s => ({ ...s, checked: true, registered: false }))
+    }
     return r
   }, [])
 
-  const login = useCallback(async (email) => {
-    const E = window.electron
-    if (!E?.authLogin) return { ok: false, error: 'Desktop app required' }
-    const r = await E.authLogin(email)
-    if (r.ok) await refreshAuth()
-    return r
-  }, [refreshAuth])
-
+  /**
+   * "Sign out" — destructive only locally. Clears the JWT so the next
+   * bootstrap re-registers (same device, same identity). Exposed mainly
+   * for support / testing; ordinary users never need this.
+   */
   const logout = useCallback(async () => {
     const E = window.electron
-    if (E?.authLogout) await E.authLogout()
-    setAuth({ checked: true, authenticated: false, email: null, usage: null })
+    if (E?.deviceLogout) await E.deviceLogout()
+    setAuth({ checked: true, registered: false, plan: 'free', usage: null, offline: false })
   }, [])
 
   const busyTimer = useRef(null)
@@ -133,21 +141,23 @@ export function AppProvider({ children }) {
     }
   }, [connected, api, loadStats, refreshAuth, indexing])
 
-  // Boot: check whether we have a valid saved token before showing the UI.
-  // Runs once after the API base is set so the bootstrap can also push the
-  // active JWT into the Java backend before any query goes through.
+  // Boot: register the device (or revalidate the saved JWT). Runs once
+  // after the renderer mounts; the underlying IPC handler auto-registers
+  // with the proxy if there's no saved token, so the user sees no login
+  // friction whatsoever — just a moment of "Loading…" then they're in.
   useEffect(() => {
     const E = window.electron
-    if (!E?.authBootstrap) {
-      setAuth({ checked: true, authenticated: false })
+    if (!E?.deviceBootstrap) {
+      setAuth(s => ({ ...s, checked: true }))
       return
     }
-    E.authBootstrap().then(r => {
+    E.deviceBootstrap().then(r => {
       setAuth({
         checked: true,
-        authenticated: !!r?.authenticated,
-        email: r?.email ?? null,
+        registered: !!r?.authenticated,
+        plan: r?.plan ?? 'free',
         usage: r?.usage ?? null,
+        offline: !!r?.offline,
       })
     })
   }, [])
@@ -164,7 +174,7 @@ export function AppProvider({ children }) {
       toast, toasts,
       stats, indexing, progress, lastJob,
       loadStats, triggerIndex,
-      auth, login, logout, refreshAuth,
+      auth, logout, refreshAuth,
     }}>
       {children}
     </AppCtx.Provider>

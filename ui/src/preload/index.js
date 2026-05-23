@@ -15,9 +15,8 @@ contextBridge.exposeInMainWorld('electron', {
   installUpdate:     ()   => ipcRenderer.invoke('updater:install'),
   checkForUpdates:   ()   => ipcRenderer.invoke('updater:check'),
 
-  // Auth
-  authBootstrap:  ()       => ipcRenderer.invoke('auth:bootstrap'),
-  authLogin:      (email)  => ipcRenderer.invoke('auth:login', { email }),
-  authLogout:     ()       => ipcRenderer.invoke('auth:logout'),
-  authMe:         ()       => ipcRenderer.invoke('auth:me'),
+  // Device identity (no per-user login — the install IS the identity)
+  deviceBootstrap: () => ipcRenderer.invoke('device:bootstrap'),
+  deviceMe:        () => ipcRenderer.invoke('device:me'),
+  deviceLogout:    () => ipcRenderer.invoke('device:logout'),
 })

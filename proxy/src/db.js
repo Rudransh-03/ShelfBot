@@ -1,11 +1,21 @@
-// Local persistence for users + daily usage counters.
+// Local persistence for devices, daily usage counters, and (when #12 lands)
+// licenses.
 //
-// Why SQLite: zero ops, single file on disk, more than fast enough at the
-// scale this proxy will ever see (15 queries/user/day means the hot path is
-// one UPDATE per query — sub-millisecond on commodity hardware).
+// Identity model: each installation of ShelfBot generates a stable
+// `device_id` (machine UUID from node-machine-id, with a UUID fallback
+// persisted under userData on failure). That device_id is the unit of
+// identity — no email, no password, no per-user account in the social
+// sense. Every device starts on the "free" plan; a license_key (added
+// in #12) flips it to "pro".
 //
-// Switch to Postgres later if you ever need multi-region; the schema is
-// identical and the queries are vanilla SQL.
+// Why this layout:
+//   • One row per device, not per email. Means the only way to multiply
+//     your free quota is to physically install on another machine.
+//   • Per-plan daily caps live in env vars (FREE_DAILY / PRO_DAILY), read
+//     once at startup. Lookup is a single integer compare on the hot path.
+//   • A separate `licenses` table is created up-front (empty for now) so
+//     the #12 payment integration is a pure code addition, not a schema
+//     migration. The devices table has a nullable license_id pointing at it.
 
 import Database from 'better-sqlite3'
 import { mkdirSync } from 'fs'
@@ -16,81 +26,111 @@ export function openDb(path) {
   const db = new Database(path)
   db.pragma('journal_mode = WAL')
   db.pragma('synchronous = NORMAL')
+  db.pragma('foreign_keys = ON')
 
   db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
-      email       TEXT    UNIQUE NOT NULL,
-      created_at  TEXT    NOT NULL,
-      last_login  TEXT    NOT NULL
+    CREATE TABLE IF NOT EXISTS licenses (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      key          TEXT    UNIQUE NOT NULL,
+      max_devices  INTEGER NOT NULL DEFAULT 3,
+      created_at   TEXT    NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS devices (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      device_id   TEXT    UNIQUE NOT NULL,
+      plan        TEXT    NOT NULL DEFAULT 'free' CHECK (plan IN ('free', 'pro')),
+      license_id  INTEGER NULL REFERENCES licenses(id) ON DELETE SET NULL,
+      created_at  TEXT    NOT NULL,
+      last_seen   TEXT    NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_devices_license ON devices(license_id);
+
     CREATE TABLE IF NOT EXISTS usage (
-      user_id      INTEGER NOT NULL,
+      device_id    INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
       date         TEXT    NOT NULL,
       query_count  INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (user_id, date),
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      PRIMARY KEY (device_id, date)
     );
   `)
 
+  // Drop pre-#11.5 tables if present so leftover dev rows from the old
+  // email-based schema don't sit around confusing anyone. The proxy is
+  // pre-production; no real customer data ever lived in those tables.
+  try { db.exec(`DROP TABLE IF EXISTS users;`) } catch {}
+
   return {
-    /** Look up or create a user by email. Idempotent. */
-    upsertUser(email) {
+    /**
+     * Registers a device (or returns the existing row if it's been seen
+     * before). Idempotent — calling repeatedly with the same device_id is
+     * a no-op write but always returns the canonical row.
+     */
+    upsertDevice(deviceId) {
       const now = new Date().toISOString()
-      const existing = db.prepare('SELECT id, email, created_at FROM users WHERE email = ?').get(email)
+      const existing = db.prepare(
+        'SELECT id, device_id, plan, license_id, created_at FROM devices WHERE device_id = ?'
+      ).get(deviceId)
       if (existing) {
-        db.prepare('UPDATE users SET last_login = ? WHERE id = ?').run(now, existing.id)
+        db.prepare('UPDATE devices SET last_seen = ? WHERE id = ?').run(now, existing.id)
         return existing
       }
-      const insert = db.prepare(
-        'INSERT INTO users (email, created_at, last_login) VALUES (?, ?, ?)'
-      ).run(email, now, now)
-      return { id: insert.lastInsertRowid, email, created_at: now }
+      const ins = db.prepare(
+        'INSERT INTO devices (device_id, plan, created_at, last_seen) VALUES (?, ?, ?, ?)'
+      ).run(deviceId, 'free', now, now)
+      return {
+        id:         ins.lastInsertRowid,
+        device_id:  deviceId,
+        plan:       'free',
+        license_id: null,
+        created_at: now,
+      }
     },
 
-    findUserById(id) {
-      return db.prepare('SELECT id, email, created_at FROM users WHERE id = ?').get(id)
+    /** Lookup by primary key. Used by JWT validation. */
+    findDeviceById(id) {
+      return db.prepare(
+        'SELECT id, device_id, plan, license_id, created_at FROM devices WHERE id = ?'
+      ).get(id)
     },
 
-    /** Returns today's count for a user (0 if no row yet). */
-    getTodayCount(userId, todayKey) {
+    /** Returns today's count for a device (0 if no row yet). */
+    getTodayCount(deviceRowId, todayKey) {
       const row = db.prepare(
-        'SELECT query_count FROM usage WHERE user_id = ? AND date = ?'
-      ).get(userId, todayKey)
+        'SELECT query_count FROM usage WHERE device_id = ? AND date = ?'
+      ).get(deviceRowId, todayKey)
       return row?.query_count ?? 0
     },
 
     /**
      * Atomically increments today's counter and returns the new value.
-     * Single-statement so two concurrent requests can't both slip through
-     * a stale read of the limit.
+     * Single-statement upsert so two concurrent requests can't both slip
+     * through a stale read.
      */
-    incrementTodayCount(userId, todayKey) {
+    incrementTodayCount(deviceRowId, todayKey) {
       db.prepare(`
-        INSERT INTO usage (user_id, date, query_count) VALUES (?, ?, 1)
-        ON CONFLICT(user_id, date) DO UPDATE SET query_count = query_count + 1
-      `).run(userId, todayKey)
-      return this.getTodayCount(userId, todayKey)
+        INSERT INTO usage (device_id, date, query_count) VALUES (?, ?, 1)
+        ON CONFLICT(device_id, date) DO UPDATE SET query_count = query_count + 1
+      `).run(deviceRowId, todayKey)
+      return this.getTodayCount(deviceRowId, todayKey)
     },
 
     /**
-     * Undoes an earlier increment — called when the upstream OpenAI call
-     * fails so the user isn't billed a quota slot for our infra outage.
-     * Never drops below zero.
+     * Undoes a prior increment — used when the OpenAI upstream call fails
+     * so the device isn't charged a slot for our infra outage. Floors at 0.
      */
-    decrementTodayCount(userId, todayKey) {
+    decrementTodayCount(deviceRowId, todayKey) {
       db.prepare(
-        'UPDATE usage SET query_count = MAX(0, query_count - 1) WHERE user_id = ? AND date = ?'
-      ).run(userId, todayKey)
-      return this.getTodayCount(userId, todayKey)
+        'UPDATE usage SET query_count = MAX(0, query_count - 1) WHERE device_id = ? AND date = ?'
+      ).run(deviceRowId, todayKey)
+      return this.getTodayCount(deviceRowId, todayKey)
     },
 
     close() { db.close() },
   }
 }
 
-/** Day key in UTC. Matches the user's billing perception ("a day" = a calendar day). */
+/** Day key in UTC. */
 export function todayKey() {
   return new Date().toISOString().slice(0, 10) // "2026-05-23"
 }

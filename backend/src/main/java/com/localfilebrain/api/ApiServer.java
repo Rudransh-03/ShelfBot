@@ -126,18 +126,15 @@ public final class ApiServer {
 
     /**
      * Auth-token bridge between the Electron UI and the Java backend.
-     *   GET    /api/auth          → { authenticated, email? }
-     *   POST   /api/auth          → { token, email } stores the JWT
-     *   DELETE /api/auth          → clears the token (logout)
+     *   GET    /api/auth   → { authenticated }
+     *   POST   /api/auth   → { token } stores the JWT for outgoing OpenAI calls
+     *   DELETE /api/auth   → clears the token
      */
     private void handleAuth(HttpExchange ex) throws IOException {
         if (preflight(ex)) return;
 
         if (isMethod(ex, "GET")) {
-            sendJson(ex, 200, map(
-                "authenticated", tokenStore.isAuthenticated(),
-                "email",         tokenStore.getUserEmail()
-            ));
+            sendJson(ex, 200, map("authenticated", tokenStore.isAuthenticated()));
             return;
         }
 
@@ -145,16 +142,15 @@ public final class ApiServer {
             try {
                 Map<?, ?> body  = readJson(ex);
                 String    token = (String) body.get("token");
-                String    email = (String) body.get("email");
                 if (token == null || token.isBlank()) {
                     sendError(ex, 400, "token is required");
                     return;
                 }
-                tokenStore.setToken(token, email);
+                tokenStore.setToken(token);
                 // Reset the lazy QueryEngine so the next query picks up the
                 // new token instead of capturing a stale "Not signed in".
                 this.queryEngine = null;
-                sendJson(ex, 200, map("ok", true, "email", email));
+                sendJson(ex, 200, map("ok", true));
             } catch (Exception e) {
                 sendError(ex, 500, e.getMessage());
             }
@@ -212,8 +208,7 @@ public final class ApiServer {
                 "platform",           System.getProperty("os.name", "").toLowerCase(),
                 "embeddingModel",     embeddingModel,
                 "apiMode",            config.getApiMode(),
-                "authenticated",      tokenStore.isAuthenticated(),
-                "userEmail",          tokenStore.getUserEmail()
+                "authenticated",      tokenStore.isAuthenticated()
             ));
         } catch (Exception e) {
             log.error("status error", e);

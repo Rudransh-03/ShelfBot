@@ -140,8 +140,8 @@ function AccessBanner({ stats }) {
         </div>
         <div className="access-banner-sub">
           {isMac
-            ? 'ShelfBot can\'t read these folders without Full Disk Access. Open System Settings → Privacy & Security → Full Disk Access and enable ShelfBot.'
-            : 'ShelfBot can\'t read these folders. Check permissions or remove them in Settings.'}
+            ? 'Rudo can\'t read these folders without Full Disk Access. Open System Settings → Privacy & Security → Full Disk Access and enable Rudo.'
+            : 'Rudo can\'t read these folders. Check permissions or remove them in Settings.'}
         </div>
         <ul className="access-banner-list">
           {issues.map(p => <li key={p}>{p}</li>)}

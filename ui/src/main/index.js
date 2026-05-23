@@ -3,6 +3,8 @@ import { join }   from 'path'
 import { spawn }  from 'child_process'
 import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'fs'
 import { createServer } from 'net'
+import { machineIdSync } from 'node-machine-id'
+import { randomUUID }    from 'crypto'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Auth: persist proxy JWT in OS-encrypted secure storage
@@ -12,8 +14,47 @@ import { createServer } from 'net'
 // Windows DPAPI, Linux Secret Service). So even if someone reads the file off
 // disk, they get ciphertext — only this app, on this user account, can decrypt.
 
-const PROXY_URL  = process.env.SHELFBOT_PROXY_URL || 'http://localhost:8787'
-const TOKEN_FILE = () => join(app.getPath('userData'), 'auth.token')
+const PROXY_URL    = process.env.SHELFBOT_PROXY_URL || 'http://localhost:8787'
+const TOKEN_FILE   = () => join(app.getPath('userData'), 'auth.token')
+const DEVICE_FILE  = () => join(app.getPath('userData'), 'device.id')
+
+/**
+ * Returns this installation's stable device identifier. Priority order:
+ *   1. A UUID we wrote to userData on a previous launch.
+ *   2. The OS-reported machine ID (node-machine-id; hashed for privacy).
+ *   3. A freshly generated UUID, persisted for next time.
+ *
+ * Why the cached UUID wins: node-machine-id can change if the OS is
+ * reinstalled or the secure-boot key rotates — we don't want a free user
+ * to silently get a brand new quota every OS reinstall. Persisting a UUID
+ * to userData makes identity portable across OS quirks while still being
+ * bound to this specific install.
+ */
+function getDeviceId() {
+  const path = DEVICE_FILE()
+  if (existsSync(path)) {
+    try {
+      const cached = readFileSync(path, 'utf8').trim()
+      if (cached.length >= 8) return cached
+    } catch {}
+  }
+  let id
+  try {
+    // machineIdSync(true) returns the original; default returns SHA-256 of it.
+    // Hashed is what we want — no need to know the actual MAC/UUID.
+    id = machineIdSync()
+  } catch {
+    id = null
+  }
+  if (!id || id.length < 8) id = randomUUID()
+  try {
+    mkdirSync(join(app.getPath('userData')), { recursive: true })
+    writeFileSync(path, id, 'utf8')
+  } catch (e) {
+    console.warn('[ShelfBot] could not persist device id:', e.message)
+  }
+  return id
+}
 
 function persistToken(tokenJson) {
   try {
@@ -216,7 +257,8 @@ function createWindow(port) {
 app.whenReady().then(async () => {
   console.log('[ShelfBot] app name:', app.getName())
   console.log('[ShelfBot] userData:', app.getPath('userData'))
-  console.log('[ShelfBot] token file would be:', TOKEN_FILE())
+  console.log('[ShelfBot] token file:', TOKEN_FILE())
+  console.log('[ShelfBot] device file:', DEVICE_FILE())
   console.log('[ShelfBot] safeStorage available:', safeStorage.isEncryptionAvailable())
   console.log('[ShelfBot] proxy url:', PROXY_URL)
   const port = await startJavaBackend()
@@ -306,101 +348,114 @@ ipcMain.on('window-close',    () => mainWindow?.close())
 ipcMain.on('open-external',   (_, url) => shell.openExternal(url))
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Auth IPC
+// Device-identity IPC
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Renderer-side flow:
-//   1. On boot: call `auth:bootstrap` → main loads token, validates with
-//      proxy /me, returns {authenticated, email, usage} (or null if no token).
-//   2. Login screen: call `auth:login` with email → main hits proxy
-//      /auth/login → receives JWT → persists via safeStorage → pushes to
-//      the Java backend's /api/auth → returns success.
-//   3. Logout: call `auth:logout` → clears local store + clears Java backend.
+// There's no "login" anymore. On first launch the app auto-registers the
+// device with the proxy and stores the returned JWT in safeStorage. Every
+// subsequent launch reuses the saved JWT and silently refreshes it if the
+// proxy says it's expired.
+//
+// Renderer-side surface:
+//   device:bootstrap → on app load. Ensures the Java backend has a current
+//                       JWT pushed to it before any query runs.
+//   device:me        → fetch /me (plan + today's usage) for display.
+//   device:logout    → clears local token AND device.id, forcing a fresh
+//                       registration on next launch. (Mostly for testing.)
 
 let lastApiPort = null
 
-async function pushTokenToBackend(token, email) {
-  if (!lastApiPort) return // backend not ready yet; will be pushed by renderer instead
+async function pushTokenToBackend(token) {
+  if (!lastApiPort) return
   try {
     await fetch(`http://localhost:${lastApiPort}/api/auth`, {
-      method: 'POST',
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token, email }),
+      body:    JSON.stringify({ token }),
     })
   } catch (e) {
     console.warn('[ShelfBot] could not push token to backend:', e.message)
   }
 }
 
-ipcMain.handle('auth:bootstrap', async () => {
-  const saved = loadToken()
-  console.log('[auth:bootstrap] token file exists:', !!saved?.token,
-              '  storage path:', TOKEN_FILE())
-  if (!saved?.token) return { authenticated: false }
+/**
+ * Hits /device/register on the proxy, persists the returned JWT, pushes it
+ * to the Java backend. Returns {ok, plan, usage} on success.
+ */
+async function registerWithProxy() {
+  const deviceId = getDeviceId()
+  console.log('[device:register] using deviceId', deviceId.slice(0, 8) + '...(truncated)')
+  try {
+    const r = await fetch(`${PROXY_URL}/device/register`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ deviceId }),
+    })
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}))
+      return { ok: false, error: body.error || `HTTP ${r.status}` }
+    }
+    const body = await r.json()
+    persistToken(JSON.stringify({ token: body.token }))
+    await pushTokenToBackend(body.token)
+    return { ok: true, plan: body.device.plan, usage: body.usage }
+  } catch (e) {
+    return { ok: false, error: e.message, offline: true }
+  }
+}
 
-  // Verify against the proxy. If it explicitly rejects the token (401/403),
-  // we clear and force a fresh login. If it's *unreachable* (proxy not yet
-  // started, network blip, offline), we optimistically trust the saved token
-  // — the user shouldn't be kicked back to the login screen just because
-  // the proxy is slow to come up. First real API call will surface the
-  // problem if the token is actually bad.
+ipcMain.handle('device:bootstrap', async () => {
+  console.log('[device:bootstrap] token path:', TOKEN_FILE())
+  const saved = loadToken()
+
+  // No token yet → auto-register. This is the *only* time we hit
+  // /device/register; subsequent launches reuse the saved JWT.
+  if (!saved?.token) {
+    console.log('[device:bootstrap] no saved token, registering fresh device')
+    const reg = await registerWithProxy()
+    if (!reg.ok) {
+      console.warn('[device:bootstrap] register failed:', reg.error)
+      // Offline-tolerant: no token means we can't query yet, but the UI
+      // can still show settings and the app isn't bricked. We'll retry
+      // on the next /me call or app restart.
+      return { authenticated: false, error: reg.error, offline: !!reg.offline }
+    }
+    return { authenticated: true, plan: reg.plan, usage: reg.usage }
+  }
+
+  // Have a token → verify it still works.
   try {
     const r = await fetch(`${PROXY_URL}/me`, {
       headers: { Authorization: `Bearer ${saved.token}` },
     })
     if (r.status === 401 || r.status === 403) {
-      console.log('[auth:bootstrap] proxy rejected token (', r.status, '), clearing.')
+      console.log('[device:bootstrap] saved token rejected, re-registering')
       clearToken()
-      return { authenticated: false, reason: 'expired' }
+      const reg = await registerWithProxy()
+      return reg.ok
+        ? { authenticated: true, plan: reg.plan, usage: reg.usage }
+        : { authenticated: false, error: reg.error }
     }
     if (!r.ok) {
-      // Other status — proxy is up but something else is wrong. Don't kick
-      // the user out; surface the cached email so the main UI still loads.
-      console.log('[auth:bootstrap] /me returned', r.status, '— trusting saved token.')
-      await pushTokenToBackend(saved.token, saved.email)
-      return { authenticated: true, email: saved.email, usage: null }
+      // Proxy reachable but errored on /me. Keep the user functional —
+      // their next API call will surface the issue if it persists.
+      console.log('[device:bootstrap] /me returned', r.status, '— trusting saved token.')
+      await pushTokenToBackend(saved.token)
+      return { authenticated: true, plan: 'free', usage: null }
     }
     const me = await r.json()
-    await pushTokenToBackend(saved.token, me.user.email)
-    console.log('[auth:bootstrap] OK,', me.user.email, 'usage', me.usage)
-    return { authenticated: true, email: me.user.email, usage: me.usage }
+    await pushTokenToBackend(saved.token)
+    console.log('[device:bootstrap] OK, plan=' + me.device.plan, 'usage', me.usage)
+    return { authenticated: true, plan: me.device.plan, usage: me.usage }
   } catch (e) {
-    // Proxy unreachable — keep the user signed in optimistically.
-    console.log('[auth:bootstrap] proxy unreachable (', e.message, '), trusting saved token.')
-    await pushTokenToBackend(saved.token, saved.email)
-    return { authenticated: true, email: saved.email, usage: null, offline: true }
+    // Proxy unreachable. Stay signed in optimistically with the cached token.
+    console.log('[device:bootstrap] proxy unreachable, trusting saved token:', e.message)
+    await pushTokenToBackend(saved.token)
+    return { authenticated: true, plan: 'free', usage: null, offline: true }
   }
 })
 
-ipcMain.handle('auth:login', async (_evt, { email }) => {
-  try {
-    const r = await fetch(`${PROXY_URL}/auth/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email }),
-    })
-    const body = await r.json().catch(() => ({}))
-    if (!r.ok) return { ok: false, error: body.error || `HTTP ${r.status}` }
-
-    persistToken(JSON.stringify({ token: body.token, email: body.user.email }))
-    await pushTokenToBackend(body.token, body.user.email)
-    return { ok: true, email: body.user.email }
-  } catch (e) {
-    return { ok: false, error: e.message }
-  }
-})
-
-ipcMain.handle('auth:logout', async () => {
-  clearToken()
-  if (lastApiPort) {
-    try {
-      await fetch(`http://localhost:${lastApiPort}/api/auth`, { method: 'DELETE' })
-    } catch {}
-  }
-  return { ok: true }
-})
-
-ipcMain.handle('auth:me', async () => {
+ipcMain.handle('device:me', async () => {
   const saved = loadToken()
   if (!saved?.token) return { authenticated: false }
   try {
@@ -409,10 +464,21 @@ ipcMain.handle('auth:me', async () => {
     })
     if (!r.ok) return { authenticated: false, reason: 'expired' }
     const me = await r.json()
-    return { authenticated: true, email: me.user.email, usage: me.usage }
-  } catch (e) {
+    return { authenticated: true, plan: me.device.plan, usage: me.usage }
+  } catch {
     return { authenticated: false, reason: 'unreachable' }
   }
+})
+
+ipcMain.handle('device:logout', async () => {
+  clearToken()
+  // Don't clear device.id — same machine should still get the same identity
+  // after a "logout" / re-register. Clearing device.id would let a user
+  // reset their free quota by clicking "logout" + reopening the app.
+  if (lastApiPort) {
+    try { await fetch(`http://localhost:${lastApiPort}/api/auth`, { method: 'DELETE' }) } catch {}
+  }
+  return { ok: true }
 })
 
 // Auto-updater IPC: trigger install (with relaunch) or a manual check.

@@ -177,7 +177,12 @@ function startJavaBackend() {
     const port = await findFreePort()
     console.log(`[ShelfBot] Starting Java on port ${port}  (${jar})`)
 
-    javaProcess = spawn('java', ['-Xmx512m', '-jar', jar, '--server', '--port', String(port)], {
+    // -Djava.awt.headless=true keeps the JVM from initializing AWT — which
+    //   (a) prevents the Java dock/menu icon appearing on macOS, and
+    //   (b) avoids loading the windowing system at all on headless Linux servers.
+    // Tika's OCR + PDF image parsers pull AWT in transitively, so without this
+    //   the user sees a Java icon pop into their dock alongside ShelfBot.
+    javaProcess = spawn('java', ['-Djava.awt.headless=true', '-Xmx512m', '-jar', jar, '--server', '--port', String(port)], {
       cwd:   BACKEND_ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
     })

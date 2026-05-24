@@ -6,6 +6,7 @@ import com.localfilebrain.config.AppConfig;
 import com.localfilebrain.embedding.EmbeddingClient;
 import com.localfilebrain.ingestion.IndexMetadataStore;
 import com.localfilebrain.ingestion.IngestionPipeline;
+import com.localfilebrain.ingestion.TextExtractor;
 import com.localfilebrain.model.FileRecord;
 import com.localfilebrain.model.IngestionResult;
 import com.localfilebrain.query.QueryEngine;
@@ -16,6 +17,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.*;
+import java.nio.charset.StandardCharsets;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -52,6 +54,9 @@ public final class ApiServer {
     private final VectorStore        vectorStore;
     private final EmbeddingClient    embeddingClient;
     private final AuthTokenStore     tokenStore;
+    // One-shot detector — instantiating TextExtractor probes Tesseract; we
+    // keep the result to report in /api/status without re-checking per call.
+    private final boolean            ocrAvailable = new TextExtractor().isOcrAvailable();
 
     // QueryEngine is created lazily so the server still starts even when the
     // OpenAI key is not yet configured.
@@ -118,6 +123,7 @@ public final class ApiServer {
         server.createContext("/api/status",       this::handleStatus);
         server.createContext("/api/index",        this::handleIndex);
         server.createContext("/api/query",        this::handleQuery);
+        server.createContext("/api/query/stream", this::handleQueryStream);
         server.createContext("/api/conversation", this::handleConversation);
         server.createContext("/api/config",       this::handleConfig);
         server.createContext("/api/files",        this::handleFiles);
@@ -208,7 +214,8 @@ public final class ApiServer {
                 "platform",           System.getProperty("os.name", "").toLowerCase(),
                 "embeddingModel",     embeddingModel,
                 "apiMode",            config.getApiMode(),
-                "authenticated",      tokenStore.isAuthenticated()
+                "authenticated",      tokenStore.isAuthenticated(),
+                "ocrAvailable",       ocrAvailable
             ));
         } catch (Exception e) {
             log.error("status error", e);
@@ -304,6 +311,90 @@ public final class ApiServer {
             log.error("Query failed", e);
             sendError(ex, 500, e.getMessage());
         }
+    }
+
+    /**
+     * POST /api/query/stream — Server-Sent Events.
+     *
+     * Body: { question: "..." }
+     *
+     * Emits a stream of events:
+     *   event: token   data: "<plain text fragment>"        (many of these)
+     *   event: done    data: {"sources":[…], "found": true} (one, at end)
+     *   event: error   data: "<message>"                    (one, on failure)
+     *
+     * The Electron renderer subscribes via EventSource (or a raw fetch
+     * reader) and appends each token to the live AI bubble. Identical
+     * retrieval logic to /api/query — only the response shape differs.
+     */
+    private void handleQueryStream(HttpExchange ex) throws IOException {
+        if (preflight(ex)) return;
+        if (!isMethod(ex, "POST")) { methodNotAllowed(ex); return; }
+
+        // Read + validate request body before opening the stream.
+        String question;
+        try {
+            Map<?, ?> req = readJson(ex);
+            question = (String) req.get("question");
+            if (question == null || question.isBlank()) {
+                sendError(ex, 400, "question is required");
+                return;
+            }
+        } catch (Exception e) {
+            sendError(ex, 400, "Invalid JSON body: " + e.getMessage());
+            return;
+        }
+
+        // Switch the response into SSE mode. Once headers are sent we own
+        // the body and can write events incrementally.
+        ex.getResponseHeaders().set("Access-Control-Allow-Origin",  "*");
+        ex.getResponseHeaders().set("Content-Type",  "text/event-stream; charset=utf-8");
+        ex.getResponseHeaders().set("Cache-Control", "no-cache, no-transform");
+        ex.getResponseHeaders().set("Connection",    "keep-alive");
+        ex.getResponseHeaders().set("X-Accel-Buffering", "no");
+        ex.sendResponseHeaders(200, 0); // 0 = chunked / open-ended
+
+        OutputStream out = ex.getResponseBody();
+
+        try {
+            QueryEngine engine = getOrInitQueryEngine();
+            QueryEngine.QueryResult result = engine.queryStream(question, token -> {
+                try {
+                    writeSseEvent(out, "token", token);
+                } catch (IOException ignored) { /* client disconnected — outer try cleans up */ }
+            });
+
+            // Final summary event with sources + found flag, encoded as JSON.
+            Map<String, Object> summary = new LinkedHashMap<>();
+            summary.put("found",   result.found());
+            summary.put("sources", result.sourceFiles());
+            writeSseEvent(out, "done", mapper.writeValueAsString(summary));
+
+        } catch (Exception e) {
+            try {
+                writeSseEvent(out, "error", e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+            } catch (IOException ignored) {}
+            log.warn("query stream failed: {}", e.getMessage());
+        } finally {
+            try { out.close(); } catch (IOException ignored) {}
+        }
+    }
+
+    /**
+     * Writes a single SSE event. Multi-line data values are split into
+     * multiple data: lines (per the SSE spec), which the browser
+     * reassembles by joining with newlines on the client side.
+     */
+    private void writeSseEvent(OutputStream out, String event, String data) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        sb.append("event: ").append(event).append('\n');
+        // SSE 'data:' must not contain embedded \n; split into multiple lines.
+        for (String line : data.split("\n", -1)) {
+            sb.append("data: ").append(line).append('\n');
+        }
+        sb.append('\n'); // blank line terminates the event
+        out.write(sb.toString().getBytes(StandardCharsets.UTF_8));
+        out.flush();
     }
 
     /** DELETE /api/conversation */

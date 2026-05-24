@@ -213,6 +213,21 @@ export default function Settings({ active }) {
                 {embeddingLabel}
               </span>
             </div>
+            <div className="svc-row">
+              <span className="svc-name">
+                <ServerIcon />
+                Image search (OCR)
+              </span>
+              <span
+                className="svc-val"
+                title={stats?.ocrAvailable
+                  ? 'Tesseract is installed — images and scanned PDFs are searchable.'
+                  : 'Install Tesseract (e.g. `brew install tesseract` on macOS) to make images and scanned PDFs searchable.'}
+              >
+                <span className={`dot ${stats?.ocrAvailable ? 'g' : 'a'}`} />
+                {stats?.ocrAvailable ? 'Enabled' : 'Install Tesseract to enable'}
+              </span>
+            </div>
           </div>
         </div>
 

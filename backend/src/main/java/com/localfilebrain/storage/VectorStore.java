@@ -24,6 +24,7 @@ import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.KnnFloatVectorQuery;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.SearcherManager;
+import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.store.FSDirectory;
 import org.slf4j.Logger;
@@ -225,6 +226,54 @@ public final class VectorStore implements AutoCloseable {
      * Returns the top-K chunks most similar to the query embedding, ordered
      * by ascending distance (most-similar first).
      */
+    /**
+     * Returns every chunk stored for a given source file, ordered by their
+     * chunk index in the original document.
+     *
+     * Used by the query engine to side-step the classic RAG failure mode
+     * where a document's "section label" chunk outranks the chunk that
+     * actually contains the answer. Once we've decided a file is relevant
+     * (via semantic search of the question), we pull the file's entire
+     * indexed content in document order — so the LLM never misses the
+     * BNY-Mellon-internship-style entry just because its bullet text
+     * embedded farther from the query than the "Work Experience" header.
+     *
+     * Distance is reported as 0.0 because these chunks aren't ranked
+     * against a query — they're file-context expansion, not retrieval.
+     */
+    public List<SearchResult> getChunksForFile(String absolutePath) {
+        try {
+            searchers.maybeRefresh();
+            IndexSearcher searcher = searchers.acquire();
+            try {
+                TermQuery q = new TermQuery(new Term(F_SRC_PATH, absolutePath));
+                // Reasonable upper bound: 1000 chunks per file is ~1.8 MB of text.
+                TopDocs td = searcher.search(q, 1000);
+                List<SearchResult> out = new ArrayList<>(td.scoreDocs.length);
+                for (ScoreDoc sd : td.scoreDocs) {
+                    Document d = searcher.storedFields().document(sd.doc);
+                    out.add(new SearchResult(
+                            d.get(F_ID),
+                            d.get(F_SRC_PATH),
+                            d.get(F_FILE_NAME),
+                            intField(d, F_CHUNK_IDX),
+                            d.get(F_TEXT),
+                            0.0
+                    ));
+                }
+                // Restore the original document order so the LLM reads chunks
+                // top-to-bottom of the source file.
+                out.sort(java.util.Comparator.comparingInt(SearchResult::chunkIndex));
+                return out;
+            } finally {
+                searchers.release(searcher);
+            }
+        } catch (IOException e) {
+            log.warn("Failed to fetch all chunks for '{}': {}", absolutePath, e.getMessage());
+            return List.of();
+        }
+    }
+
     public List<SearchResult> query(float[] queryEmbedding, int topK) {
         try {
             // Ensure latest writes are visible. maybeRefresh is cheap when

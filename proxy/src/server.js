@@ -143,6 +143,12 @@ app.post('/proxy/chat/completions', auth.requireAuth, async (req, res) => {
 
   const after = db.incrementTodayCount(req.device.id, todayKey())
 
+  // Streaming branch: when the client sets {"stream": true}, OpenAI returns
+  // an SSE response. We pipe its bytes straight through to the client so
+  // each delta token shows up live in the chat UI. Same auth + rate-limit
+  // logic; only the response shape differs.
+  const wantsStream = req.body && req.body.stream === true
+
   try {
     const upstream = await fetch(OPENAI_BASE_URL + '/chat/completions', {
       method:  'POST',
@@ -152,14 +158,44 @@ app.post('/proxy/chat/completions', auth.requireAuth, async (req, res) => {
       },
       body: JSON.stringify(req.body),
     })
-    const body = await upstream.text()
+
+    // Mirror useful response metadata
     res.status(upstream.status)
-       .type(upstream.headers.get('content-type') || 'application/json')
        .set('X-Plan',            req.device.plan)
        .set('X-Usage-Used',      String(after))
        .set('X-Usage-Limit',     String(limit))
        .set('X-Usage-Remaining', String(Math.max(0, limit - after)))
-       .send(body)
+
+    if (wantsStream && upstream.ok && upstream.body) {
+      // Pipe SSE bytes straight through. We DO NOT buffer — that would
+      // defeat the entire point of streaming. Set headers explicitly so
+      // intermediaries (and Express) don't try to gzip / chunk-buffer.
+      res.set('Content-Type',      'text/event-stream')
+      res.set('Cache-Control',     'no-cache, no-transform')
+      res.set('Connection',        'keep-alive')
+      res.set('X-Accel-Buffering', 'no')          // disable nginx buffering if behind one
+      res.flushHeaders?.()
+
+      // Node 18+ fetch returns a web ReadableStream; use the standard
+      // Response.body.pipeTo + writable stream, or fall back to async iteration.
+      try {
+        for await (const chunk of upstream.body) {
+          if (!res.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))) {
+            // backpressure
+            await new Promise(resolve => res.once('drain', resolve))
+          }
+        }
+      } catch (streamErr) {
+        // Mid-stream failure — best-effort terminate and refund.
+        console.warn('[proxy] stream pipe error:', streamErr.message)
+      }
+      res.end()
+      return
+    }
+
+    // Non-streaming path (legacy): pull full body, send.
+    const body = await upstream.text()
+    res.type(upstream.headers.get('content-type') || 'application/json').send(body)
   } catch (e) {
     // Refund the slot — the user shouldn't pay for our outage.
     db.decrementTodayCount(req.device.id, todayKey())

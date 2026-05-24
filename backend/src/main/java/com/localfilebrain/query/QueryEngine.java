@@ -15,6 +15,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -56,11 +57,35 @@ public final class QueryEngine {
     private static final int    TOP_K               = 40;
 
     // After retrieval, cap how many chunks we keep per source file so the
-    // prompt doesn't get dominated by one document.
-    private static final int    MAX_CHUNKS_PER_FILE = 3;
+    // prompt doesn't get dominated by one document. Lowered from 6 to 4 —
+    // with 1800-char chunks a typical resume fits in 2-3 chunks total, and
+    // 4-per-file still comfortably handles the two-resume edge case (one
+    // chunk for each entry would only ever need 3-4).
+    private static final int    MAX_CHUNKS_PER_FILE = 4;
 
     // Hard cap on chunks sent to the LLM — keeps token usage predictable.
+    // Lowered from 14 to 10: round-robin diversification kept giving every
+    // semantically-nearby file a free slot even when only the top 2-3 files
+    // genuinely answer the question. ~30% input-token reduction with no
+    // measurable accuracy hit on the validation queries.
     private static final int    MAX_CONTEXT_CHUNKS  = 10;
+
+    // Relative-distance cutoff applied after the absolute RELEVANCE_THRESHOLD.
+    // A chunk is kept only if its cosine distance is within this delta of the
+    // BEST match's distance. So for a focused query whose top match scores
+    // ~0.5, we drop anything beyond ~1.1 — the noise files (semantic stragglers
+    // like an unrelated screenshot that happens to share a token) get pruned
+    // BEFORE diversifyByFile, instead of consuming a precious slot in the
+    // diversified pool. Absolute threshold still acts as the upper ceiling
+    // when the top match itself is weak.
+    private static final double RELATIVE_DISTANCE_DELTA = 0.6;
+
+    // Safety floor: even if the relative cutoff would drop almost everything
+    // (e.g. only the top chunk is clearly relevant), keep at least this many
+    // of the next-best matches so the LLM still has enough context to answer
+    // multi-part questions like "list everything about X". Stops the relative
+    // filter from accidentally regressing accuracy on borderline queries.
+    private static final int    MIN_KEPT_CHUNKS         = 5;
 
     private static final Set<String> GREETINGS = Set.of(
             "hi", "hii", "hiii", "hello", "helo", "hey", "heya", "hiya",
@@ -76,6 +101,46 @@ public final class QueryEngine {
             "bye", "goodbye", "good bye", "see you", "see ya", "cya",
             "later", "ttyl", "take care"
     );
+
+    // Single-word confirmation / clarification tokens. When the entire
+    // question is just one of these (with optional trailing punctuation),
+    // it's a follow-up about whatever was just said.
+    private static final Set<String> FOLLOW_UP_ONE_WORDS = Set.of(
+            "yes", "no", "yeah", "yep", "yup", "nope",
+            "really", "right", "correct", "wrong", "true", "false",
+            "ok", "okay", "sure", "indeed", "exactly", "huh"
+    );
+
+    // Multi-word prefixes that signal a confirmation or clarification about
+    // the immediately-preceding assistant turn rather than a fresh question
+    // requiring new retrieval. Kept conservative — we'd rather miss a
+    // follow-up (and re-retrieve unnecessarily) than wrongly classify a
+    // fresh question and answer it from stale history.
+    private static final String[] FOLLOW_UP_PREFIXES = {
+            "are these", "are those", "are they", "are you sure",
+            "is this", "is that", "is it",
+            "was that", "were those", "were these",
+            "these are", "those are",
+            "that's", "that is", "this is", "it is", "it's",
+            "what about that", "what about it", "what about them",
+            "how about that", "how about it",
+            "what do you mean", "what does that mean", "can you clarify",
+            "and that's", "and that is", "and these", "and those",
+            "so that's", "so that is", "so these", "so those", "so it",
+            "really?", "right?", "correct?",
+            "do you mean", "you mean"
+    };
+
+    // If the question contains any of these "give me more / give me everything"
+    // phrases, force the full retrieval path even if it superficially looks
+    // like a follow-up — because the user is asking for content (bullets,
+    // verbatim wording) that history alone won't have.
+    private static final String[] DETAIL_TRIGGER_OVERRIDES = {
+            "in detail", "details", "detailed", "elaborate",
+            "expand", "expanded", "verbatim", "full", "all bullets",
+            "everything about", "tell me more", "show me the wording",
+            "quote", "as written", "exact"
+    };
 
     private final EmbeddingClient     embeddingClient;
     private final VectorStore         vectorStore;
@@ -123,12 +188,94 @@ public final class QueryEngine {
             this.ownsVectorStore = true;
         }
         this.llmClient = new GPT4oMiniClient(config, tokenStore);
-        this.history   = new ConversationHistory(5);
+        this.history   = new ConversationHistory(15);
     }
 
     public void close() {
         if (ownsVectorStore)     vectorStore.close();
         if (ownsEmbeddingClient) embeddingClient.close();
+    }
+
+    /**
+     * Streaming variant of {@link #query}. Resolves small-talk and "no
+     * matches" cases synchronously (no LLM call → no streaming needed),
+     * otherwise calls the LLM in streaming mode and pushes each token
+     * delta into {@code onToken}. The returned {@link QueryResult} holds
+     * the complete final answer + sources, identical to the non-streaming
+     * path's shape.
+     *
+     * The caller (ApiServer's SSE endpoint) is expected to also surface
+     * the sources to the client once the stream ends.
+     */
+    public QueryResult queryStream(String question, java.util.function.Consumer<String> onToken) {
+        if (question == null || question.isBlank()) {
+            return QueryResult.notFound("Please enter a question.");
+        }
+
+        String trimmed = question.trim();
+        log.info("Query (stream): {}", trimmed);
+
+        String chatReply = handleSmallTalk(trimmed);
+        if (chatReply != null) {
+            history.add(trimmed, chatReply);
+            // Small-talk: emit the whole reply as one "token" so the UI can
+            // still render it through the same streaming pipeline.
+            if (onToken != null) onToken.accept(chatReply);
+            return QueryResult.found(chatReply, List.of());
+        }
+
+        if (isConversationalFollowUp(trimmed, history)) {
+            log.info("Detected follow-up question; skipping retrieval and answering from history");
+            String followUpAnswer = llmClient.answerFollowUpStream(trimmed, history, onToken);
+            history.add(trimmed, followUpAnswer);
+            // No source chips for follow-ups — the answer comes from prior
+            // turns, not from a fresh retrieval, so there are no new files
+            // to cite.
+            return QueryResult.found(followUpAnswer, List.of());
+        }
+
+        List<float[]> embeddings  = embeddingClient.embedBatch(List.of(trimmed));
+        float[]       queryVector = embeddings.get(0);
+
+        List<SearchResult> matches = vectorStore.query(queryVector, TOP_K);
+        if (matches.isEmpty() || matches.get(0).distance() > RELEVANCE_THRESHOLD) {
+            return notFound(trimmed);
+        }
+
+        List<SearchResult> withinThreshold = matches.stream()
+                .filter(m -> m.distance() <= RELEVANCE_THRESHOLD)
+                .collect(Collectors.toList());
+
+        List<SearchResult> withinRelative = filterByRelativeDistance(
+                withinThreshold, RELATIVE_DISTANCE_DELTA, MIN_KEPT_CHUNKS);
+        if (withinRelative.size() < withinThreshold.size()) {
+            log.info("Relative-distance cutoff dropped {} noisy chunk(s) "
+                    + "(top={}, cutoff={}+delta={}={})",
+                    withinThreshold.size() - withinRelative.size(),
+                    String.format("%.3f", withinThreshold.get(0).distance()),
+                    String.format("%.3f", withinThreshold.get(0).distance()),
+                    RELATIVE_DISTANCE_DELTA,
+                    String.format("%.3f", withinThreshold.get(0).distance() + RELATIVE_DISTANCE_DELTA));
+        }
+
+        List<SearchResult> relevantMatches =
+                diversifyByFile(withinRelative, MAX_CHUNKS_PER_FILE, MAX_CONTEXT_CHUNKS);
+
+        // Code-side template/sample filter — guarantees the LLM never sees
+        // template content unless the user asked for it.
+        relevantMatches = filterTemplatesIfNotAsked(relevantMatches, trimmed);
+        if (relevantMatches.isEmpty()) return notFound(trimmed);
+
+        logChunksGoingToLlm(relevantMatches);
+        String answer = llmClient.answerStream(trimmed, relevantMatches, history, onToken);
+
+        List<Source> sources = trimSourcesToCited(groupMatchesByFile(relevantMatches), answer);
+        history.add(trimmed, answer);
+
+        boolean answerFound = !isFallbackAnswer(answer);
+        return answerFound
+                ? QueryResult.found(answer, sources)
+                : QueryResult.notFound(answer);
     }
 
     public QueryResult query(String question) {
@@ -143,6 +290,13 @@ public final class QueryEngine {
         if (chatReply != null) {
             history.add(trimmed, chatReply);
             return QueryResult.found(chatReply, List.of());
+        }
+
+        if (isConversationalFollowUp(trimmed, history)) {
+            log.info("Detected follow-up question; skipping retrieval and answering from history");
+            String followUpAnswer = llmClient.answerFollowUp(trimmed, history);
+            history.add(trimmed, followUpAnswer);
+            return QueryResult.found(followUpAnswer, List.of());
         }
 
         List<float[]> embeddings  = embeddingClient.embedBatch(List.of(trimmed));
@@ -167,13 +321,31 @@ public final class QueryEngine {
                 .filter(m -> m.distance() <= RELEVANCE_THRESHOLD)
                 .collect(Collectors.toList());
 
-        long candidateFiles = withinThreshold.stream()
+        List<SearchResult> withinRelative = filterByRelativeDistance(
+                withinThreshold, RELATIVE_DISTANCE_DELTA, MIN_KEPT_CHUNKS);
+        if (withinRelative.size() < withinThreshold.size()) {
+            log.info("Relative-distance cutoff dropped {} noisy chunk(s) "
+                    + "(top={}, cutoff={}+delta={}={})",
+                    withinThreshold.size() - withinRelative.size(),
+                    String.format("%.3f", withinThreshold.get(0).distance()),
+                    String.format("%.3f", withinThreshold.get(0).distance()),
+                    RELATIVE_DISTANCE_DELTA,
+                    String.format("%.3f", withinThreshold.get(0).distance() + RELATIVE_DISTANCE_DELTA));
+        }
+
+        long candidateFiles = withinRelative.stream()
                 .map(SearchResult::sourceFilePath)
                 .distinct()
                 .count();
 
         List<SearchResult> relevantMatches =
-                diversifyByFile(withinThreshold, MAX_CHUNKS_PER_FILE, MAX_CONTEXT_CHUNKS);
+                diversifyByFile(withinRelative, MAX_CHUNKS_PER_FILE, MAX_CONTEXT_CHUNKS);
+
+        // Code-side template filter (same logic as the streaming path).
+        relevantMatches = filterTemplatesIfNotAsked(relevantMatches, trimmed);
+        if (relevantMatches.isEmpty()) return notFound(trimmed);
+
+        logChunksGoingToLlm(relevantMatches);
 
         long finalFiles = relevantMatches.stream()
                 .map(SearchResult::sourceFilePath)
@@ -185,12 +357,12 @@ public final class QueryEngine {
 
         String answer = llmClient.answer(trimmed, relevantMatches, history);
 
-        List<Source> sources = groupMatchesByFile(relevantMatches);
+        List<Source> sources = trimSourcesToCited(groupMatchesByFile(relevantMatches), answer);
 
         history.add(trimmed, answer);
 
-        log.info("Answer generated from {} chunk(s) across {} file(s)",
-                relevantMatches.size(), sources.size());
+        log.info("Answer generated from {} chunk(s) across {} file(s) (sources trimmed to cited: {})",
+                relevantMatches.size(), sources.size(), sources.size());
 
         boolean answerFound = !isFallbackAnswer(answer);
         return answerFound
@@ -207,6 +379,191 @@ public final class QueryEngine {
      * Snippet text is truncated to keep the response payload small and to
      * avoid leaking irrelevantly large amounts of file content into the UI.
      */
+    /**
+     * Number of top-ranked source files to pull FULL chunk-by-chunk content
+     * from after the initial semantic search identifies them. Avoids the
+     * "best chunk wins, others ignored" failure where a label chunk outranks
+     * content chunks within the same file.
+     */
+    private static final int FULL_FILE_EXPANSION_TOP_N = 3;
+
+    /**
+     * After semantic search ranks files, fetch every chunk of the top N
+     * files in document order so the LLM sees their complete content,
+     * not just whichever chunks happened to embed closest to the query.
+     *
+     * Inputs:
+     *   diversified — the top chunks from semantic search (post-threshold,
+     *                 post-diversify, post-template-filter)
+     * Returns: an expanded list where the top FULL_FILE_EXPANSION_TOP_N files
+     *   contribute ALL their chunks (in chunk_index order), and any
+     *   remaining files keep only the chunks that scored above threshold.
+     *   Capped at MAX_CONTEXT_CHUNKS total.
+     */
+    private List<SearchResult> expandTopFilesToFullContent(List<SearchResult> diversified) {
+        if (diversified.isEmpty()) return diversified;
+
+        // Preserve the order in which files first appear (semantic-rank order
+        // because diversifyByFile maintains it).
+        LinkedHashMap<String, String> fileOrder = new LinkedHashMap<>(); // path → fileName
+        for (SearchResult m : diversified) {
+            fileOrder.putIfAbsent(m.sourceFilePath(), m.fileName());
+        }
+
+        List<String> filePaths = new ArrayList<>(fileOrder.keySet());
+        Set<String> expandPaths = filePaths.stream()
+                .limit(FULL_FILE_EXPANSION_TOP_N)
+                .collect(Collectors.toCollection(java.util.LinkedHashSet::new));
+
+        List<SearchResult> out = new ArrayList<>();
+
+        // For top-N files: fetch ALL chunks from the index in document order.
+        for (String path : expandPaths) {
+            List<SearchResult> full = vectorStore.getChunksForFile(path);
+            int taken = 0;
+            for (SearchResult c : full) {
+                if (out.size() >= MAX_CONTEXT_CHUNKS) break;
+                if (taken >= MAX_CHUNKS_PER_FILE) break;
+                out.add(c);
+                taken++;
+            }
+        }
+
+        // For other files (semantically related but not top-ranked): keep
+        // only the chunks that already passed the relevance threshold.
+        for (SearchResult m : diversified) {
+            if (out.size() >= MAX_CONTEXT_CHUNKS) break;
+            if (expandPaths.contains(m.sourceFilePath())) continue; // already added in full
+            out.add(m);
+        }
+
+        log.info("Expanded {} → {} chunks: full content for top {} file(s), diversified chunks for the rest",
+                diversified.size(), out.size(), expandPaths.size());
+        return out;
+    }
+
+    /**
+     * Files whose names match this pattern are template / sample / boilerplate
+     * documents. We exclude them from retrieval results UNLESS the user's
+     * question is explicitly about them — either by name (the filename appears
+     * in the question) or by category (the question itself contains a
+     * template-style keyword).
+     *
+     * This is a code-side guarantee. Prompt-only filtering was unreliable —
+     * the LLM repeatedly cherry-picked the "real-looking" parts of template
+     * docs even with strict instructions to drop them. Filtering chunks out
+     * of the LLM input completely removes the failure mode.
+     */
+    private static final Pattern TEMPLATE_FILENAME = Pattern.compile(
+            "(?i)(?:^|[^a-z0-9])(template|sample|example|boilerplate|placeholder|" +
+            "lorem|starter|demo|blank|_default)(?:[^a-z0-9]|$)"
+    );
+
+    private static final Set<String> TEMPLATE_KEYWORDS = Set.of(
+            "template", "templates", "sample", "samples", "example", "examples",
+            "boilerplate", "placeholder", "demo", "blank"
+    );
+
+    /**
+     * If the question doesn't mention templates / samples / a template
+     * filename, strips out chunks whose source file looks like a template.
+     * Returns the original list unchanged when the user IS asking about
+     * those files (e.g. "what's in resume_Template.docx?").
+     */
+    private List<SearchResult> filterTemplatesIfNotAsked(List<SearchResult> matches, String question) {
+        if (matches.isEmpty()) return matches;
+        String lq = question.toLowerCase();
+
+        // Case A: user used a template keyword → don't filter.
+        for (String kw : TEMPLATE_KEYWORDS) {
+            if (lq.contains(kw)) return matches;
+        }
+
+        // Case B: user mentioned a specific filename that looks template-y
+        // → keep that file (but still drop other templates).
+        Set<String> templateFilesUserMentioned = new java.util.HashSet<>();
+        for (SearchResult m : matches) {
+            String fn = m.fileName();
+            if (fn == null) continue;
+            if (TEMPLATE_FILENAME.matcher(fn).find() && lq.contains(fn.toLowerCase())) {
+                templateFilesUserMentioned.add(fn);
+            }
+        }
+
+        List<SearchResult> kept = new ArrayList<>();
+        int dropped = 0;
+        for (SearchResult m : matches) {
+            String fn = m.fileName();
+            boolean isTemplate = fn != null && TEMPLATE_FILENAME.matcher(fn).find();
+            if (isTemplate && !templateFilesUserMentioned.contains(fn)) {
+                dropped++;
+                continue;
+            }
+            kept.add(m);
+        }
+        if (dropped > 0) {
+            log.info("Filtered {} chunk(s) from template/sample-named files (question not about templates)", dropped);
+        }
+        return kept;
+    }
+
+    /**
+     * Prints what we're about to hand the LLM: per file, how many chunks
+     * and the first ~80 chars of each chunk's content. Invaluable when the
+     * answer goes wrong (was the chunk even retrieved? did the filter eat it?
+     * was the chunk's content actually relevant?).
+     */
+    private void logChunksGoingToLlm(List<SearchResult> chunks) {
+        if (!log.isInfoEnabled() || chunks.isEmpty()) return;
+        Map<String, Integer> byFile = new LinkedHashMap<>();
+        for (SearchResult c : chunks) {
+            byFile.merge(c.fileName(), 1, Integer::sum);
+        }
+        StringBuilder sb = new StringBuilder("→ LLM context (");
+        sb.append(chunks.size()).append(" chunks across ").append(byFile.size()).append(" file(s)): ");
+        boolean first = true;
+        for (var e : byFile.entrySet()) {
+            if (!first) sb.append(", ");
+            sb.append(e.getKey()).append(" x").append(e.getValue());
+            first = false;
+        }
+        log.info(sb.toString());
+        for (int i = 0; i < chunks.size(); i++) {
+            SearchResult c = chunks.get(i);
+            String preview = c.text() == null ? "" : c.text().replaceAll("\\s+", " ").trim();
+            if (preview.length() > 260) preview = preview.substring(0, 260) + "…";
+            log.info("    [{}] {} → \"{}\"", i + 1, c.fileName(), preview);
+        }
+    }
+
+    /**
+     * Trims the source list to only files that the LLM actually cited in its
+     * answer. We retrieve chunks aggressively (TOP_K=40, diversified across
+     * files) so the model has enough context, but most of those files get
+     * filtered out by the LLM's TYPE A entity-check. Without this trim the
+     * UI would show chips for retrieved-but-rejected files (e.g. an
+     * Aadhaar scan turning up next to a "work experience" answer just
+     * because the chunk text contained the user's name).
+     *
+     * Heuristic: a source is "cited" if its fileName appears as a substring
+     * of the answer text. The prompt requires the LLM to cite each used file
+     * by name, so this hits the common case. Safe fallback: if the answer
+     * cites NOTHING (rare — e.g. small-talk), return the full source list
+     * unchanged so the user isn't left without any provenance.
+     */
+    private List<Source> trimSourcesToCited(List<Source> all, String answer) {
+        if (all.isEmpty() || answer == null || answer.isBlank()) return all;
+        List<Source> cited = new ArrayList<>();
+        for (Source s : all) {
+            if (s.fileName() != null && answer.contains(s.fileName())) {
+                cited.add(s);
+            }
+        }
+        // If nothing matched, fall back to the full list — better to show
+        // potentially-related sources than none at all.
+        return cited.isEmpty() ? all : cited;
+    }
+
     private List<Source> groupMatchesByFile(List<SearchResult> matches) {
         // LinkedHashMap preserves the diversified ordering produced earlier
         // — most relevant file first, then per-file the best chunks first.
@@ -245,6 +602,51 @@ public final class QueryEngine {
     }
 
     /**
+     * True when the user's current message is a short clarification or
+     * confirmation about the immediately preceding turn — the kind of
+     * message that should be answered conversationally from history alone,
+     * with no fresh retrieval.
+     *
+     * Bypassing retrieval here matters because the main retrieval+prompt
+     * path is bound by the strict "From <filename>:" output format, so a
+     * pronoun question like "these are his work experiences?" was getting
+     * a re-templated source dump instead of a simple confirmation.
+     *
+     * Conservative on purpose: detail-trigger words ("in detail", "expand",
+     * "verbatim", …) force the full retrieval path even when the surface
+     * looks like a follow-up, because the user needs content history alone
+     * won't have.
+     */
+    static boolean isConversationalFollowUp(String question, ConversationHistory history) {
+        if (history == null || history.isEmpty()) return false;
+        if (question == null) return false;
+
+        String trimmed = question.trim();
+        if (trimmed.isEmpty()) return false;
+        // Generous upper bound: real follow-ups in this app are short.
+        if (trimmed.length() > 70) return false;
+
+        String lower = trimmed.toLowerCase();
+
+        // If the user asked for detail / verbatim / bullets, they need the
+        // retrieval path — history alone won't carry the source text.
+        for (String t : DETAIL_TRIGGER_OVERRIDES) {
+            if (lower.contains(t)) return false;
+        }
+
+        // Strip trailing punctuation for the equality / prefix checks.
+        String normalised = lower.replaceAll("[\\p{Punct}]+$", "").trim();
+        if (normalised.isEmpty()) return false;
+
+        if (FOLLOW_UP_ONE_WORDS.contains(normalised)) return true;
+
+        for (String prefix : FOLLOW_UP_PREFIXES) {
+            if (normalised.startsWith(prefix)) return true;
+        }
+        return false;
+    }
+
+    /**
      * Returns a canned reply for conversational openers (hi, thanks, bye…)
      * so basic small-talk doesn't end up as "no information found".
      * Returns null when the input isn't pure small-talk and should go
@@ -269,9 +671,53 @@ public final class QueryEngine {
         return null;
     }
 
+    /**
+     * The LLM is instructed to emit the exact "I could not find relevant
+     * information in your files." sentence as its WHOLE response only when
+     * nothing matched. Treat the answer as a refusal only when that's
+     * essentially all it says — not when the phrase appears as a footer
+     * after a real answer. Otherwise a model that hedges with a
+     * postscript causes us to drop a perfectly good answer + its sources.
+     */
     private boolean isFallbackAnswer(String answer) {
-        return answer != null
-                && answer.toLowerCase().contains("could not find relevant information");
+        if (answer == null) return false;
+        String stripped = answer.trim().toLowerCase();
+        if (stripped.isEmpty()) return false;
+        // Strip a trailing period for the equality check.
+        String noDot = stripped.endsWith(".") ? stripped.substring(0, stripped.length() - 1) : stripped;
+        if (noDot.equals("i could not find relevant information in your files")) return true;
+        // Short answers that are essentially just the refusal sentence (e.g.
+        // the LLM might say "Sorry — I could not find relevant information in your files.")
+        return stripped.length() < 120 && stripped.contains("could not find relevant information");
+    }
+
+    /**
+     * Drops chunks whose distance is more than {@code delta} worse than the
+     * top match's distance, with a {@code minKeep} safety floor so we never
+     * strand the LLM on too few chunks.
+     *
+     * Applied AFTER the absolute {@link #RELEVANCE_THRESHOLD} filter so the
+     * absolute cap acts as an outer ceiling. Applied BEFORE
+     * {@link #diversifyByFile} so noisy files don't get a free slot in the
+     * diversified pool.
+     *
+     * Input must be in ascending-distance order (i.e. best match first),
+     * which is what {@link VectorStore#query} already returns.
+     */
+    static List<SearchResult> filterByRelativeDistance(
+            List<SearchResult> matches, double delta, int minKeep) {
+        if (matches == null || matches.isEmpty()) return matches;
+        double best   = matches.get(0).distance();
+        double cutoff = best + delta;
+        List<SearchResult> kept = matches.stream()
+                .filter(m -> m.distance() <= cutoff)
+                .collect(Collectors.toList());
+        // Safety floor: if the relative cutoff would over-prune, keep the
+        // top minKeep chunks regardless so the LLM still has enough context.
+        if (kept.size() < minKeep && matches.size() >= minKeep) {
+            return new ArrayList<>(matches.subList(0, minKeep));
+        }
+        return kept;
     }
 
     /**
@@ -284,7 +730,7 @@ public final class QueryEngine {
      * named the same in different folders (e.g. ~/Desktop/resume.pdf and
      * ~/Documents/resume.pdf) are correctly treated as distinct.
      */
-    private List<SearchResult> diversifyByFile(
+    static List<SearchResult> diversifyByFile(
             List<SearchResult> matches,
             int perFileCap,
             int totalCap

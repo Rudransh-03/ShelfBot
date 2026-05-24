@@ -188,24 +188,51 @@ export default function Chat({ active }) {
     // two requests in parallel.
     setTimeout(() => inputRef.current?.focus(), 0)
 
-    try {
-      const res = await api.query(question)
-      setMessages(m => [...m, {
-        role: 'ai',
-        text: res.answer,
-        sources: res.sources ?? [],
-        variant: !res.found ? 'not-found' : undefined,
-      }])
-    } catch (e) {
-      setMessages(m => [...m, { role: 'ai', text: e.message, variant: 'error' }])
-    } finally {
-      setLoading(false)
-      setJustAnswered(true)
-      setTimeout(() => setJustAnswered(false), 2200)
-      // Refresh /me so the daily-usage counter in Settings updates within
-      // a second of each query, not on the slow 30s poller.
-      refreshAuth()
+    // Push a placeholder AI bubble that we'll grow as tokens arrive.
+    // The streaming callback updates the LAST message's text field, so the
+    // bubble appears to type itself in real time.
+    setMessages(m => [...m, { role: 'ai', text: '', streaming: true }])
+
+    const appendToken = (chunk) => {
+      setMessages(m => {
+        const next = m.slice()
+        const last = next[next.length - 1]
+        if (last && last.role === 'ai') {
+          next[next.length - 1] = { ...last, text: (last.text || '') + chunk }
+        }
+        return next
+      })
     }
+
+    const finalize = (patch) => {
+      setMessages(m => {
+        const next = m.slice()
+        const last = next[next.length - 1]
+        if (last && last.role === 'ai') {
+          next[next.length - 1] = { ...last, streaming: false, ...patch }
+        }
+        return next
+      })
+    }
+
+    await new Promise((resolve) => {
+      api.queryStream(question, {
+        onToken: appendToken,
+        onDone:  ({ sources = [], found = true }) => {
+          finalize({ sources, variant: !found ? 'not-found' : undefined })
+          resolve()
+        },
+        onError: (err) => {
+          finalize({ text: err.message || 'Something went wrong.', variant: 'error', sources: [] })
+          resolve()
+        },
+      })
+    })
+
+    setLoading(false)
+    setJustAnswered(true)
+    setTimeout(() => setJustAnswered(false), 2200)
+    refreshAuth()
   }, [api, connected, loading, refreshAuth])
 
   const handleKey = (e) => {
@@ -284,16 +311,21 @@ export default function Chat({ active }) {
       ) : (
         <div className="messages" ref={msgsRef}>
           {messages.map((m, i) => (
-            <Message
-              key={i}
-              role={m.role}
-              text={m.text}
-              sources={m.sources}
-              variant={m.variant}
-              onOpenSource={openSource}
-            />
+            // Show the typing indicator instead of an empty bubble at the
+            // start of a streaming response (no tokens have landed yet).
+            m.role === 'ai' && m.streaming && !m.text ? (
+              <TypingIndicator key={i} />
+            ) : (
+              <Message
+                key={i}
+                role={m.role}
+                text={m.text}
+                sources={m.sources}
+                variant={m.variant}
+                onOpenSource={openSource}
+              />
+            )
           ))}
-          {loading && <TypingIndicator />}
         </div>
       )}
 

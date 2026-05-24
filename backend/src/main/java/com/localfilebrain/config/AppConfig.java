@@ -141,7 +141,11 @@ public final class AppConfig {
     public String[] getSupportedExtensions() {
         String value = getOrDefault(
                 "supported.extensions",
-                "pdf,docx,doc,txt,md,xlsx,xls,pptx,ppt,odt,ods,odp,html,htm,rtf,csv"
+                // Documents
+                "pdf,docx,doc,txt,md,xlsx,xls,pptx,ppt,odt,ods,odp,html,htm,rtf,csv,"
+                // Images — OCR'd via Tesseract when it's installed on the
+                // host, so users can search photos of IDs / receipts / etc.
+                + "jpg,jpeg,png,tif,tiff,bmp,webp,gif"
         );
         String[] parts = value.split(",");
         for (int i = 0; i < parts.length; i++) parts[i] = parts[i].trim().toLowerCase();

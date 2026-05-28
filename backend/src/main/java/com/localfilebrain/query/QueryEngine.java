@@ -7,6 +7,7 @@ import com.localfilebrain.embedding.EmbeddingClientFactory;
 import com.localfilebrain.llm.GPT4oMiniClient;
 import com.localfilebrain.storage.VectorStore;
 import com.localfilebrain.storage.VectorStore.SearchResult;
+import com.localfilebrain.util.PathNormalizer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -234,6 +235,19 @@ public final class QueryEngine {
             return QueryResult.found(followUpAnswer, List.of());
         }
 
+        // File-targeted path: when the question literally names an indexed
+        // file (typically by absolute path), bypass semantic search and feed
+        // the LLM that file's full chunk list. Semantic vectors of "give a
+        // half page brief of /Users/.../foo.pdf" don't reliably hit the
+        // doc's content chunks, but the user clearly meant that one file.
+        java.util.Optional<String> scoped = detectFileScope(trimmed);
+        if (scoped.isPresent()) {
+            String scopedAnswer = answerFromFileScopeStream(trimmed, scoped.get(), onToken);
+            if (scopedAnswer != null) return scopedAnswer.isEmpty()
+                    ? notFound(trimmed)
+                    : scopedAnswerResult(trimmed, scoped.get(), scopedAnswer);
+        }
+
         List<float[]> embeddings  = embeddingClient.embedBatch(List.of(trimmed));
         float[]       queryVector = embeddings.get(0);
 
@@ -297,6 +311,15 @@ public final class QueryEngine {
             String followUpAnswer = llmClient.answerFollowUp(trimmed, history);
             history.add(trimmed, followUpAnswer);
             return QueryResult.found(followUpAnswer, List.of());
+        }
+
+        // File-targeted path — see streaming variant for the rationale.
+        java.util.Optional<String> scoped = detectFileScope(trimmed);
+        if (scoped.isPresent()) {
+            String scopedAnswer = answerFromFileScope(trimmed, scoped.get());
+            if (scopedAnswer != null) return scopedAnswer.isEmpty()
+                    ? notFound(trimmed)
+                    : scopedAnswerResult(trimmed, scoped.get(), scopedAnswer);
         }
 
         List<float[]> embeddings  = embeddingClient.embedBatch(List.of(trimmed));
@@ -588,6 +611,75 @@ public final class QueryEngine {
         String cleaned = text.strip();
         if (cleaned.length() <= SNIPPET_MAX_CHARS) return cleaned;
         return cleaned.substring(0, SNIPPET_MAX_CHARS).stripTrailing() + "…";
+    }
+
+    // Absolute paths in user questions: must start with '/' and end at the
+    // first whitespace OR end of string. Filenames on macOS can contain
+    // spaces (rare in pasted paths), so this won't handle every case; the
+    // user can drop the space-containing path with a trailing newline to
+    // force termination.
+    private static final Pattern ABS_PATH_IN_QUESTION = Pattern.compile(
+            "(/[^\\s\\n]+\\.[A-Za-z0-9]{1,8})"
+    );
+
+    /**
+     * Returns the canonical path of an indexed file explicitly named in the
+     * question (typically pasted as an absolute path), or empty if no such
+     * file is found in the index. A path is considered indexed only when
+     * the Lucene store has at least one chunk tagged with it.
+     */
+    private java.util.Optional<String> detectFileScope(String question) {
+        if (question == null) return java.util.Optional.empty();
+        java.util.regex.Matcher m = ABS_PATH_IN_QUESTION.matcher(question);
+        while (m.find()) {
+            String candidate = m.group(1);
+            // Trim trailing punctuation that's almost never part of a real path.
+            while (candidate.endsWith(".") || candidate.endsWith(",")
+                    || candidate.endsWith(";") || candidate.endsWith(":")
+                    || candidate.endsWith(")") || candidate.endsWith("]")) {
+                candidate = candidate.substring(0, candidate.length() - 1);
+            }
+            String canonical = PathNormalizer.canonical(candidate);
+            List<SearchResult> chunks = vectorStore.getChunksForFile(canonical);
+            if (!chunks.isEmpty()) return java.util.Optional.of(canonical);
+        }
+        return java.util.Optional.empty();
+    }
+
+    /**
+     * Calls the LLM with every indexed chunk of {@code path} (capped at
+     * {@link #MAX_CONTEXT_CHUNKS}) as context. Returns the answer text, or
+     * an empty string if the file had zero retrievable chunks, or null if
+     * the caller should fall through to the normal semantic-search path.
+     */
+    private String answerFromFileScope(String question, String path) {
+        List<SearchResult> chunks = vectorStore.getChunksForFile(path);
+        if (chunks.isEmpty()) return null;
+        if (chunks.size() > MAX_CONTEXT_CHUNKS) chunks = chunks.subList(0, MAX_CONTEXT_CHUNKS);
+        log.info("File-scoped retrieval: {} chunk(s) from {}", chunks.size(), path);
+        logChunksGoingToLlm(chunks);
+        return llmClient.answer(question, chunks, history);
+    }
+
+    /** Streaming variant of {@link #answerFromFileScope}. */
+    private String answerFromFileScopeStream(String question, String path,
+                                             java.util.function.Consumer<String> onToken) {
+        List<SearchResult> chunks = vectorStore.getChunksForFile(path);
+        if (chunks.isEmpty()) return null;
+        if (chunks.size() > MAX_CONTEXT_CHUNKS) chunks = chunks.subList(0, MAX_CONTEXT_CHUNKS);
+        log.info("File-scoped retrieval (stream): {} chunk(s) from {}", chunks.size(), path);
+        logChunksGoingToLlm(chunks);
+        return llmClient.answerStream(question, chunks, history, onToken);
+    }
+
+    /** Wraps a file-scoped answer in the same result shape as semantic search. */
+    private QueryResult scopedAnswerResult(String question, String path, String answer) {
+        List<SearchResult> chunks = vectorStore.getChunksForFile(path);
+        List<Source> sources = groupMatchesByFile(chunks);
+        history.add(question, answer);
+        return isFallbackAnswer(answer)
+                ? QueryResult.notFound(answer)
+                : QueryResult.found(answer, sources);
     }
 
     public void clearHistory() {

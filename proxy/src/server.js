@@ -12,23 +12,29 @@
 // The desktop app never sees the OpenAI key — that's the entire point.
 // Identity is the device, not an email; rate limits are per-device-per-day.
 
-import dotenv  from 'dotenv'
-import express from 'express'
-import cors    from 'cors'
+import dotenv     from 'dotenv'
+import express    from 'express'
+import cors       from 'cors'
+import { randomUUID } from 'node:crypto'
 
 import { openDb, todayKey } from './db.js'
 import { makeAuth }         from './auth.js'
 
 dotenv.config()
 
-const PORT              = parseInt(process.env.PORT || '8787', 10)
-const JWT_SECRET        = process.env.JWT_SECRET
-const JWT_TTL_SECONDS   = parseInt(process.env.JWT_TTL_SECONDS || '2592000', 10)
-const FREE_DAILY        = parseInt(process.env.FREE_DAILY || '5', 10)
-const PRO_DAILY         = parseInt(process.env.PRO_DAILY  || '25', 10)
-const OPENAI_API_KEY    = process.env.OPENAI_API_KEY
-const OPENAI_BASE_URL   = (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '')
-const DB_PATH           = process.env.DB_PATH || './shelfbot-proxy.db'
+const PORT                  = parseInt(process.env.PORT || '8787', 10)
+const JWT_SECRET            = process.env.JWT_SECRET
+const JWT_TTL_SECONDS       = parseInt(process.env.JWT_TTL_SECONDS || '2592000', 10)
+const FREE_DAILY            = parseInt(process.env.FREE_DAILY || '5', 10)
+const PRO_DAILY             = parseInt(process.env.PRO_DAILY  || '25', 10)
+// Bumped to 20 during testing — restore to 1 (free) / 5 (pro) before shipping.
+const FREE_REORG_DAILY      = parseInt(process.env.FREE_REORG_DAILY || '20', 10)
+const PRO_REORG_DAILY       = parseInt(process.env.PRO_REORG_DAILY  || '20', 10)
+const REORG_LLM_BUDGET      = parseInt(process.env.REORG_LLM_BUDGET || '50', 10)
+const REORG_SESSION_TTL_MIN = parseInt(process.env.REORG_SESSION_TTL_MIN || '30', 10)
+const OPENAI_API_KEY        = process.env.OPENAI_API_KEY
+const OPENAI_BASE_URL       = (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '')
+const DB_PATH               = process.env.DB_PATH || './shelfbot-proxy.db'
 
 if (!JWT_SECRET || JWT_SECRET.length < 16) {
   console.error('[proxy] JWT_SECRET missing or too short. Refusing to start.')
@@ -48,6 +54,12 @@ function planLimit(plan) {
   return FREE_DAILY
 }
 
+/** Returns the per-day reorg-start quota for a given plan. */
+function reorgPlanLimit(plan) {
+  if (plan === 'pro') return PRO_REORG_DAILY
+  return FREE_REORG_DAILY
+}
+
 const app = express()
 app.use(cors())
 app.use(express.json({ limit: '8mb' }))
@@ -58,6 +70,12 @@ app.get('/health', (req, res) => {
     ok:       true,
     service:  'shelfbot-proxy',
     plans:    { free: FREE_DAILY, pro: PRO_DAILY },
+    reorg:    {
+      free:       FREE_REORG_DAILY,
+      pro:        PRO_REORG_DAILY,
+      llmBudget:  REORG_LLM_BUDGET,
+      sessionTtlMin: REORG_SESSION_TTL_MIN,
+    },
   })
 })
 
@@ -203,11 +221,132 @@ app.post('/proxy/chat/completions', auth.requireAuth, async (req, res) => {
   }
 })
 
+// ─── Reorg sessions ───────────────────────────────────────────────────────
+//
+// A reorg is a multi-call interaction: the backend calls /reorg/llm many
+// times for naming clusters and judging loners. We gate it on two axes:
+//
+//   1. Per-day starts  — free 1/day, pro 5/day. Prevents the user from
+//      kicking off unlimited reorgs even if the per-session budget held.
+//   2. Per-session LLM-call budget (default 50) — prevents a single reorg
+//      from runaway-burning credits if the backend or LLM loops.
+//
+// /reorg/start creates a session, decrements the day cap. /reorg/llm draws
+// from the session's budget, refunding on upstream failure. The session ID
+// is opaque to the backend and bound to the device that opened it.
+
+app.post('/reorg/start', auth.requireAuth, (req, res) => {
+  const day   = todayKey()
+  const limit = reorgPlanLimit(req.device.plan)
+  const used  = db.getReorgStartsToday(req.device.id, day)
+
+  if (used >= limit) {
+    return res.status(429).json({
+      error:       'Daily reorganization limit reached for this device.',
+      detail:      `You've used ${used} of ${limit} reorganizations today. The limit resets at midnight UTC.`,
+      plan:        req.device.plan,
+      used,
+      limit,
+      remaining:   0,
+      upgradeHint: req.device.plan === 'free'
+        ? `Upgrade to Pro for ${PRO_REORG_DAILY} reorganizations/day.`
+        : null,
+    })
+  }
+
+  const after = db.incrementReorgStartsToday(req.device.id, day)
+
+  const sessionId = randomUUID()
+  const expiresAt = new Date(Date.now() + REORG_SESSION_TTL_MIN * 60 * 1000).toISOString()
+  try {
+    db.createReorgSession(sessionId, req.device.id, REORG_LLM_BUDGET, expiresAt)
+  } catch (e) {
+    // Roll back the day-cap decrement so the user isn't charged for our error.
+    db.decrementReorgStartsToday(req.device.id, day)
+    return res.status(500).json({ error: 'Failed to create reorg session: ' + e.message })
+  }
+
+  res.json({
+    sessionId,
+    llmBudget:    REORG_LLM_BUDGET,
+    expiresAt,
+    plan:         req.device.plan,
+    usage:        { used: after, limit, remaining: Math.max(0, limit - after) },
+  })
+})
+
+app.post('/reorg/llm', auth.requireAuth, async (req, res) => {
+  const sessionId = (req.body?.sessionId || '').trim()
+  if (!sessionId) {
+    return res.status(400).json({ error: 'Missing sessionId in request body.' })
+  }
+
+  const now = new Date().toISOString()
+  const session = db.getActiveReorgSession(sessionId, now)
+  if (!session) {
+    return res.status(404).json({
+      error:  'Reorg session not found or expired.',
+      detail: 'Start a new reorganization to get a fresh session.',
+    })
+  }
+  if (session.device_id !== req.device.id) {
+    // Session belongs to a different device. Treat as not-found to avoid
+    // leaking the existence of other devices' sessions.
+    return res.status(404).json({
+      error:  'Reorg session not found or expired.',
+      detail: 'Start a new reorganization to get a fresh session.',
+    })
+  }
+
+  const remaining = db.decrementReorgSessionBudget(sessionId, now)
+  if (remaining < 0) {
+    return res.status(429).json({
+      error:  'This reorganization scope is too large to finish — LLM budget exhausted.',
+      detail: `I'm only allowed ${REORG_LLM_BUDGET} small decisions per reorganization to keep costs and quality in check. Try running on a smaller subfolder instead.`,
+      budget: { remaining: 0, initial: session.budget_initial },
+    })
+  }
+
+  // Extract OpenAI args from the request body. The backend sends them
+  // pre-formatted; we add nothing except the API key on the outgoing call.
+  const upstreamBody = { ...req.body }
+  delete upstreamBody.sessionId   // session id is for the proxy only
+
+  try {
+    const upstream = await fetch(OPENAI_BASE_URL + '/chat/completions', {
+      method:  'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': 'Bearer ' + OPENAI_API_KEY,
+      },
+      body: JSON.stringify(upstreamBody),
+    })
+
+    res.status(upstream.status)
+       .set('X-Reorg-Budget-Remaining', String(remaining))
+       .set('X-Reorg-Budget-Initial',   String(session.budget_initial))
+
+    if (!upstream.ok) {
+      // Upstream rejected the call (rate-limited, bad request, etc.). Refund
+      // the budget — the model didn't actually run for us.
+      db.refundReorgSessionBudget(sessionId)
+    }
+
+    const body = await upstream.text()
+    res.type(upstream.headers.get('content-type') || 'application/json').send(body)
+  } catch (e) {
+    // Network / connection failure. Refund.
+    db.refundReorgSessionBudget(sessionId)
+    res.status(502).json({ error: 'Upstream LLM call failed: ' + e.message })
+  }
+})
+
 // ─── Start ────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`[proxy] listening on http://localhost:${PORT}`)
   console.log(`[proxy] plans:  free=${FREE_DAILY}/day  pro=${PRO_DAILY}/day`)
+  console.log(`[proxy] reorg:  free=${FREE_REORG_DAILY}/day  pro=${PRO_REORG_DAILY}/day  budget=${REORG_LLM_BUDGET}/session`)
   console.log(`[proxy] db:     ${DB_PATH}`)
 })
 
-export { app, db, planLimit } // exported for tests
+export { app, db, planLimit, reorgPlanLimit } // exported for tests

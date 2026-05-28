@@ -10,7 +10,20 @@ import com.localfilebrain.ingestion.TextExtractor;
 import com.localfilebrain.model.FileRecord;
 import com.localfilebrain.model.IngestionResult;
 import com.localfilebrain.query.QueryEngine;
+import com.localfilebrain.reorg.DirectoryAnalyzer;
+import com.localfilebrain.reorg.DirectoryReorgPlan;
+import com.localfilebrain.reorg.FileVectorService;
+import com.localfilebrain.reorg.MoveExecutor;
+import com.localfilebrain.reorg.ProxyReorgLlmClient;
+import com.localfilebrain.reorg.ReorgExecutionResult;
+import com.localfilebrain.reorg.ReorgPlanBuilder;
+import com.localfilebrain.reorg.ReorgProposal;
+import com.localfilebrain.reorg.ReorgToolLoop;
+import com.localfilebrain.reorg.ReorgToolLoopResult;
+import com.localfilebrain.reorg.ScopeError;
+import com.localfilebrain.reorg.UndoExecutor;
 import com.localfilebrain.storage.VectorStore;
+import com.localfilebrain.util.PathNormalizer;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import org.slf4j.Logger;
@@ -42,6 +55,11 @@ import java.util.concurrent.atomic.*;
  *   GET  /api/files             – list indexed files (sorted by size desc)
  *   DELETE /api/files           – remove an indexed file (frees its token budget)
  *                                  Body: {"path": "/absolute/path/to/file"}
+ *   POST /api/reorg/execute     – run a vetted list of moves; returns batchId for undo
+ *                                  Body: {"targetDir": "...", "moves": [{from, to, destinationIsNew, ...}]}
+ *   POST /api/reorg/undo        – reverse a batch
+ *                                  Body: {"batchId": "..."}
+ *   GET  /api/reorg/history     – recent batches (?limit=N)
  */
 public final class ApiServer {
 
@@ -128,6 +146,10 @@ public final class ApiServer {
         server.createContext("/api/config",       this::handleConfig);
         server.createContext("/api/files",        this::handleFiles);
         server.createContext("/api/auth",         this::handleAuth);
+        server.createContext("/api/reorg/preview", this::handleReorgPreview);
+        server.createContext("/api/reorg/execute", this::handleReorgExecute);
+        server.createContext("/api/reorg/undo",    this::handleReorgUndo);
+        server.createContext("/api/reorg/history", this::handleReorgHistory);
     }
 
     /**
@@ -506,12 +528,17 @@ public final class ApiServer {
 
         try {
             Map<?, ?> req  = readJson(ex);
-            String    path = (String) req.get("path");
+            String    rawPath = (String) req.get("path");
 
-            if (path == null || path.isBlank()) {
+            if (rawPath == null || rawPath.isBlank()) {
                 sendError(ex, 400, "path is required");
                 return;
             }
+
+            // Canonicalize so the row keyed by the on-disk-real path is the
+            // one we delete — the UI may send any case variant macOS happens
+            // to display.
+            String path = PathNormalizer.canonical(rawPath);
 
             // Drop the file's chunks from the vector store first; metadata
             // row last so that a failure midway leaves the metadata consistent
@@ -615,6 +642,417 @@ public final class ApiServer {
     // ── HTTP utilities ────────────────────────────────────────────────────────
 
     /** Handles OPTIONS preflight and adds CORS headers to every response. */
+    // ─────────────────────────────────────────────────────────────────────────
+    // Reorg execute / undo
+    // ─────────────────────────────────────────────────────────────────────────
+    //
+    // The preview / proposal endpoint (which runs analyzer + LLM tool loop +
+    // plan builder) is added alongside the UI in Step 8. These endpoints
+    // are the action surface: the UI sends a vetted-by-user list of moves
+    // here to execute, and can reverse them later via /undo.
+    //
+    // Both endpoints are auth-token-free at the API level — the UI is the
+    // only caller (this server only binds to localhost) and the dangerous
+    // LLM-cost path goes through the proxy separately. The filesystem
+    // moves themselves are gated by the safety belts inside MoveExecutor.
+
+    /**
+     * POST /api/reorg/preview  body: { targetDir }
+     *
+     * End-to-end dry-run: runs the directory analyzer (Steps 1-3), then the
+     * LLM tool loop (Steps 4-5) via the proxy, then the plan builder (Step 6),
+     * and returns the user-approvable {@link ReorgProposal} as JSON. If the
+     * directory is too varied to handle in one pass, the analyzer's scope
+     * error is surfaced INSTEAD of the proposal so the UI can render the
+     * "try these subdirs instead" suggestions without ever spending an LLM
+     * call.
+     */
+    private void handleReorgPreview(HttpExchange ex) throws IOException {
+        if (preflight(ex)) return;
+        if (!isMethod(ex, "POST")) { methodNotAllowed(ex); return; }
+
+        try {
+            Map<?, ?> body = readJson(ex);
+            String targetDirStr = (String) body.get("targetDir");
+            if (targetDirStr == null || targetDirStr.isBlank()) {
+                sendError(ex, 400, "targetDir is required");
+                return;
+            }
+            Path targetDir = Paths.get(targetDirStr);
+            if (!Files.isDirectory(targetDir)) {
+                sendError(ex, 400, "targetDir is not a directory: " + targetDir);
+                return;
+            }
+
+            // Refuse to reorganize a folder that contains ShelfBot's own
+            // working data — moving Lucene segment files or the metadata
+            // DB around would corrupt the index. Compare on normalized
+            // absolute paths so the user can't sneak past with "./" tricks.
+            Path absTarget = targetDir.toAbsolutePath().normalize();
+            Path indexPath = config.getVectorIndexPath().toAbsolutePath().normalize();
+            Path dbPath    = config.getMetadataDbPath().toAbsolutePath().normalize();
+            if (indexPath.startsWith(absTarget) || dbPath.startsWith(absTarget)) {
+                sendError(ex, 400,
+                        "That folder contains ShelfBot's own data files. "
+                      + "Pick a different folder to reorganize.");
+                return;
+            }
+
+            // Stage 0: just-in-time indexing of the target folder's loose files.
+            //
+            // ShelfBot's library indexer only covers configured root paths,
+            // so picking a folder for reorg that isn't in the library would
+            // leave every file as a filename-only embedding — BGE-small on
+            // bare filenames is too noisy to ground the clustering or the
+            // LLM's content-aware judgments. Index now so the analyzer has
+            // real content vectors to work with. indexOne is idempotent
+            // (timestamp + hash check) so files already in the library are
+            // a no-op; the cost is paid only for new files.
+            jitIndexLooseFiles(targetDir);
+
+            // Stage 1-3: local analysis (no LLM cost).
+            FileVectorService  fvs      = new FileVectorService(vectorStore, metadataStore, embeddingClient);
+            DirectoryAnalyzer  analyzer = new DirectoryAnalyzer(fvs);
+            DirectoryReorgPlan plan     = analyzer.analyze(targetDir);
+
+            // Scope guard short-circuit: don't spend any LLM call if we
+            // already know the directory is too varied.
+            if (plan.scopeError().isPresent()) {
+                sendJson(ex, 200, map(
+                        "kind",       "scopeError",
+                        "scopeError", serializeScopeError(plan.scopeError().get()),
+                        "summary",    summarizePlan(plan)));
+                return;
+            }
+
+            // No-op path: nothing to do means no LLM call needed.
+            if (plan.newClusters().isEmpty() && plan.loners().isEmpty()
+                    && plan.assignedToExisting().isEmpty()) {
+                sendJson(ex, 200, map(
+                        "kind",     "proposal",
+                        "proposal", serializeProposal(new ReorgProposal(
+                                plan.targetDir(),
+                                List.of(), List.of(), List.of(),
+                                0, 0, java.util.Optional.empty())),
+                        "summary",  summarizePlan(plan)));
+                return;
+            }
+
+            // Stage 4-5: LLM tool loop via the auth proxy.
+            if (!tokenStore.isAuthenticated()) {
+                sendError(ex, 401, "Please sign in to ShelfBot before running a reorganization.");
+                return;
+            }
+            ProxyReorgLlmClient llmClient = new ProxyReorgLlmClient(config, tokenStore);
+            ReorgToolLoop       loop      = new ReorgToolLoop(llmClient);
+            ReorgToolLoopResult llmResult = loop.run(plan);
+
+            // Stage 6: assemble final proposal.
+            ReorgPlanBuilder builder  = new ReorgPlanBuilder();
+            ReorgProposal    proposal = builder.build(plan, llmResult);
+
+            sendJson(ex, 200, map(
+                    "kind",     "proposal",
+                    "proposal", serializeProposal(proposal),
+                    "summary",  summarizePlan(plan)));
+
+        } catch (com.localfilebrain.reorg.ReorgLlmClient.LlmHttpException e) {
+            // Proxy unreachable or returned a non-friendly error. Surface the
+            // proxy's user-facing message verbatim if it had one; otherwise
+            // a generic but actionable hint.
+            log.warn("/api/reorg/preview proxy failure: {}", e.getMessage());
+            String msg = e.getMessage();
+            if (msg == null || msg.isBlank() || msg.contains("Connection refused")
+                    || msg.contains("ConnectException")) {
+                msg = "Can't reach the ShelfBot service right now. Check your internet connection and try again in a moment.";
+            }
+            sendError(ex, 502, msg);
+        } catch (Exception e) {
+            log.warn("/api/reorg/preview failed", e);
+            sendError(ex, 500, e.getMessage());
+        }
+    }
+
+    /** POST /api/reorg/execute  body: { targetDir, moves: [{from, to, destinationIsNew, source, reason, confidence}] } */
+    private void handleReorgExecute(HttpExchange ex) throws IOException {
+        if (preflight(ex)) return;
+        if (!isMethod(ex, "POST")) { methodNotAllowed(ex); return; }
+
+        try {
+            Map<?, ?> body = readJson(ex);
+            String targetDirStr = (String) body.get("targetDir");
+            if (targetDirStr == null || targetDirStr.isBlank()) {
+                sendError(ex, 400, "targetDir is required");
+                return;
+            }
+            Path targetDir = Paths.get(targetDirStr);
+            if (!Files.isDirectory(targetDir)) {
+                sendError(ex, 400, "targetDir is not a directory: " + targetDir);
+                return;
+            }
+
+            // Same guard as preview — refuse if targetDir hosts ShelfBot's
+            // own data. A buggy client could still post a payload here
+            // without first calling preview.
+            Path absTargetExec = targetDir.toAbsolutePath().normalize();
+            Path indexPathExec = config.getVectorIndexPath().toAbsolutePath().normalize();
+            Path dbPathExec    = config.getMetadataDbPath().toAbsolutePath().normalize();
+            if (indexPathExec.startsWith(absTargetExec) || dbPathExec.startsWith(absTargetExec)) {
+                sendError(ex, 400,
+                        "That folder contains ShelfBot's own data files. "
+                      + "Pick a different folder to reorganize.");
+                return;
+            }
+
+            Object movesRaw = body.get("moves");
+            if (!(movesRaw instanceof List<?> movesList)) {
+                sendError(ex, 400, "moves must be an array");
+                return;
+            }
+            List<ReorgProposal.ProposedMove> moves = new ArrayList<>(movesList.size());
+            for (Object m : movesList) {
+                if (!(m instanceof Map<?, ?> mm)) {
+                    sendError(ex, 400, "each move must be a JSON object");
+                    return;
+                }
+                String from = (String) mm.get("from");
+                String to   = (String) mm.get("to");
+                if (from == null || to == null) {
+                    sendError(ex, 400, "each move requires from and to");
+                    return;
+                }
+                Boolean newDest = (Boolean) mm.get("destinationIsNew");
+                Object  sourceRaw = mm.get("source");
+                Object  reasonRaw = mm.get("reason");
+                Object  confRaw   = mm.get("confidence");
+                String  source = sourceRaw instanceof String s ? s : "NEW_CLUSTER";
+                String  reason = reasonRaw instanceof String r ? r : "";
+                float   confidence = confRaw instanceof Number n ? n.floatValue() : 0f;
+                moves.add(new ReorgProposal.ProposedMove(
+                        Paths.get(from), Paths.get(to),
+                        Boolean.TRUE.equals(newDest),
+                        parseSource(source),
+                        reason,
+                        confidence));
+            }
+
+            MoveExecutor executor = new MoveExecutor(metadataStore);
+            ReorgExecutionResult result = executor.execute(targetDir, moves);
+            sendJson(ex, 200, serializeExecution(result));
+        } catch (Exception e) {
+            log.warn("/api/reorg/execute failed", e);
+            sendError(ex, 500, e.getMessage());
+        }
+    }
+
+    /** POST /api/reorg/undo  body: { batchId } */
+    private void handleReorgUndo(HttpExchange ex) throws IOException {
+        if (preflight(ex)) return;
+        if (!isMethod(ex, "POST")) { methodNotAllowed(ex); return; }
+
+        try {
+            Map<?, ?> body = readJson(ex);
+            String batchId = (String) body.get("batchId");
+            if (batchId == null || batchId.isBlank()) {
+                sendError(ex, 400, "batchId is required");
+                return;
+            }
+            UndoExecutor undoer = new UndoExecutor(metadataStore);
+            UndoExecutor.UndoResult r = undoer.undo(batchId);
+            sendJson(ex, 200, serializeUndo(r));
+        } catch (Exception e) {
+            log.warn("/api/reorg/undo failed", e);
+            sendError(ex, 500, e.getMessage());
+        }
+    }
+
+    /** GET /api/reorg/history?limit=N — recent batches for the "Undo last reorg" UI. */
+    private void handleReorgHistory(HttpExchange ex) throws IOException {
+        if (preflight(ex)) return;
+        if (!isMethod(ex, "GET")) { methodNotAllowed(ex); return; }
+
+        int limit = 20;
+        String q = ex.getRequestURI().getQuery();
+        if (q != null) {
+            for (String kv : q.split("&")) {
+                int eq = kv.indexOf('=');
+                if (eq > 0 && "limit".equals(kv.substring(0, eq))) {
+                    try { limit = Math.max(1, Math.min(100, Integer.parseInt(kv.substring(eq + 1)))); }
+                    catch (NumberFormatException ignored) {}
+                }
+            }
+        }
+        var batches = metadataStore.listRecentUndoBatches(limit);
+        List<Map<String, Object>> out = new ArrayList<>(batches.size());
+        for (var b : batches) {
+            out.add(this.<String, Object>map(
+                    "batchId",    b.batchId(),
+                    "moveCount",  b.moveCount(),
+                    "executedAt", b.executedAt()));
+        }
+        sendJson(ex, 200, map("batches", out));
+    }
+
+    /**
+     * JSON shape for a {@link ReorgProposal} — mirrors the record fields with
+     * paths as strings (UI doesn't speak java.nio.file.Path).
+     */
+    private Map<String, Object> serializeProposal(ReorgProposal p) {
+        List<Map<String, Object>> moves = new ArrayList<>(p.moves().size());
+        for (var m : p.moves()) {
+            moves.add(this.<String, Object>map(
+                    "from",             m.from().toString(),
+                    "to",               m.to().toString(),
+                    "destinationFile",  m.destinationFile().toString(),
+                    "destinationIsNew", m.destinationIsNew(),
+                    "source",           m.source().name(),
+                    "reason",           m.reason(),
+                    "confidence",       m.confidence()));
+        }
+        List<Map<String, Object>> dropped = new ArrayList<>(p.dropped().size());
+        for (var d : p.dropped()) {
+            dropped.add(this.<String, Object>map(
+                    "file",       d.file().toString(),
+                    "reason",     d.reason(),
+                    "confidence", d.confidence()));
+        }
+        List<String> leftAlone = new ArrayList<>(p.leftAlone().size());
+        for (var pth : p.leftAlone()) leftAlone.add(pth.toString());
+
+        return this.<String, Object>map(
+                "targetDir",          p.targetDir().toString(),
+                "moves",              moves,
+                "dropped",            dropped,
+                "leftAlone",          leftAlone,
+                "llmCallsAttempted",  p.llmCallsAttempted(),
+                "llmCallsSuccessful", p.llmCallsSuccessful(),
+                "stoppedReason",      p.stoppedReason().orElse(null),
+                "hasAnyChanges",      p.hasAnyChanges());
+    }
+
+    private Map<String, Object> serializeScopeError(ScopeError e) {
+        List<Map<String, Object>> suggestions = new ArrayList<>(e.suggestions().size());
+        for (var s : e.suggestions()) {
+            Map<String, Object> entry = this.<String, Object>map(
+                    "label",     s.label(),
+                    "scopePath", s.scopePath() == null ? null : s.scopePath().toString());
+            if (s.familyFilter() != null) {
+                entry.put("familyFilter", this.<String, Object>map(
+                        "family",    s.familyFilter().family().name(),
+                        "fileCount", s.familyFilter().fileCount()));
+            }
+            suggestions.add(entry);
+        }
+        return this.<String, Object>map(
+                "title",             e.title(),
+                "detail",            e.detail(),
+                "suggestions",       suggestions,
+                "decisionsRequired", e.decisionsRequired(),
+                "decisionBudget",    e.decisionBudget());
+    }
+
+    /** Compact stats the UI shows above the move list ("3 already in place / 4 to organize"). */
+    private Map<String, Object> summarizePlan(DirectoryReorgPlan plan) {
+        return this.<String, Object>map(
+                "looseFiles",          plan.totalLooseFiles(),
+                "decisions",           plan.totalDecisions(),
+                "assignedToExisting",  plan.assignedToExisting().size(),
+                "newClusters",         plan.newClusters().size(),
+                "loners",              plan.loners().size(),
+                "existingSubdirCount", plan.existingSubdirs().size());
+    }
+
+    /**
+     * Indexes any top-level loose files of {@code targetDir} that aren't
+     * already up-to-date in the metadata store. Uses the shared
+     * VectorStore + EmbeddingClient + IndexMetadataStore so the rest of
+     * the app (live watcher, query path) sees the fresh chunks
+     * immediately and the next reorg call short-circuits.
+     *
+     * <p>Failures (Tika can't read .pages, file too large, budget tripped)
+     * are logged and swallowed — we never want indexing problems to
+     * prevent the reorg preview from running. Files we couldn't index
+     * fall through to the existing filename-only path inside the analyzer.
+     */
+    private void jitIndexLooseFiles(Path targetDir) {
+        java.util.Set<String> supportedExts = new java.util.HashSet<>();
+        for (String e : config.getSupportedExtensions()) supportedExts.add(e.toLowerCase());
+
+        List<Path> candidates = new ArrayList<>();
+        try (var stream = Files.newDirectoryStream(targetDir)) {
+            for (Path p : stream) {
+                if (!Files.isRegularFile(p)) continue;
+                String name = p.getFileName().toString();
+                if (name.startsWith(".")) continue;
+                int dot = name.lastIndexOf('.');
+                if (dot <= 0 || dot == name.length() - 1) continue;
+                String ext = name.substring(dot + 1).toLowerCase();
+                if (!supportedExts.contains(ext)) continue;
+                candidates.add(p);
+            }
+        } catch (IOException e) {
+            log.warn("JIT-index: failed to scan {}: {}", targetDir, e.getMessage());
+            return;
+        }
+
+        if (candidates.isEmpty()) return;
+
+        IngestionPipeline pipeline = new IngestionPipeline(
+                config, metadataStore, vectorStore, embeddingClient);
+        int newlyIndexed = 0;
+        for (Path file : candidates) {
+            try {
+                int chunks = pipeline.indexOne(file);
+                if (chunks > 0) newlyIndexed++;
+            } catch (Exception e) {
+                log.debug("JIT-index: '{}' failed: {}", file.getFileName(), e.getMessage());
+            }
+        }
+        if (newlyIndexed > 0) {
+            log.info("JIT-indexed {} new file(s) under {}", newlyIndexed, targetDir);
+        }
+    }
+
+    private static ReorgProposal.ProposedMove.Source parseSource(String s) {
+        try { return ReorgProposal.ProposedMove.Source.valueOf(s); }
+        catch (IllegalArgumentException e) { return ReorgProposal.ProposedMove.Source.NEW_CLUSTER; }
+    }
+
+    private Map<String, Object> serializeExecution(ReorgExecutionResult r) {
+        List<Map<String, Object>> outcomes = new ArrayList<>(r.outcomes().size());
+        for (var o : r.outcomes()) {
+            outcomes.add(this.<String, Object>map(
+                    "from",       o.from().toString(),
+                    "to",         o.to().toString(),
+                    "resolvedTo", o.resolvedTo() == null ? null : o.resolvedTo().toString(),
+                    "status",     o.status().name(),
+                    "reason",     o.reason()));
+        }
+        return this.<String, Object>map(
+                "batchId",      r.batchId(),
+                "outcomes",     outcomes,
+                "successCount", r.successCount(),
+                "skippedCount", r.skippedCount(),
+                "failedCount",  r.failedCount());
+    }
+
+    private Map<String, Object> serializeUndo(UndoExecutor.UndoResult r) {
+        List<Map<String, Object>> outcomes = new ArrayList<>(r.outcomes().size());
+        for (var o : r.outcomes()) {
+            outcomes.add(this.<String, Object>map(
+                    "fromPath", o.fromPath(),
+                    "toPath",   o.toPath(),
+                    "status",   o.status().name(),
+                    "reason",   o.reason()));
+        }
+        return this.<String, Object>map(
+                "batchId",      r.batchId(),
+                "outcomes",     outcomes,
+                "successCount", r.successCount(),
+                "skippedCount", r.skippedCount(),
+                "failedCount",  r.failedCount());
+    }
+
     private boolean preflight(HttpExchange ex) throws IOException {
         ex.getResponseHeaders().set("Access-Control-Allow-Origin",  "*");
         ex.getResponseHeaders().set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");

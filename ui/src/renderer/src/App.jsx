@@ -9,6 +9,7 @@ import WelcomeModal   from './components/WelcomeModal'
 import BackgroundFX   from './components/BackgroundFX'
 import Chat           from './views/Chat'
 import Library        from './views/Library'
+import Organize       from './views/Organize'
 import Settings       from './views/Settings'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -78,8 +79,9 @@ function Shell() {
             onToggle={toggleCollapsed}
           />
           <div className="content">
-            <Chat    active={view === 'chat'} />
-            <Library active={view === 'lib'}  onGoSettings={() => setView('set')} />
+            <Chat     active={view === 'chat'} />
+            <Library  active={view === 'lib'}  onGoSettings={() => setView('set')} />
+            <Organize active={view === 'org'} />
             <Settings active={view === 'set'} />
           </div>
         </div>

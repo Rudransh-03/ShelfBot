@@ -2,6 +2,7 @@ package com.localfilebrain.ingestion;
 
 import com.localfilebrain.config.AppConfig;
 import com.localfilebrain.util.FileHashUtil;
+import com.localfilebrain.util.PathNormalizer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -145,7 +146,9 @@ public final class FileScanner {
             return;
         }
 
-        String absolutePath = file.toAbsolutePath().toString();
+        // Canonical path so case-only differences on macOS APFS don't create
+        // two metadata rows for the same physical file.
+        String absolutePath = PathNormalizer.canonical(file);
         long lastModifiedMs = attrs.lastModifiedTime().toMillis();
 
         // Step 1: timestamp check — zero I/O, instant SQLite lookup

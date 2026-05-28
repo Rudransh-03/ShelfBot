@@ -9,6 +9,7 @@ import com.localfilebrain.model.FileRecord;
 import com.localfilebrain.model.IngestionResult;
 import com.localfilebrain.storage.VectorStore;
 import com.localfilebrain.util.FileHashUtil;
+import com.localfilebrain.util.PathNormalizer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -256,7 +257,7 @@ public final class IngestionPipeline {
     public int indexOne(Path file) {
         try {
             BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class);
-            String absolutePath  = file.toAbsolutePath().toString();
+            String absolutePath  = PathNormalizer.canonical(file);
             long   lastModified  = attrs.lastModifiedTime().toMillis();
 
             if (metadataStore.isUpToDateByTimestamp(absolutePath, lastModified)) {
@@ -297,7 +298,7 @@ public final class IngestionPipeline {
      * that case.
      */
     public void removeFile(Path file) {
-        String absolutePath = file.toAbsolutePath().toString();
+        String absolutePath = PathNormalizer.canonical(file);
         try {
             vectorStore.deleteBySourceFile(absolutePath);
             metadataStore.delete(absolutePath);
@@ -311,7 +312,7 @@ public final class IngestionPipeline {
         TextExtractor.ExtractionResult extraction = textExtractor.extract(file);
         if (extraction.isEmpty()) return null;
 
-        String absolutePath = file.toAbsolutePath().toString();
+        String absolutePath = PathNormalizer.canonical(file);
 
         // Cheap budget check from the raw extracted text length — done BEFORE
         // any work (chunking, OpenAI API call) so we never burn money on a
@@ -396,7 +397,7 @@ public final class IngestionPipeline {
             BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class);
             String hash = FileHashUtil.sha256(file);
             metadataStore.upsert(FileRecord.builder()
-                    .absolutePath(file.toAbsolutePath().toString())
+                    .absolutePath(PathNormalizer.canonical(file))
                     .fileName(file.getFileName().toString())
                     .fileExtension(FileScanner.getExtension(file.getFileName().toString()))
                     .fileSizeBytes(attrs.size())
@@ -413,7 +414,7 @@ public final class IngestionPipeline {
     }
 
     private void recordFailed(Path file, String errorMessage) {
-        String absolutePath = file.toAbsolutePath().toString();
+        String absolutePath = PathNormalizer.canonical(file);
         try {
             BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class);
             String hash = FileHashUtil.sha256(file);

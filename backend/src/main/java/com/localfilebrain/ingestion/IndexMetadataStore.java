@@ -4,6 +4,8 @@ import com.localfilebrain.model.FileRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.file.Path;
 import java.sql.*;
 import java.time.Instant;
@@ -41,8 +43,17 @@ public final class IndexMetadataStore implements AutoCloseable {
         String jdbcUrl = "jdbc:sqlite:" + dbPath.toAbsolutePath();
         try {
             this.connection = DriverManager.getConnection(jdbcUrl);
+            // WAL mode gives us: (1) durable single-statement writes — important
+            // for the reorg undo log, which must be on disk BEFORE the move,
+            // and (2) concurrent reads alongside writes, so a long-running
+            // indexing job doesn't block the reorg history endpoint. The
+            // PRAGMA is per-database-file and persists.
+            try (Statement pragma = connection.createStatement()) {
+                pragma.execute("PRAGMA journal_mode=WAL");
+                pragma.execute("PRAGMA synchronous=NORMAL");
+            }
             initSchema();
-            log.info("Metadata store opened: {}", dbPath.toAbsolutePath());
+            log.info("Metadata store opened (WAL): {}", dbPath.toAbsolutePath());
         } catch (SQLException e) {
             throw new MetadataStoreException("Failed to open metadata DB at: " + dbPath, e);
         }
@@ -73,6 +84,44 @@ public final class IndexMetadataStore implements AutoCloseable {
             // Index for fast lookup by status (used during re-index to find FAILEDs)
             stmt.executeUpdate("""
                 CREATE INDEX IF NOT EXISTS idx_status ON file_index(status)
+                """);
+
+            // Cache of mean-pooled file-level embeddings, derived on demand
+            // from the per-chunk vectors in Lucene. Stored as a raw byte BLOB
+            // (4 bytes per dim, little-endian) — SQLite handles arbitrary
+            // binary blobs natively. Invalidated on file upsert / delete and
+            // on embedding-model change (via model_id mismatch on read).
+            stmt.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS file_vectors (
+                    absolute_path TEXT    PRIMARY KEY,
+                    dim           INTEGER NOT NULL,
+                    model_id      TEXT    NOT NULL,
+                    chunk_count   INTEGER NOT NULL,
+                    vec           BLOB    NOT NULL,
+                    computed_at   TEXT    NOT NULL
+                )
+                """);
+
+            // Undo log for executed reorg batches. One row per file move.
+            // Written BEFORE the move actually happens so a crash mid-move
+            // still leaves a recoverable record. The created_destination_dir
+            // column lets undo know whether to delete the (possibly empty)
+            // destination folder we created — null when we moved into a
+            // folder that already existed.
+            stmt.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS reorg_undo_log (
+                    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id                TEXT    NOT NULL,
+                    sequence                INTEGER NOT NULL,
+                    executed_at             TEXT    NOT NULL,
+                    from_path               TEXT    NOT NULL,
+                    to_path                 TEXT    NOT NULL,
+                    created_destination_dir TEXT
+                )
+                """);
+            stmt.executeUpdate("""
+                CREATE INDEX IF NOT EXISTS idx_undo_batch
+                    ON reorg_undo_log(batch_id)
                 """);
 
             // Lightweight migration: pre-existing DBs from before token tracking
@@ -313,6 +362,10 @@ public final class IndexMetadataStore implements AutoCloseable {
         } catch (SQLException e) {
             throw new MetadataStoreException("Failed to upsert record for: " + record.getAbsolutePath(), e);
         }
+        // Any re-upsert means the file's content has been re-processed and its
+        // cached file-level vector (if any) is now stale. Cheaper to wipe than
+        // to detect staleness on read.
+        deleteFileVector(record.getAbsolutePath());
     }
 
     /**
@@ -346,6 +399,9 @@ public final class IndexMetadataStore implements AutoCloseable {
     public synchronized int clearAllIndexedRecords() {
         try (Statement stmt = connection.createStatement()) {
             int n = stmt.executeUpdate("DELETE FROM file_index WHERE status = 'INDEXED'");
+            // File-level vector cache is downstream of indexed chunks — if the
+            // indexed set is wiped, the cache is meaningless.
+            stmt.executeUpdate("DELETE FROM file_vectors");
             log.warn("Cleared {} INDEXED rows from metadata store (drift recovery)", n);
             return n;
         } catch (SQLException e) {
@@ -364,6 +420,234 @@ public final class IndexMetadataStore implements AutoCloseable {
         } catch (SQLException e) {
             throw new MetadataStoreException("Failed to delete record for: " + absolutePath, e);
         }
+        deleteFileVector(absolutePath);
+    }
+
+    // -------------------------------------------------------------------------
+    // File-level vector cache (for reorg / clustering)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Stores the mean-pooled, L2-normalized file vector for {@code absolutePath}.
+     * Overwrites any existing entry. The {@code modelId} pin lets readers
+     * detect — and discard — vectors computed under a different embedding
+     * model.
+     */
+    public synchronized void putFileVector(String absolutePath,
+                                           int dim,
+                                           String modelId,
+                                           int chunkCount,
+                                           float[] vec) {
+        if (vec.length != dim) {
+            throw new IllegalArgumentException("vec.length=" + vec.length + " != dim=" + dim);
+        }
+        byte[] blob = floatsToBytes(vec);
+        String sql = """
+            INSERT INTO file_vectors (absolute_path, dim, model_id, chunk_count, vec, computed_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(absolute_path) DO UPDATE SET
+              dim         = excluded.dim,
+              model_id    = excluded.model_id,
+              chunk_count = excluded.chunk_count,
+              vec         = excluded.vec,
+              computed_at = excluded.computed_at
+            """;
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, absolutePath);
+            ps.setInt   (2, dim);
+            ps.setString(3, modelId);
+            ps.setInt   (4, chunkCount);
+            ps.setBytes (5, blob);
+            ps.setString(6, Instant.now().toString());
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to put file vector for: " + absolutePath, e);
+        }
+    }
+
+    /**
+     * Returns the cached file vector, or empty if none exists. Callers must
+     * check the {@code modelId} field against the current embedding backend
+     * — a mismatch means the cached vector lives in the wrong embedding
+     * space and should be discarded.
+     */
+    public synchronized Optional<CachedFileVector> getFileVector(String absolutePath) {
+        String sql = "SELECT dim, model_id, chunk_count, vec FROM file_vectors WHERE absolute_path = ?";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, absolutePath);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return Optional.empty();
+                int dim       = rs.getInt("dim");
+                String model  = rs.getString("model_id");
+                int chunkCnt  = rs.getInt("chunk_count");
+                byte[] blob   = rs.getBytes("vec");
+                float[] vec   = bytesToFloats(blob, dim);
+                return Optional.of(new CachedFileVector(absolutePath, dim, model, chunkCnt, vec));
+            }
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to read file vector for: " + absolutePath, e);
+        }
+    }
+
+    /** Removes the cached file vector for one file. No-op if none stored. */
+    public synchronized void deleteFileVector(String absolutePath) {
+        String sql = "DELETE FROM file_vectors WHERE absolute_path = ?";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, absolutePath);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            // Cache invalidation is best-effort — log and continue.
+            log.warn("Failed to delete file vector for '{}': {}", absolutePath, e.getMessage());
+        }
+    }
+
+    /** Cached file-level embedding row. */
+    public record CachedFileVector(String absolutePath,
+                                   int dim,
+                                   String modelId,
+                                   int chunkCount,
+                                   float[] vec) {}
+
+    // -------------------------------------------------------------------------
+    // Reorg undo log
+    // -------------------------------------------------------------------------
+
+    /**
+     * Records one move in the undo log. Must be called BEFORE the actual
+     * filesystem move so a crash between the DB write and the move still
+     * leaves a recoverable trail.
+     *
+     * @param createdDestinationDir absolute path of a directory the executor
+     *        created for this move (so undo knows it can clean up); null if
+     *        the destination directory already existed.
+     */
+    public synchronized void appendUndoEntry(String batchId,
+                                             int sequence,
+                                             String fromPath,
+                                             String toPath,
+                                             String createdDestinationDir) {
+        String sql = """
+            INSERT INTO reorg_undo_log
+              (batch_id, sequence, executed_at, from_path, to_path, created_destination_dir)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """;
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, batchId);
+            ps.setInt   (2, sequence);
+            ps.setString(3, Instant.now().toString());
+            ps.setString(4, fromPath);
+            ps.setString(5, toPath);
+            if (createdDestinationDir != null) ps.setString(6, createdDestinationDir);
+            else                               ps.setNull  (6, Types.VARCHAR);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to append undo entry for batch " + batchId, e);
+        }
+    }
+
+    /**
+     * Returns all rows in a batch, ordered for replay-in-reverse (largest
+     * sequence first). Used by the undo executor to reverse moves in the
+     * opposite order they were applied.
+     */
+    public synchronized List<UndoEntry> getUndoBatchReversed(String batchId) {
+        String sql = """
+            SELECT batch_id, sequence, executed_at, from_path, to_path, created_destination_dir
+            FROM reorg_undo_log
+            WHERE batch_id = ?
+            ORDER BY sequence DESC
+            """;
+        List<UndoEntry> out = new ArrayList<>();
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, batchId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(new UndoEntry(
+                            rs.getString("batch_id"),
+                            rs.getInt("sequence"),
+                            rs.getString("executed_at"),
+                            rs.getString("from_path"),
+                            rs.getString("to_path"),
+                            rs.getString("created_destination_dir")));
+                }
+            }
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to read undo batch " + batchId, e);
+        }
+        return out;
+    }
+
+    /** Removes all rows for a batch — called after a successful undo. */
+    public synchronized void deleteUndoBatch(String batchId) {
+        String sql = "DELETE FROM reorg_undo_log WHERE batch_id = ?";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, batchId);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to delete undo batch " + batchId, e);
+        }
+    }
+
+    /**
+     * Recent batches, newest first. Powers the "Undo last reorganization"
+     * UI affordance. Each summary carries enough info to render a one-line
+     * label without re-reading individual rows.
+     */
+    public synchronized List<UndoBatchSummary> listRecentUndoBatches(int limit) {
+        String sql = """
+            SELECT batch_id,
+                   COUNT(*)           AS move_count,
+                   MAX(executed_at)   AS executed_at
+            FROM reorg_undo_log
+            GROUP BY batch_id
+            ORDER BY executed_at DESC
+            LIMIT ?
+            """;
+        List<UndoBatchSummary> out = new ArrayList<>();
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setInt(1, Math.max(1, limit));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(new UndoBatchSummary(
+                            rs.getString("batch_id"),
+                            rs.getInt("move_count"),
+                            rs.getString("executed_at")));
+                }
+            }
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to list undo batches", e);
+        }
+        return out;
+    }
+
+    /** A single recorded move in the undo log. */
+    public record UndoEntry(String batchId,
+                            int sequence,
+                            String executedAt,
+                            String fromPath,
+                            String toPath,
+                            String createdDestinationDir) {}
+
+    /** Lightweight summary of an undo batch — for the "recent reorgs" UI list. */
+    public record UndoBatchSummary(String batchId, int moveCount, String executedAt) {}
+
+    private static byte[] floatsToBytes(float[] v) {
+        ByteBuffer buf = ByteBuffer.allocate(v.length * Float.BYTES).order(ByteOrder.LITTLE_ENDIAN);
+        for (float f : v) buf.putFloat(f);
+        return buf.array();
+    }
+
+    private static float[] bytesToFloats(byte[] b, int expectedDim) {
+        if (b.length != expectedDim * Float.BYTES) {
+            throw new MetadataStoreException(
+                    "Corrupt file_vectors row: blob length " + b.length +
+                    " ≠ expected " + (expectedDim * Float.BYTES),
+                    null);
+        }
+        ByteBuffer buf = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN);
+        float[] out = new float[expectedDim];
+        for (int i = 0; i < expectedDim; i++) out[i] = buf.getFloat();
+        return out;
     }
 
     // -------------------------------------------------------------------------

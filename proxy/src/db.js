@@ -53,6 +53,35 @@ export function openDb(path) {
       query_count  INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (device_id, date)
     );
+
+    -- Per-day reorg "starts" counter — capped separately from chat queries
+    -- because a reorg is a heavier, multi-call interaction. Same row layout
+    -- as the usage table so the daily-reset semantics are identical (no
+    -- explicit cron — the row just doesn't exist until the next day's
+    -- first start).
+    CREATE TABLE IF NOT EXISTS reorg_usage (
+      device_id    INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+      date         TEXT    NOT NULL,
+      start_count  INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (device_id, date)
+    );
+
+    -- One row per active reorg session. The backend opens a session via
+    -- /reorg/start (which decrements the per-day cap), then uses sessionId
+    -- to draw from a fixed per-session LLM call budget. Sessions are
+    -- short-lived (~30 min) and the row is never updated after expiry —
+    -- expired rows are just ignored by the decrement query.
+    CREATE TABLE IF NOT EXISTS reorg_sessions (
+      id                TEXT    PRIMARY KEY,
+      device_id         INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+      budget_remaining  INTEGER NOT NULL,
+      budget_initial    INTEGER NOT NULL,
+      created_at        TEXT    NOT NULL,
+      expires_at        TEXT    NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_reorg_sessions_device ON reorg_sessions(device_id);
+    CREATE INDEX IF NOT EXISTS idx_reorg_sessions_expiry ON reorg_sessions(expires_at);
   `)
 
   // Drop pre-#11.5 tables if present so leftover dev rows from the old
@@ -124,6 +153,93 @@ export function openDb(path) {
         'UPDATE usage SET query_count = MAX(0, query_count - 1) WHERE device_id = ? AND date = ?'
       ).run(deviceRowId, todayKey)
       return this.getTodayCount(deviceRowId, todayKey)
+    },
+
+    // ── Reorg quota & sessions ──────────────────────────────────────────────
+
+    /** Today's reorg-start count for a device. 0 if no row yet. */
+    getReorgStartsToday(deviceRowId, todayKey) {
+      const row = db.prepare(
+        'SELECT start_count FROM reorg_usage WHERE device_id = ? AND date = ?'
+      ).get(deviceRowId, todayKey)
+      return row?.start_count ?? 0
+    },
+
+    /** Atomically increments today's reorg-start count. Same upsert shape as chat usage. */
+    incrementReorgStartsToday(deviceRowId, todayKey) {
+      db.prepare(`
+        INSERT INTO reorg_usage (device_id, date, start_count) VALUES (?, ?, 1)
+        ON CONFLICT(device_id, date) DO UPDATE SET start_count = start_count + 1
+      `).run(deviceRowId, todayKey)
+      return this.getReorgStartsToday(deviceRowId, todayKey)
+    },
+
+    /**
+     * Refunds a prior start increment — used when /reorg/start successfully
+     * decrements the day cap but then fails to create the session row. Floors at 0.
+     */
+    decrementReorgStartsToday(deviceRowId, todayKey) {
+      db.prepare(
+        'UPDATE reorg_usage SET start_count = MAX(0, start_count - 1) WHERE device_id = ? AND date = ?'
+      ).run(deviceRowId, todayKey)
+      return this.getReorgStartsToday(deviceRowId, todayKey)
+    },
+
+    /**
+     * Creates a new reorg session. The caller is responsible for generating
+     * a unique {@code sessionId} (UUID) and computing the absolute expiry.
+     */
+    createReorgSession(sessionId, deviceRowId, budget, expiresAtIso) {
+      const now = new Date().toISOString()
+      db.prepare(`
+        INSERT INTO reorg_sessions
+          (id, device_id, budget_remaining, budget_initial, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(sessionId, deviceRowId, budget, budget, now, expiresAtIso)
+    },
+
+    /**
+     * Returns the session row, or undefined if it doesn't exist OR is
+     * expired. Expired sessions are not auto-deleted (cheap to keep, and
+     * useful for forensics) — we just don't act on them.
+     */
+    getActiveReorgSession(sessionId, nowIso) {
+      return db.prepare(`
+        SELECT id, device_id, budget_remaining, budget_initial, created_at, expires_at
+        FROM reorg_sessions
+        WHERE id = ? AND expires_at > ?
+      `).get(sessionId, nowIso)
+    },
+
+    /**
+     * Atomically decrements the session's budget IF it's still > 0 AND the
+     * session hasn't expired. Returns the new budget on success, or -1 if
+     * the session was either exhausted or expired. Race-safe: SQLite
+     * serializes writes, and the WHERE clause makes the check + decrement
+     * a single statement.
+     */
+    decrementReorgSessionBudget(sessionId, nowIso) {
+      const r = db.prepare(`
+        UPDATE reorg_sessions
+        SET budget_remaining = budget_remaining - 1
+        WHERE id = ? AND budget_remaining > 0 AND expires_at > ?
+      `).run(sessionId, nowIso)
+      if (r.changes === 0) return -1
+      return db.prepare(
+        'SELECT budget_remaining FROM reorg_sessions WHERE id = ?'
+      ).get(sessionId).budget_remaining
+    },
+
+    /**
+     * Undoes a budget decrement — used when the OpenAI upstream call fails.
+     * Capped at budget_initial so a buggy caller can't inflate a session.
+     */
+    refundReorgSessionBudget(sessionId) {
+      db.prepare(`
+        UPDATE reorg_sessions
+        SET budget_remaining = MIN(budget_initial, budget_remaining + 1)
+        WHERE id = ?
+      `).run(sessionId)
     },
 
     close() { db.close() },

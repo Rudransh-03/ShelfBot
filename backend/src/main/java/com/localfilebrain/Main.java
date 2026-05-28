@@ -10,11 +10,16 @@ import com.localfilebrain.ingestion.IndexMetadataStore;
 import com.localfilebrain.ingestion.IngestionPipeline;
 import com.localfilebrain.query.QueryEngine;
 import com.localfilebrain.storage.VectorStore;
+import com.localfilebrain.util.PathNormalizer;
+import com.localfilebrain.model.FileRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Scanner;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -158,6 +163,12 @@ public final class Main {
         // or storage paths got moved), wipe the stale "INDEXED" rows so the
         // next scan re-processes everything instead of skipping.
         resetMetadataIfDrifted(metadataStore, vectorStore);
+
+        // Collapse rows that point at the same physical file via different
+        // path casings. Older builds didn't canonicalize path keys, so on
+        // case-insensitive macOS APFS the Library could show "Others2/foo"
+        // and "others2/foo" as two separate files.
+        deduplicateCasePaths(metadataStore, vectorStore);
 
         final EmbeddingClient finalEmbedding = embeddingClient;
 
@@ -338,6 +349,54 @@ public final class Main {
             java.nio.file.Files.writeString(markerFile, content);
         } catch (Exception e) {
             log.warn("Could not write embedding marker '{}': {}", markerFile, e.getMessage());
+        }
+    }
+
+    /**
+     * Removes duplicate metadata rows that differ only in path casing on
+     * case-insensitive filesystems. For each set of paths that canonicalize
+     * to the same on-disk path:
+     *   - if one row already uses the canonical path, keep it and drop the rest;
+     *   - if none do, keep the first row, drop the rest — the surviving row's
+     *     chunks remain valid until the next watcher/scan re-keys them.
+     *
+     * Each "drop" removes the row's chunks from Lucene too so the index
+     * doesn't keep stale duplicates.
+     */
+    private static void deduplicateCasePaths(IndexMetadataStore meta, VectorStore vec) {
+        List<FileRecord> all = meta.listIndexedFilesBySizeDesc();
+        if (all.isEmpty()) return;
+
+        Map<String, List<FileRecord>> byCanonical = new LinkedHashMap<>();
+        for (FileRecord r : all) {
+            String canonical = PathNormalizer.canonical(r.getAbsolutePath());
+            byCanonical.computeIfAbsent(canonical, k -> new java.util.ArrayList<>()).add(r);
+        }
+
+        int removed = 0;
+        for (Map.Entry<String, List<FileRecord>> e : byCanonical.entrySet()) {
+            List<FileRecord> group = e.getValue();
+            if (group.size() < 2) continue;
+
+            String canonical = e.getKey();
+            FileRecord keep = group.stream()
+                    .filter(r -> canonical.equals(r.getAbsolutePath()))
+                    .findFirst()
+                    .orElse(group.get(0));
+
+            for (FileRecord r : group) {
+                if (r == keep) continue;
+                try { vec.deleteBySourceFile(r.getAbsolutePath()); }
+                catch (Exception ex) {
+                    log.warn("dedup: failed to drop chunks for '{}': {}", r.getAbsolutePath(), ex.getMessage());
+                }
+                meta.delete(r.getAbsolutePath());
+                removed++;
+            }
+        }
+
+        if (removed > 0) {
+            log.warn("dedup: removed {} duplicate metadata row(s) for case-only path variants", removed);
         }
     }
 

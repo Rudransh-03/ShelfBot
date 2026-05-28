@@ -15,17 +15,22 @@ import org.apache.lucene.document.KnnFloatVectorField;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.document.StringField;
 import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.FloatVectorValues;
+import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.IndexableField;
+import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.KnnFloatVectorQuery;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.SearcherManager;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.util.ArrayUtil;
 import org.apache.lucene.store.FSDirectory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -270,6 +275,66 @@ public final class VectorStore implements AutoCloseable {
             }
         } catch (IOException e) {
             log.warn("Failed to fetch all chunks for '{}': {}", absolutePath, e.getMessage());
+            return List.of();
+        }
+    }
+
+    /**
+     * Returns the raw embedding vectors for every chunk that came from the
+     * given source file. Unlike {@link #getChunksForFile}, this skips the
+     * stored-field round-trip and pulls float[] arrays directly out of the
+     * HNSW field — used by the reorg pipeline to mean-pool chunk vectors
+     * into a single file-level vector.
+     *
+     * Order is by Lucene docId (i.e. insertion order within each segment),
+     * not by chunk_index. Mean-pooling is order-independent, so callers that
+     * just want the centroid don't need to sort.
+     *
+     * Each returned float[] is a defensive clone — Lucene's
+     * {@link FloatVectorValues} reuses its internal buffer across calls.
+     */
+    public List<float[]> getChunkVectorsForFile(String absolutePath) {
+        try {
+            searchers.maybeRefresh();
+            IndexSearcher searcher = searchers.acquire();
+            try {
+                TermQuery q = new TermQuery(new Term(F_SRC_PATH, absolutePath));
+                // Same upper bound as getChunksForFile — 1000 chunks is plenty.
+                TopDocs td = searcher.search(q, 1000);
+                if (td.scoreDocs.length == 0) return List.of();
+
+                // Group docs by leaf so we open one FloatVectorValues per leaf
+                // and advance forward (its iterator is monotonic).
+                IndexReader reader = searcher.getIndexReader();
+                java.util.Map<Integer, java.util.List<Integer>> docsByLeaf = new java.util.HashMap<>();
+                for (ScoreDoc sd : td.scoreDocs) {
+                    int leafIdx = org.apache.lucene.index.ReaderUtil.subIndex(sd.doc, reader.leaves());
+                    docsByLeaf.computeIfAbsent(leafIdx, k -> new ArrayList<>()).add(sd.doc);
+                }
+
+                List<float[]> out = new ArrayList<>(td.scoreDocs.length);
+                for (var entry : docsByLeaf.entrySet()) {
+                    LeafReaderContext ctx = reader.leaves().get(entry.getKey());
+                    FloatVectorValues fvv = ctx.reader().getFloatVectorValues(F_VECTOR);
+                    if (fvv == null) continue;
+                    // Local docIds (within the leaf) — advance() needs them sorted.
+                    java.util.List<Integer> localDocs = new ArrayList<>(entry.getValue().size());
+                    for (int globalDoc : entry.getValue()) localDocs.add(globalDoc - ctx.docBase);
+                    java.util.Collections.sort(localDocs);
+                    for (int localDocId : localDocs) {
+                        if (fvv.advance(localDocId) == localDocId) {
+                            float[] v = fvv.vectorValue();
+                            // Clone — FloatVectorValues may reuse the underlying array.
+                            out.add(ArrayUtil.copyOfSubArray(v, 0, v.length));
+                        }
+                    }
+                }
+                return out;
+            } finally {
+                searchers.release(searcher);
+            }
+        } catch (IOException e) {
+            log.warn("Failed to fetch chunk vectors for '{}': {}", absolutePath, e.getMessage());
             return List.of();
         }
     }

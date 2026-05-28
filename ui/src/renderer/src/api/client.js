@@ -108,4 +108,45 @@ export class ApiClient {
 
   /** Removes an indexed file by absolute path. Frees its token budget. */
   deleteFile(path)  { return this._r('/api/files', { method: 'DELETE', body: JSON.stringify({ path }) }) }
+
+  // ── Reorg pipeline ───────────────────────────────────────────────────────
+
+  /**
+   * End-to-end dry-run for a target directory. Returns one of:
+   *   { kind: 'scopeError', scopeError: {...}, summary: {...} }
+   *   { kind: 'proposal',   proposal: { moves, dropped, leftAlone, ... }, summary: {...} }
+   * The proposal can have zero moves — that's the "everything is already
+   * tidy, nothing to do" case.
+   */
+  reorgPreview(targetDir) {
+    return this._r('/api/reorg/preview', {
+      method: 'POST',
+      body:   JSON.stringify({ targetDir }),
+    })
+  }
+
+  /**
+   * Executes a user-approved subset of moves. Returns
+   *   { batchId, outcomes, successCount, skippedCount, failedCount }
+   * Hand `batchId` to {@link reorgUndo} to reverse the batch.
+   */
+  reorgExecute(targetDir, moves) {
+    return this._r('/api/reorg/execute', {
+      method: 'POST',
+      body:   JSON.stringify({ targetDir, moves }),
+    })
+  }
+
+  /** Reverses a previously-executed batch. */
+  reorgUndo(batchId) {
+    return this._r('/api/reorg/undo', {
+      method: 'POST',
+      body:   JSON.stringify({ batchId }),
+    })
+  }
+
+  /** Recent batches the user could choose to undo, newest first. */
+  reorgHistory(limit = 20) {
+    return this._r(`/api/reorg/history?limit=${limit}`)
+  }
 }

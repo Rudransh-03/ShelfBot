@@ -19,10 +19,10 @@
 
 import { useEffect, useRef } from 'react'
 
-const NODE_COUNT        = 55
+const NODE_COUNT        = 85      // a few more so the field doesn't read as empty
 const MAX_LINK_DIST     = 150     // px — link only nodes within this radius
 const CURSOR_RADIUS     = 220     // px — proximity field around cursor
-const BASE_NODE_ALPHA   = 0.35
+const BASE_NODE_ALPHA   = 0.42    // slightly brighter idle stars
 const BASE_LINE_ALPHA   = 0.10
 
 export default function BackgroundFX() {

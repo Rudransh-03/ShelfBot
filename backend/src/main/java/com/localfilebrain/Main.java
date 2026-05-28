@@ -196,6 +196,19 @@ public final class Main {
             // the user can still re-index manually after fixing config.
             final FileWatcher watcher = tryStartWatcher(config, finalStore, vectorStore, finalEmbedding);
 
+            // Catch files that were modified while the app was closed. The
+            // live FileWatcher only sees events that happen AFTER startup,
+            // so without this pass a doc edited overnight would still serve
+            // a stale summary from the cache (its summary row matches the
+            // stored content_hash, which itself is now out of date).
+            //
+            // pipeline.run() is idempotent and cheap when nothing changed
+            // (FileScanner short-circuits on timestamp match). Anything it
+            // does re-process goes through metadataStore.upsert, which
+            // calls deleteSummary — so the summary cache is invalidated
+            // automatically for exactly the files that need it.
+            runStartupReindex(config, finalStore, vectorStore, finalEmbedding);
+
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 if (watcher != null) watcher.close();
                 server.stop();
@@ -219,6 +232,50 @@ public final class Main {
      * failure is logged and swallowed — the API server still runs, and
      * the user can re-index manually via the UI.
      */
+    /**
+     * Runs a background scan after server start that picks up files
+     * modified, added, or deleted while the app was closed and re-indexes
+     * them. Re-indexing fires {@code metadataStore.upsert}, which in turn
+     * deletes the stale summary cache row for that file — so subsequent
+     * /api/files/summary requests regenerate from fresh chunks.
+     *
+     * Daemon thread so it never blocks shutdown; failures are logged but
+     * never crash the server (the user can still index manually).
+     */
+    private static void runStartupReindex(AppConfig config,
+                                          IndexMetadataStore meta,
+                                          VectorStore vec,
+                                          EmbeddingClient embed) {
+        if (embed == null) {
+            log.warn("[startup-rescan] skipped — embedding client unavailable");
+            return;
+        }
+        Thread t = new Thread(() -> {
+            try {
+                // Small grace period so the HTTP server has a quiet startup
+                // window — otherwise the first UI requests race with a busy
+                // indexing thread that's reading every root recursively.
+                Thread.sleep(2_000);
+                IngestionPipeline pipeline = new IngestionPipeline(config, meta, vec, embed);
+                log.info("[startup-rescan] checking for changes since the app was last open");
+                var result = pipeline.run();
+                if (result.getFilesProcessed() > 0 || result.getFilesFailed() > 0) {
+                    log.info("[startup-rescan] re-indexed {} file(s), {} failed — summary cache invalidated for those rows",
+                            result.getFilesProcessed(), result.getFilesFailed());
+                } else {
+                    log.info("[startup-rescan] no changes detected ({} files scanned, all up to date)",
+                            result.getTotalFilesScanned());
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            } catch (Exception e) {
+                log.warn("[startup-rescan] failed: {}", e.getMessage());
+            }
+        }, "shelfbot-startup-rescan");
+        t.setDaemon(true);
+        t.start();
+    }
+
     private static FileWatcher tryStartWatcher(AppConfig config,
                                                IndexMetadataStore store,
                                                VectorStore vectorStore,

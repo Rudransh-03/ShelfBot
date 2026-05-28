@@ -23,7 +23,10 @@ import com.localfilebrain.reorg.ReorgToolLoopResult;
 import com.localfilebrain.reorg.ScopeError;
 import com.localfilebrain.reorg.UndoExecutor;
 import com.localfilebrain.storage.VectorStore;
+import com.localfilebrain.summarize.SummarizationEngine;
+import com.localfilebrain.llm.GPT4oMiniClient;
 import com.localfilebrain.util.PathNormalizer;
+import com.localfilebrain.model.FileRecord;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import org.slf4j.Logger;
@@ -144,6 +147,7 @@ public final class ApiServer {
         server.createContext("/api/query/stream", this::handleQueryStream);
         server.createContext("/api/conversation", this::handleConversation);
         server.createContext("/api/config",       this::handleConfig);
+        server.createContext("/api/files/summary", this::handleFileSummary);
         server.createContext("/api/files",        this::handleFiles);
         server.createContext("/api/auth",         this::handleAuth);
         server.createContext("/api/reorg/preview", this::handleReorgPreview);
@@ -554,6 +558,96 @@ public final class ApiServer {
             sendJson(ex, 200, map("deleted", true, "path", path));
         } catch (Exception e) {
             log.error("delete file error", e);
+            sendError(ex, 500, e.getMessage());
+        }
+    }
+
+    /**
+     * POST /api/files/summary  body: { path, force? }
+     *
+     * Returns the one-page brief for an indexed file. Cache logic:
+     *   - Path is canonicalized so case-only differences hit the same row.
+     *   - If a cached summary exists AND its content_hash matches the file's
+     *     current hash, return it immediately ({@code cached: true}).
+     *   - Otherwise (or when force=true), generate via {@link SummarizationEngine},
+     *     persist, and return ({@code cached: false}).
+     *
+     * Status codes:
+     *   200 OK         — body has summary
+     *   400 Bad Request — missing path
+     *   404 Not Found  — file isn't indexed
+     *   401 Unauthorized — proxy says you aren't signed in
+     *   429 Too Many   — daily LLM quota reached
+     *   503 Service Unavailable — backend isn't configured (no LLM client)
+     */
+    private void handleFileSummary(HttpExchange ex) throws IOException {
+        if (preflight(ex)) return;
+        if (!isMethod(ex, "POST")) { methodNotAllowed(ex); return; }
+
+        try {
+            Map<?, ?> body = readJson(ex);
+            String rawPath = (String) body.get("path");
+            if (rawPath == null || rawPath.isBlank()) {
+                sendError(ex, 400, "path is required");
+                return;
+            }
+            boolean force = Boolean.TRUE.equals(body.get("force"));
+            String path = PathNormalizer.canonical(rawPath);
+
+            FileRecord record = metadataStore.findByPath(path).orElse(null);
+            if (record == null || record.getStatus() != FileRecord.Status.INDEXED) {
+                sendError(ex, 404, "File is not indexed: " + path);
+                return;
+            }
+
+            // Cache hit path — return immediately when the file hasn't changed
+            // since the summary was generated.
+            if (!force) {
+                var cached = metadataStore.getSummary(path);
+                if (cached.isPresent()
+                        && cached.get().contentHash().equals(record.getContentHash())) {
+                    sendJson(ex, 200, map(
+                            "path",        path,
+                            "fileName",    record.getFileName(),
+                            "summary",     cached.get().summary(),
+                            "llmCalls",    cached.get().llmCalls(),
+                            "generatedAt", cached.get().generatedAt(),
+                            "cached",      true));
+                    return;
+                }
+            }
+
+            if (embeddingClient == null) {
+                sendError(ex, 503, "Backend is still starting up. Try again in a moment.");
+                return;
+            }
+            if (!tokenStore.isAuthenticated()) {
+                sendError(ex, 401, "Please sign in to ShelfBot before generating summaries.");
+                return;
+            }
+
+            GPT4oMiniClient llm = new GPT4oMiniClient(config, tokenStore);
+            SummarizationEngine engine = new SummarizationEngine(llm, vectorStore);
+            SummarizationEngine.Result result = engine.summarize(path, record.getFileName());
+
+            metadataStore.putSummary(path, record.getContentHash(), result.summary(), result.llmCalls());
+
+            sendJson(ex, 200, map(
+                    "path",        path,
+                    "fileName",    record.getFileName(),
+                    "summary",     result.summary(),
+                    "llmCalls",    result.llmCalls(),
+                    "generatedAt", java.time.Instant.now().toString(),
+                    "cached",      false));
+
+        } catch (com.localfilebrain.llm.GPT4oMiniClient.LLMException e) {
+            String msg = e.getMessage() == null ? "Summary failed" : e.getMessage();
+            int status = msg.toLowerCase().contains("session") ? 401
+                       : msg.toLowerCase().contains("limit")   ? 429
+                       : 502;
+            sendError(ex, status, msg);
+        } catch (Exception e) {
+            log.warn("/api/files/summary failed", e);
             sendError(ex, 500, e.getMessage());
         }
     }

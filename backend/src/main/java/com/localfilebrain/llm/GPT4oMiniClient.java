@@ -289,6 +289,22 @@ public final class GPT4oMiniClient {
     }
 
     /**
+     * One-shot call with a caller-supplied system + user prompt, no
+     * retrieval excerpts and no conversation history attached. Used by the
+     * summarization pipeline where the prompt is fully self-contained.
+     */
+    public String oneShot(String systemPrompt, String userPrompt) {
+        ObjectNode body = mapper.createObjectNode();
+        body.put("model", MODEL);
+        body.put("max_tokens", MAX_TOKENS);
+        body.put("temperature", 0.2);
+        ArrayNode messages = body.putArray("messages");
+        addMessage(messages, "system", systemPrompt);
+        addMessage(messages, "user",   userPrompt);
+        return doRequest(body);
+    }
+
+    /**
      * Follow-up non-streaming variant — see {@link #answerFollowUpStream}.
      */
     public String answerFollowUp(String question, ConversationHistory history) {

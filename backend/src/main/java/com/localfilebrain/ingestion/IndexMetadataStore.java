@@ -102,6 +102,21 @@ public final class IndexMetadataStore implements AutoCloseable {
                 )
                 """);
 
+            // Cached one-page summary per indexed file. Generated on demand
+            // when the user clicks "Summarise" in the Library view. The
+            // content_hash column is the staleness check — when the file's
+            // current hash differs from the stored one the cached row is
+            // ignored and regenerated.
+            stmt.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS file_summaries (
+                    absolute_path TEXT    PRIMARY KEY,
+                    content_hash  TEXT    NOT NULL,
+                    summary       TEXT    NOT NULL,
+                    llm_calls     INTEGER NOT NULL DEFAULT 1,
+                    generated_at  TEXT    NOT NULL
+                )
+                """);
+
             // Undo log for executed reorg batches. One row per file move.
             // Written BEFORE the move actually happens so a crash mid-move
             // still leaves a recoverable record. The created_destination_dir
@@ -366,6 +381,10 @@ public final class IndexMetadataStore implements AutoCloseable {
         // cached file-level vector (if any) is now stale. Cheaper to wipe than
         // to detect staleness on read.
         deleteFileVector(record.getAbsolutePath());
+        // The file was re-processed (possibly with different content), so
+        // any cached summary is stale — drop it. The summary will be
+        // regenerated on next /api/files/summary request.
+        deleteSummary(record.getAbsolutePath());
     }
 
     /**
@@ -421,6 +440,79 @@ public final class IndexMetadataStore implements AutoCloseable {
             throw new MetadataStoreException("Failed to delete record for: " + absolutePath, e);
         }
         deleteFileVector(absolutePath);
+        deleteSummary(absolutePath);
+    }
+
+    // -------------------------------------------------------------------------
+    // Document summary cache
+    // -------------------------------------------------------------------------
+
+    /** Cached one-page summary for a file. */
+    public record CachedSummary(String absolutePath,
+                                String contentHash,
+                                String summary,
+                                int llmCalls,
+                                String generatedAt) {}
+
+    /**
+     * Returns the cached summary for a file (regardless of staleness — the
+     * caller compares {@code contentHash} against the current file row to
+     * decide whether to use it).
+     */
+    public synchronized Optional<CachedSummary> getSummary(String absolutePath) {
+        String sql = "SELECT absolute_path, content_hash, summary, llm_calls, generated_at "
+                   + "FROM file_summaries WHERE absolute_path = ?";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, absolutePath);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return Optional.empty();
+                return Optional.of(new CachedSummary(
+                        rs.getString("absolute_path"),
+                        rs.getString("content_hash"),
+                        rs.getString("summary"),
+                        rs.getInt("llm_calls"),
+                        rs.getString("generated_at")));
+            }
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to read summary for: " + absolutePath, e);
+        }
+    }
+
+    /** Inserts or replaces the cached summary. */
+    public synchronized void putSummary(String absolutePath,
+                                        String contentHash,
+                                        String summary,
+                                        int llmCalls) {
+        String sql = """
+            INSERT INTO file_summaries (absolute_path, content_hash, summary, llm_calls, generated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(absolute_path) DO UPDATE SET
+              content_hash = excluded.content_hash,
+              summary      = excluded.summary,
+              llm_calls    = excluded.llm_calls,
+              generated_at = excluded.generated_at
+            """;
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, absolutePath);
+            ps.setString(2, contentHash);
+            ps.setString(3, summary);
+            ps.setInt   (4, llmCalls);
+            ps.setString(5, Instant.now().toString());
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to put summary for: " + absolutePath, e);
+        }
+    }
+
+    /** Removes the cached summary. No-op if none stored. */
+    public synchronized void deleteSummary(String absolutePath) {
+        String sql = "DELETE FROM file_summaries WHERE absolute_path = ?";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, absolutePath);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            log.warn("Failed to delete summary for '{}': {}", absolutePath, e.getMessage());
+        }
     }
 
     // -------------------------------------------------------------------------

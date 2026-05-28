@@ -109,6 +109,19 @@ export class ApiClient {
   /** Removes an indexed file by absolute path. Frees its token budget. */
   deleteFile(path)  { return this._r('/api/files', { method: 'DELETE', body: JSON.stringify({ path }) }) }
 
+  /**
+   * Generates (or returns the cached) one-page brief for an indexed file.
+   * Returns { path, fileName, summary, llmCalls, generatedAt, cached }.
+   * The first call can take several seconds for large docs; subsequent calls
+   * are instant unless the file's content has changed.
+   */
+  summarizeFile(path, { force = false } = {}) {
+    return this._r('/api/files/summary', {
+      method: 'POST',
+      body:   JSON.stringify({ path, force }),
+    })
+  }
+
   // ── Reorg pipeline ───────────────────────────────────────────────────────
 
   /**

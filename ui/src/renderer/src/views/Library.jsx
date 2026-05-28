@@ -96,6 +96,20 @@ const TrashIcon = () => (
     <path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/>
   </svg>
 )
+const SummaryIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+    <polyline points="14 2 14 8 20 8"/>
+    <line x1="8"  y1="13" x2="16" y2="13"/>
+    <line x1="8"  y1="17" x2="13" y2="17"/>
+  </svg>
+)
+const CloseIconSm = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <line x1="18" y1="6" x2="6"  y2="18"/>
+    <line x1="6"  y1="6" x2="18" y2="18"/>
+  </svg>
+)
 const FileTypeIcon = () => (
   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
     <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
@@ -194,7 +208,7 @@ function TokenMeter({ used = 0, limit = 1, perFileLimit = 0 }) {
 
 // ── Per-file row with inline delete confirmation ────────────────────────────
 
-function FileRow({ file, onDelete }) {
+function FileRow({ file, onDelete, onSummarise }) {
   const [pendingDelete, setPendingDelete] = useState(false)
   const [busy, setBusy] = useState(false)
 
@@ -241,16 +255,128 @@ function FileRow({ file, onDelete }) {
           </button>
         </div>
       ) : (
-        <button
-          className="file-row-del"
-          onClick={() => setPendingDelete(true)}
-          title="Remove from index (file on disk is not touched)"
-          aria-label={`Remove ${file.name} from index`}
-        >
-          <TrashIcon />
-        </button>
+        <div className="file-row-actions">
+          <button
+            className="file-row-action"
+            onClick={() => onSummarise(file)}
+            title="Generate a one-page brief"
+            aria-label={`Summarise ${file.name}`}
+          >
+            <SummaryIcon />
+            <span>Summarise</span>
+          </button>
+          <button
+            className="file-row-del"
+            onClick={() => setPendingDelete(true)}
+            title="Remove from index (file on disk is not touched)"
+            aria-label={`Remove ${file.name} from index`}
+          >
+            <TrashIcon />
+          </button>
+        </div>
       )}
     </li>
+  )
+}
+
+// ── Summary modal ───────────────────────────────────────────────────────────
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+/**
+ * Render the GPT-4o mini brief as minimal HTML — the model emits **bold**
+ * section headers and "- " bullets. We escape first, then re-introduce
+ * those two markdown forms. Anything else (links, italics) is preserved
+ * as plain text.
+ */
+function renderBrief(text) {
+  const esc = escapeHtml(text || '')
+  const lines = esc.split('\n')
+  const html = lines.map(line => {
+    const bolded = line.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    if (/^\s*-\s+/.test(bolded)) {
+      return '<li>' + bolded.replace(/^\s*-\s+/, '') + '</li>'
+    }
+    return bolded
+  })
+  // Wrap consecutive <li> sequences with <ul>.
+  const out = []
+  let inList = false
+  for (const ln of html) {
+    if (ln.startsWith('<li>')) {
+      if (!inList) { out.push('<ul>'); inList = true }
+      out.push(ln)
+    } else {
+      if (inList) { out.push('</ul>'); inList = false }
+      out.push(ln)
+    }
+  }
+  if (inList) out.push('</ul>')
+  return out.join('\n').replace(/\n+/g, '\n').replace(/\n/g, '<br>')
+}
+
+function SummaryModal({ file, data, error, loading, onClose, onRegenerate }) {
+  // Close on Escape — nicer keyboard ergonomics than forcing a click.
+  useEffect(() => {
+    const onKey = e => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  return (
+    <div className="summary-overlay" onClick={onClose}>
+      <div className="summary-card" onClick={e => e.stopPropagation()}>
+        <div className="summary-head">
+          <div className="summary-head-main">
+            <div className="summary-head-title">{file.name}</div>
+            <div className="summary-head-sub">
+              {loading
+                ? 'Reading the document…'
+                : error
+                  ? 'Failed to summarise'
+                  : data?.cached
+                    ? `Cached · generated ${fmtAge(data.generatedAt)}`
+                    : data
+                      ? `Generated just now · ${data.llmCalls} LLM call${data.llmCalls === 1 ? '' : 's'}`
+                      : ''}
+            </div>
+          </div>
+          <button className="summary-close" onClick={onClose} aria-label="Close summary">
+            <CloseIconSm />
+          </button>
+        </div>
+
+        <div className="summary-body">
+          {loading ? (
+            <div className="summary-loading">
+              <div className="spin-sm" />
+              <span>Pulling chunks and writing the brief…</span>
+            </div>
+          ) : error ? (
+            <div className="summary-error">{error}</div>
+          ) : data ? (
+            <div
+              className="summary-brief"
+              dangerouslySetInnerHTML={{ __html: renderBrief(data.summary) }}
+            />
+          ) : null}
+        </div>
+
+        {data && !loading && !error && (
+          <div className="summary-foot">
+            <button className="btn-ghost btn-sm" onClick={onRegenerate}>
+              Regenerate
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
   )
 }
 
@@ -259,6 +385,10 @@ function FileRow({ file, onDelete }) {
 function IndexedFilesPanel({ api, connected, refreshKey, onDeleted, toast }) {
   const [files, setFiles] = useState(null)
   const [loading, setLoading] = useState(false)
+
+  // Active summary modal state: { file, data, error, loading }.
+  // Only one modal at a time — clicking Summarise on a different row replaces.
+  const [summaryState, setSummaryState] = useState(null)
 
   const load = useCallback(async () => {
     if (!api || !connected) return
@@ -287,6 +417,22 @@ function IndexedFilesPanel({ api, connected, refreshKey, onDeleted, toast }) {
     }
   }, [api, toast, onDeleted])
 
+  const runSummary = useCallback(async (file, opts = {}) => {
+    setSummaryState({ file, data: null, error: null, loading: true })
+    try {
+      const data = await api.summarizeFile(file.path, opts)
+      setSummaryState({ file, data, error: null, loading: false })
+    } catch (e) {
+      setSummaryState({ file, data: null, error: e.message, loading: false })
+    }
+  }, [api])
+
+  const handleSummarise = useCallback((file) => { runSummary(file) }, [runSummary])
+  const closeSummary   = useCallback(() => setSummaryState(null), [])
+  const regenerate     = useCallback(() => {
+    if (summaryState?.file) runSummary(summaryState.file, { force: true })
+  }, [runSummary, summaryState])
+
   return (
     <div className="files-panel">
       <div className="files-panel-head">
@@ -313,9 +459,25 @@ function IndexedFilesPanel({ api, connected, refreshKey, onDeleted, toast }) {
       ) : (
         <ul className="file-list">
           {files.map(f => (
-            <FileRow key={f.path} file={f} onDelete={handleDelete} />
+            <FileRow
+              key={f.path}
+              file={f}
+              onDelete={handleDelete}
+              onSummarise={handleSummarise}
+            />
           ))}
         </ul>
+      )}
+
+      {summaryState && (
+        <SummaryModal
+          file={summaryState.file}
+          data={summaryState.data}
+          error={summaryState.error}
+          loading={summaryState.loading}
+          onClose={closeSummary}
+          onRegenerate={regenerate}
+        />
       )}
     </div>
   )

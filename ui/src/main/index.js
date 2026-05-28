@@ -1,10 +1,13 @@
 import { app, BrowserWindow, dialog, ipcMain, safeStorage, shell } from 'electron'
 import { join }   from 'path'
-import { spawn }  from 'child_process'
+import { spawn, execFile }  from 'child_process'
 import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'fs'
 import { createServer } from 'net'
 import { machineIdSync } from 'node-machine-id'
 import { randomUUID }    from 'crypto'
+import { promisify }     from 'util'
+
+const execFileP = promisify(execFile)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Auth: persist proxy JWT in OS-encrypted secure storage
@@ -162,6 +165,74 @@ function findFreePort(from = DEFAULT_PORT) {
   })
 }
 
+/**
+ * Kills any orphaned ShelfBot Java process before we spawn a new one.
+ *
+ * Lucene allows only one writer per index directory; if a previous Electron
+ * launch was force-quit (Cmd-Q during indexing, crash, IDE stop button), the
+ * Java child can survive and hold the write.lock — every subsequent
+ * `npm run dev` then fails with LockObtainFailedException and the UI loads
+ * with no backend. We sweep for stale instances on every start so dev runs
+ * are reliable.
+ *
+ * macOS / Linux: use `pgrep -f` against the JAR name. Windows: best-effort
+ * via wmic; failure is logged and ignored (rare in dev for this project).
+ *
+ * After killing, also clear a leftover write.lock — on hard kill the JVM
+ * doesn't get to release it via shutdown hook.
+ */
+async function killOrphanedJava() {
+  const isWin = process.platform === 'win32'
+  let pids = []
+  try {
+    if (isWin) {
+      // wmic returns lines like:  CommandLine=java ... ProcessId=12345
+      const { stdout } = await execFileP('wmic', ['process', 'where', "name='java.exe'", 'get', 'CommandLine,ProcessId', '/format:list'])
+      for (const block of stdout.split(/\r?\n\r?\n/)) {
+        if (block.includes('local-file-brain') || block.includes('shelfbot.jar')) {
+          const m = block.match(/ProcessId=(\d+)/)
+          if (m) pids.push(parseInt(m[1], 10))
+        }
+      }
+    } else {
+      const { stdout } = await execFileP('pgrep', ['-f', 'local-file-brain|shelfbot\\.jar'])
+      pids = stdout.split('\n').filter(Boolean).map(s => parseInt(s.trim(), 10))
+    }
+  } catch (e) {
+    // pgrep exits 1 when nothing matches — that's the happy case.
+    if (e.code !== 1) console.warn('[ShelfBot] orphan-scan failed:', e.message)
+    return
+  }
+
+  // Don't kill our own child (it shouldn't exist this early, but safe-guard).
+  pids = pids.filter(p => !javaProcess || javaProcess.pid !== p)
+  if (pids.length === 0) return
+
+  console.log('[ShelfBot] killing orphan Java pid(s):', pids.join(', '))
+  for (const pid of pids) {
+    try { process.kill(pid, 'SIGTERM') } catch {}
+  }
+
+  // Give them a moment to release the lock, then SIGKILL any survivors.
+  await new Promise(r => setTimeout(r, 1200))
+  for (const pid of pids) {
+    try { process.kill(pid, 0); process.kill(pid, 'SIGKILL') } catch {}
+  }
+
+  // Some hard kills leave Lucene's write.lock on disk. Remove it so the
+  // fresh JVM can open the index. Lock contents don't matter — Lucene
+  // recreates on open.
+  const lockFile = join(BACKEND_ROOT, 'shelfbot-vector-index', 'write.lock')
+  try {
+    if (existsSync(lockFile)) {
+      unlinkSync(lockFile)
+      console.log('[ShelfBot] removed stale Lucene write.lock')
+    }
+  } catch (e) {
+    console.warn('[ShelfBot] could not remove stale lock:', e.message)
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Java backend
 // ─────────────────────────────────────────────────────────────────────────────
@@ -174,6 +245,8 @@ function startJavaBackend() {
   }
 
   return new Promise(async (resolve) => {
+    // Always sweep orphaned JVMs first — see killOrphanedJava() for why.
+    await killOrphanedJava()
     const port = await findFreePort()
     console.log(`[ShelfBot] Starting Java on port ${port}  (${jar})`)
 

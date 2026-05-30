@@ -118,6 +118,12 @@ const FileTypeIcon = () => (
     <line x1="9"  y1="17" x2="15" y2="17"/>
   </svg>
 )
+const SearchIcon = () => (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+    <circle cx="11" cy="11" r="7"/>
+    <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+  </svg>
+)
 
 // ── macOS Full Disk Access banner ───────────────────────────────────────────
 // Shown only when the backend reports it can't read one or more configured
@@ -321,7 +327,7 @@ function renderBrief(text) {
   return out.join('\n').replace(/\n+/g, '\n').replace(/\n/g, '<br>')
 }
 
-function SummaryModal({ file, data, error, loading, onClose, onRegenerate }) {
+function SummaryModal({ file, data, error, loading, onClose }) {
   // Close on Escape — nicer keyboard ergonomics than forcing a click.
   useEffect(() => {
     const onKey = e => { if (e.key === 'Escape') onClose() }
@@ -367,14 +373,6 @@ function SummaryModal({ file, data, error, loading, onClose, onRegenerate }) {
             />
           ) : null}
         </div>
-
-        {data && !loading && !error && (
-          <div className="summary-foot">
-            <button className="btn-ghost btn-sm" onClick={onRegenerate}>
-              Regenerate
-            </button>
-          </div>
-        )}
       </div>
     </div>
   )
@@ -385,6 +383,7 @@ function SummaryModal({ file, data, error, loading, onClose, onRegenerate }) {
 function IndexedFilesPanel({ api, connected, refreshKey, onDeleted, toast }) {
   const [files, setFiles] = useState(null)
   const [loading, setLoading] = useState(false)
+  const [query, setQuery] = useState('')
 
   // Active summary modal state: { file, data, error, loading }.
   // Only one modal at a time — clicking Summarise on a different row replaces.
@@ -429,9 +428,16 @@ function IndexedFilesPanel({ api, connected, refreshKey, onDeleted, toast }) {
 
   const handleSummarise = useCallback((file) => { runSummary(file) }, [runSummary])
   const closeSummary   = useCallback(() => setSummaryState(null), [])
-  const regenerate     = useCallback(() => {
-    if (summaryState?.file) runSummary(summaryState.file, { force: true })
-  }, [runSummary, summaryState])
+
+  // Instant client-side filter on file name or path. Filtering an in-memory
+  // array on each keystroke is sub-millisecond, so no debounce is needed —
+  // the list updates the moment a key is pressed.
+  const q = query.trim().toLowerCase()
+  const visible = q
+    ? (files ?? []).filter(f =>
+        (f.name ?? '').toLowerCase().includes(q) ||
+        (f.path ?? '').toLowerCase().includes(q))
+    : (files ?? [])
 
   return (
     <div className="files-panel">
@@ -452,21 +458,56 @@ function IndexedFilesPanel({ api, connected, refreshKey, onDeleted, toast }) {
         </button>
       </div>
 
+      {files != null && files.length > 0 && (
+        <div className="files-search">
+          <span className="files-search-icon"><SearchIcon /></span>
+          <input
+            className="files-search-input"
+            type="text"
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            placeholder="Search indexed files by name…"
+            aria-label="Search indexed files"
+            autoComplete="off"
+            spellCheck={false}
+          />
+          {query && (
+            <button
+              className="files-search-clear"
+              onClick={() => setQuery('')}
+              title="Clear search"
+              aria-label="Clear search"
+            >
+              <CloseIconSm />
+            </button>
+          )}
+        </div>
+      )}
+
       {files == null ? (
         <div className="files-panel-empty">{loading ? 'Loading…' : ''}</div>
       ) : files.length === 0 ? (
         <div className="files-panel-empty">No files indexed yet.</div>
+      ) : visible.length === 0 ? (
+        <div className="files-panel-empty">No files match “{query}”.</div>
       ) : (
-        <ul className="file-list">
-          {files.map(f => (
-            <FileRow
-              key={f.path}
-              file={f}
-              onDelete={handleDelete}
-              onSummarise={handleSummarise}
-            />
-          ))}
-        </ul>
+        <>
+          {q && (
+            <div className="files-search-count">
+              Showing {visible.length} of {files.length} files
+            </div>
+          )}
+          <ul className="file-list">
+            {visible.map(f => (
+              <FileRow
+                key={f.path}
+                file={f}
+                onDelete={handleDelete}
+                onSummarise={handleSummarise}
+              />
+            ))}
+          </ul>
+        </>
       )}
 
       {summaryState && (
@@ -476,7 +517,6 @@ function IndexedFilesPanel({ api, connected, refreshKey, onDeleted, toast }) {
           error={summaryState.error}
           loading={summaryState.loading}
           onClose={closeSummary}
-          onRegenerate={regenerate}
         />
       )}
     </div>

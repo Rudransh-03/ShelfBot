@@ -39,14 +39,19 @@ public final class TextExtractor {
 
     private static final int MAX_CHARS = 10_000_000;
 
+    // A genuine text page carries ~1,500–3,500 chars; a scanned (image-only)
+    // page yields ~0. So if a PDF's text-only extraction averages fewer than
+    // this many chars per page, we treat it as a scan and run full OCR.
+    private static final int MIN_CHARS_PER_PAGE = 100;
+
     // Extensions we handle via direct UTF-8 read (fast path, no charset detection needed)
     private static final java.util.Set<String> PLAIN_TEXT_EXTENSIONS = java.util.Set.of(
         "txt", "md", "markdown", "csv", "tsv", "log", "properties", "yaml", "yml", "json", "xml", "htm", "html"
     );
 
     // Image-and-image-like extensions that only yield text if we OCR them.
-    // (image-only PDFs are handled inside extractWithTika since detection
-    //  happens after the parse — see runOcrOnImagePdfIfEmpty.)
+    // (Scanned/image-only PDFs are detected inside extractWithTika via a fast
+    //  text-only pass, then OCR'd only if their text-per-page is too low.)
     private static final java.util.Set<String> IMAGE_EXTENSIONS = java.util.Set.of(
         "jpg", "jpeg", "png", "tif", "tiff", "bmp", "webp", "gif"
     );
@@ -166,6 +171,19 @@ public final class TextExtractor {
         return context;
     }
 
+    /**
+     * Context that extracts a PDF's embedded text layer only — NO OCR. Used for
+     * the fast first pass that decides whether a PDF is digital (skip OCR) or a
+     * scan (fall back to {@link #newOcrContext()}).
+     */
+    private ParseContext newNoOcrContext() {
+        ParseContext context = new ParseContext();
+        PDFParserConfig pdf = new PDFParserConfig();
+        pdf.setOcrStrategy(PDFParserConfig.OCR_STRATEGY.NO_OCR);
+        context.set(PDFParserConfig.class, pdf);
+        return context;
+    }
+
     // -------------------------------------------------------------------------
     // Plain text fast path
     // -------------------------------------------------------------------------
@@ -202,15 +220,53 @@ public final class TextExtractor {
     // -------------------------------------------------------------------------
 
     private ExtractionResult extractWithTika(Path file) throws ExtractionException {
+        String ext = getExtension(file.getFileName().toString());
+
+        // PDFs are the expensive case: with OCR_AND_TEXT_EXTRACTION Tika renders
+        // and OCRs *every* page, so a 300-page digital PDF pays for 300 needless
+        // OCR passes (~minutes). Decide first with a fast text-only pass: only
+        // fall back to full OCR when the text-per-page is too low to be a real
+        // text layer (i.e. it's a scan). The check is at the whole-document
+        // level, so a scan carrying a thin text layer (e.g. a cover page) still
+        // drops below the threshold and gets OCR'd.
+        if ("pdf".equals(ext) && ocrAvailable) {
+            TikaParse fast = parse(file, newNoOcrContext());
+            int pages   = pageCount(fast.metadata());
+            int perPage = pages > 0 ? fast.text().length() / pages : fast.text().length();
+
+            if (perPage >= MIN_CHARS_PER_PAGE) {
+                log.debug("PDF '{}' looks digital ({} chars / {} pages = {}/page) — skipping OCR",
+                        file.getFileName(), fast.text().length(), pages, perPage);
+                return finish(file, fast);
+            }
+            log.info("PDF '{}' looks scanned ({} chars / {} pages = {}/page, < {}) — running full OCR",
+                    file.getFileName(), fast.text().length(), pages, perPage, MIN_CHARS_PER_PAGE);
+            return finish(file, parse(file, newOcrContext()));
+        }
+
+        // Everything else (DOCX, XLSX, PPTX, …): OCR-aware context when Tesseract
+        // is available so embedded images still get read; plain otherwise.
+        ParseContext ctx = ocrAvailable ? newOcrContext() : new ParseContext();
+        return finish(file, parse(file, ctx));
+    }
+
+    /** Cleans the parsed text, builds the result, and logs the blank case. */
+    private ExtractionResult finish(Path file, TikaParse p) {
+        String cleaned = cleanText(p.text());
+        if (cleaned.isBlank()) {
+            log.warn("No text extracted from '{}' (MIME: {}). File may be scanned/image-only.",
+                    file.getFileName(), p.mime());
+        } else {
+            log.debug("Extracted {} chars from '{}' (MIME: {})", cleaned.length(), file.getFileName(), p.mime());
+        }
+        return new ExtractionResult(cleaned, p.mime());
+    }
+
+    /** One Tika parse with the given context; tolerates the char-limit SAX abort. */
+    private TikaParse parse(Path file, ParseContext context) throws ExtractionException {
         Metadata metadata = new Metadata();
         metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, file.getFileName().toString());
-
-        BodyContentHandler handler  = new BodyContentHandler(MAX_CHARS);
-        // Use OCR-aware context when Tesseract is available — that way
-        // scanned/image-only PDFs (Aadhaar, receipts, etc.) get their
-        // text pulled out as well. Falls back to a plain context when
-        // OCR isn't available so we don't slow down regular PDFs.
-        ParseContext context = ocrAvailable ? newOcrContext() : new ParseContext();
+        BodyContentHandler handler = new BodyContentHandler(MAX_CHARS);
 
         try (TikaInputStream tis = TikaInputStream.get(file.toFile(), metadata)) {
             parser.parse(tis, handler, metadata, context);
@@ -226,21 +282,25 @@ public final class TextExtractor {
             throw new ExtractionException("IO error reading file: " + file, e);
         }
 
-        String rawText  = handler.toString();
-        String cleaned  = cleanText(rawText);
-        String mimeType = metadata.get(HttpHeaders.CONTENT_TYPE);
-        if (mimeType == null) mimeType = "application/octet-stream";
-        int semiColon = mimeType.indexOf(';');
-        if (semiColon > 0) mimeType = mimeType.substring(0, semiColon).trim();
+        String mime = metadata.get(HttpHeaders.CONTENT_TYPE);
+        if (mime == null) mime = "application/octet-stream";
+        int semi = mime.indexOf(';');
+        if (semi > 0) mime = mime.substring(0, semi).trim();
+        return new TikaParse(handler.toString(), mime, metadata);
+    }
 
-        if (cleaned.isBlank()) {
-            log.warn("No text extracted from '{}' (MIME: {}). File may be scanned/image-only.",
-                file.getFileName(), mimeType);
-        } else {
-            log.debug("Extracted {} chars from '{}' (MIME: {})", cleaned.length(), file.getFileName(), mimeType);
+    private record TikaParse(String text, String mime, Metadata metadata) {}
+
+    /** PDF page count from Tika metadata; 0 if it couldn't be determined. */
+    private static int pageCount(Metadata md) {
+        String[] keys = { "xmpTPg:NPages", "meta:page-count", "Page-Count" };
+        for (String k : keys) {
+            String v = md.get(k);
+            if (v != null) {
+                try { return Integer.parseInt(v.trim()); } catch (NumberFormatException ignored) { /* try next */ }
+            }
         }
-
-        return new ExtractionResult(cleaned, mimeType);
+        return 0;
     }
 
     // -------------------------------------------------------------------------

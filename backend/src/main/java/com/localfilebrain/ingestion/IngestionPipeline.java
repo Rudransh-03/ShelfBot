@@ -19,7 +19,12 @@ import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Full ingestion pipeline: Scan → Extract → Chunk → Embed → Store.
@@ -57,6 +62,14 @@ public final class IngestionPipeline {
 
     /** Chars-per-token used for the rough estimate. */
     private static final int CHARS_PER_TOKEN = 4;
+
+    /** Chunks embedded per locked sub-batch — small enough to report smooth
+     *  "embedded X / N" progress, large enough to keep lock churn negligible. */
+    private static final int EMBED_PROGRESS_BATCH = 16;
+
+    /** Serialises embedding across worker threads. The ONNX model already uses
+     *  every core for one call, so concurrent embeds would only contend. */
+    private final Object embedLock = new Object();
 
     private final AppConfig          config;
     private final IndexMetadataStore metadataStore;
@@ -165,58 +178,79 @@ public final class IngestionPipeline {
 
         log.info("Files to process: {} | Already up-to-date: {}", toProcess.size(), skippedCount);
 
-        int processedCount = 0;
-        int failedCount    = scan.errors().size();
-        int totalChunks    = 0;
-        List<String> failedPaths = new ArrayList<>(
-                scan.errors().stream().map(Path::toString).toList()
-        );
+        // Parallelise across files: extraction + OCR + chunking run fully in
+        // parallel per worker, embedding is serialised through embedLock, and
+        // Lucene + SQLite writes are already synchronized internally. The pool
+        // is sized to ~half the cores so the machine stays usable while
+        // indexing, and never spawns more workers than there are files.
+        int cores   = Runtime.getRuntime().availableProcessors();
+        int threads = Math.max(1, Math.min(toProcess.size(), Math.max(2, cores / 2)));
+        log.info("Indexing {} files across {} worker thread(s) ({} cores)",
+                toProcess.size(), threads, cores);
 
-        // Emit a starting tick so the UI can switch from "indexing…" to
-        // a real progress bar immediately, even before the first file
-        // finishes (large files can take a few seconds each).
-        listener.onProgress(0, toProcess.size(), 0,
-                toProcess.get(0).getFileName().toString());
+        AtomicInteger processed      = new AtomicInteger(0);
+        AtomicInteger failed         = new AtomicInteger(scan.errors().size());
+        AtomicInteger totalChunksCtr = new AtomicInteger(0);
+        List<String>  failedPaths    = Collections.synchronizedList(new ArrayList<>(
+                scan.errors().stream().map(Path::toString).toList()));
+        final int total = toProcess.size();
 
-        for (int i = 0; i < toProcess.size(); i++) {
-            Path file = toProcess.get(i);
-            log.info("[{}/{}] Processing: {}", i + 1, toProcess.size(), file.getFileName());
+        // Starting tick so the UI flips from "indexing…" to a real bar at once.
+        listener.onProgress(0, total, failed.get(), null);
 
-            // Re-emit before processing so "current file" reflects the file
-            // we're *about* to handle (otherwise a slow file looks like the
-            // previous one is taking forever).
-            listener.onProgress(processedCount, toProcess.size(), failedCount,
-                    file.getFileName().toString());
+        final ProgressListener lst = listener;
+        ExecutorService pool = Executors.newFixedThreadPool(threads, r -> {
+            Thread t = new Thread(r, "shelfbot-index-worker");
+            t.setDaemon(true);
+            return t;
+        });
 
-            try {
-                ProcessResult result = processFile(file);
+        List<Future<?>> futures = new ArrayList<>(total);
+        for (Path file : toProcess) {
+            futures.add(pool.submit(() -> {
+                String fileId   = file.toString();
+                String fileName = file.getFileName().toString();
+                lst.onFileStart(fileId, fileName);
+                try {
+                    ProcessResult result = processFile(file,
+                            (stage, done, tot) -> lst.onFileStage(fileId, stage, done, tot));
 
-                if (result == null || result.chunkCount == 0) {
-                    log.warn("  ✗ No text extracted from '{}'. Skipping.", file.getFileName());
-                    recordFailed(file, "No text could be extracted");
-                    failedCount++;
-                    failedPaths.add(file.toString());
-                    continue;
+                    if (result == null || result.chunkCount == 0) {
+                        log.warn("  ✗ No text extracted from '{}'. Skipping.", fileName);
+                        recordFailed(file, "No text could be extracted");
+                        failed.incrementAndGet();
+                        failedPaths.add(fileId);
+                    } else {
+                        recordSuccess(file, result.chunkCount, result.tokenCount);
+                        processed.incrementAndGet();
+                        totalChunksCtr.addAndGet(result.chunkCount);
+                        log.info("  ✓ {} chunks ({} tokens) embedded for '{}'",
+                                result.chunkCount, result.tokenCount, fileName);
+                    }
+                } catch (BudgetExceededException e) {
+                    log.warn("  ⚠ Skipping '{}': {}", fileName, e.getMessage());
+                    recordFailed(file, e.getMessage());
+                    failed.incrementAndGet();
+                    failedPaths.add(fileId);
+                } catch (Exception e) {
+                    log.error("  ✗ Failed '{}': {}", fileName, e.getMessage(), e);
+                    recordFailed(file, e.getMessage());
+                    failed.incrementAndGet();
+                    failedPaths.add(fileId);
+                } finally {
+                    lst.onFileEnd(fileId);
+                    lst.onProgress(processed.get(), total, failed.get(), null);
                 }
-
-                recordSuccess(file, result.chunkCount, result.tokenCount);
-                processedCount++;
-                totalChunks += result.chunkCount;
-                log.info("  ✓ {} chunks ({} tokens) embedded for '{}'",
-                        result.chunkCount, result.tokenCount, file.getFileName());
-
-            } catch (BudgetExceededException e) {
-                log.warn("  ⚠ Skipping '{}': {}", file.getFileName(), e.getMessage());
-                recordFailed(file, e.getMessage());
-                failedCount++;
-                failedPaths.add(file.toString());
-            } catch (Exception e) {
-                log.error("  ✗ Failed '{}': {}", file.getFileName(), e.getMessage(), e);
-                recordFailed(file, e.getMessage());
-                failedCount++;
-                failedPaths.add(file.toString());
-            }
+            }));
         }
+        pool.shutdown();
+        for (Future<?> f : futures) {
+            try { f.get(); } catch (Exception e) { log.warn("indexing worker error: {}", e.getMessage()); }
+        }
+
+        int processedCount = processed.get();
+        int failedCount    = failed.get();
+        int totalChunks    = totalChunksCtr.get();
 
         // Final tick at 100% so the UI can show the completed state cleanly
         // before the result card replaces the progress bar.
@@ -309,6 +343,11 @@ public final class IngestionPipeline {
     }
 
     private ProcessResult processFile(Path file) throws Exception {
+        return processFile(file, FileProgress.NOOP);
+    }
+
+    private ProcessResult processFile(Path file, FileProgress fp) throws Exception {
+        fp.stage("extracting", 0, 0);
         TextExtractor.ExtractionResult extraction = textExtractor.extract(file);
         if (extraction.isEmpty()) return null;
 
@@ -323,6 +362,7 @@ public final class IngestionPipeline {
         BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class);
         long lastModifiedMs = attrs.lastModifiedTime().toMillis();
 
+        fp.stage("chunking", 0, 0);
         List<DocumentChunk> chunks = textChunker.chunk(
                 extraction.text(), file, extraction.mimeType(), lastModifiedMs);
         if (chunks.isEmpty()) return null;
@@ -330,8 +370,9 @@ public final class IngestionPipeline {
         vectorStore.deleteBySourceFile(absolutePath);
 
         List<String>  texts      = chunks.stream().map(DocumentChunk::getText).toList();
-        List<float[]> embeddings = embeddingClient.embedBatch(texts);
+        List<float[]> embeddings = embedWithProgress(texts, fp);
 
+        fp.stage("saving", texts.size(), texts.size());
         vectorStore.upsert(chunks, embeddings);
 
         // Use the actual chunked text length for storage — slightly more
@@ -341,6 +382,28 @@ public final class IngestionPipeline {
         long actualTokens = Math.max(1L, actualChars / CHARS_PER_TOKEN);
 
         return new ProcessResult(chunks.size(), actualTokens);
+    }
+
+    /**
+     * Embeds the chunk texts in small sub-batches behind {@link #embedLock},
+     * reporting "embedded X / N" progress after each batch. Serialising here
+     * (rather than per-thread embedders) keeps one model in memory and avoids
+     * cores contending, since one embed call already saturates the CPU.
+     */
+    private List<float[]> embedWithProgress(List<String> texts, FileProgress fp) {
+        int total = texts.size();
+        fp.stage("embedding", 0, total);
+        List<float[]> out = new ArrayList<>(total);
+        for (int i = 0; i < total; i += EMBED_PROGRESS_BATCH) {
+            List<String> slice = texts.subList(i, Math.min(total, i + EMBED_PROGRESS_BATCH));
+            List<float[]> part;
+            synchronized (embedLock) {
+                part = embeddingClient.embedBatch(slice);
+            }
+            out.addAll(part);
+            fp.stage("embedding", out.size(), total);
+        }
+        return out;
     }
 
     /**
@@ -382,14 +445,32 @@ public final class IngestionPipeline {
     }
 
     /**
-     * Receives per-file progress events during a full {@link #run(ProgressListener)}.
-     * Called from the indexing thread — implementations must be cheap and
-     * non-blocking (storing to an AtomicReference is the expected pattern).
+     * Receives progress events during a full {@link #run(ProgressListener)}.
+     * Indexing is multi-threaded, so the per-file callbacks fire from several
+     * worker threads at once — implementations MUST be thread-safe and cheap
+     * (a ConcurrentHashMap + AtomicReference is the expected pattern).
+     *
+     * {@code onProgress} is the overall "X of N files" tick; the {@code onFile*}
+     * callbacks drive the live per-file status panel. {@code fileId} is the
+     * file's absolute path and is stable across that file's events.
      */
-    @FunctionalInterface
     public interface ProgressListener {
         void onProgress(int processed, int total, int failed, String currentFile);
+        /** A worker picked up this file. */
+        default void onFileStart(String fileId, String fileName) {}
+        /** Stage update for an in-flight file: extracting | chunking | embedding | saving. */
+        default void onFileStage(String fileId, String stage, int done, int total) {}
+        /** This file finished (success or failure) and should leave the panel. */
+        default void onFileEnd(String fileId) {}
         ProgressListener NOOP = (p, t, f, c) -> {};
+    }
+
+    /** Per-file stage callback handed to {@link #processFile} so it can report
+     *  "extracting / chunking / embedding X of N / saving" as it goes. */
+    @FunctionalInterface
+    public interface FileProgress {
+        void stage(String stage, int done, int total);
+        FileProgress NOOP = (s, d, t) -> {};
     }
 
     private void recordSuccess(Path file, int chunkCount, long tokenCount) {

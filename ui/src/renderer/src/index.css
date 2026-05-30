@@ -1601,6 +1601,39 @@ input:focus-visible {
   color: var(--text-4);
   margin-bottom: 8px;
 }
+
+/* ── Live indexing status modal ────────────────────────────────────────── */
+.prog-status-btn { margin-top: 12px; align-self: flex-start; }
+.status-card { max-width: 560px; width: 92%; }
+.status-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.status-item { display: flex; flex-direction: column; gap: 7px; }
+.status-item-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+.status-item-name {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.status-item-stage {
+  font-size: 11px;
+  color: var(--text-3);
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
 .file-list {
   list-style: none;
   margin: 0;

@@ -9,7 +9,7 @@ const AppCtx = createContext(null)
 const IDLE_POLL_MS  = 30_000
 // While an indexing job is running, poll /api/index more aggressively so the
 // progress UI in Library and the "Indexing…" label in the Sidebar stay live.
-const BUSY_POLL_MS  = 2_200
+const BUSY_POLL_MS  = 1_200
 
 export function AppProvider({ children }) {
   const [apiBase,   setApiBase]   = useState(null)
@@ -21,6 +21,7 @@ export function AppProvider({ children }) {
   const [indexing, setIndexing] = useState(false)
   const [lastJob,  setLastJob]  = useState(null) // { ok, data?, msg? }
   const [progress, setProgress] = useState(null) // { processed, total, failed, currentFile }
+  const [activeFiles, setActiveFiles] = useState([]) // [{ name, stage, done, total, path }] in flight
 
   // Device-identity state. Mirrors what /device/bootstrap returns.
   //   checked        — false until bootstrap completes
@@ -91,13 +92,16 @@ export function AppProvider({ children }) {
       if (!api) return
       try {
         const s = await api.pollIndex()
-        // Surface per-file progress every tick so the bar moves smoothly.
+        // Surface overall + per-file progress every tick so the bar and the
+        // status panel stay live.
         setProgress(s.progress ?? null)
+        setActiveFiles(s.activeFiles ?? [])
         if (!s.running) {
           clearInterval(busyTimer.current)
           busyTimer.current = null
           setIndexing(false)
           setProgress(null)
+          setActiveFiles([])
           if (s.result) { setLastJob({ ok: true,  data: s.result }); toast('Indexing complete', 's') }
           if (s.error)  { setLastJob({ ok: false, msg:  s.error  }); toast('Indexing failed', 'e') }
           loadStats()
@@ -107,6 +111,7 @@ export function AppProvider({ children }) {
         busyTimer.current = null
         setIndexing(false)
         setProgress(null)
+        setActiveFiles([])
       }
     }, BUSY_POLL_MS)
   }, [api, loadStats, toast])
@@ -172,7 +177,7 @@ export function AppProvider({ children }) {
       api, apiBase, setApiBase,
       connected, setConnected,
       toast, toasts,
-      stats, indexing, progress, lastJob,
+      stats, indexing, progress, activeFiles, lastJob,
       loadStats, triggerIndex,
       auth, logout, refreshAuth,
     }}>

@@ -87,6 +87,11 @@ public final class ApiServer {
     private final AtomicBoolean                    indexingRunning = new AtomicBoolean(false);
     private final AtomicReference<IndexingStatus>  indexingStatus  = new AtomicReference<>(null);
     private final AtomicReference<IndexingProgress> currentProgress = new AtomicReference<>(null);
+    // Live per-file status for the "View status" panel, keyed by absolute path.
+    // Files are added when a worker picks them up and removed when they finish,
+    // so this only ever holds the files currently being indexed (never skipped
+    // or completed ones).
+    private final Map<String, Map<String, Object>> fileStatuses = new ConcurrentHashMap<>();
     private final ExecutorService                bgExecutor      = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "shelfbot-indexing");
         t.setDaemon(true);
@@ -272,6 +277,19 @@ public final class ApiServer {
                 p.put("currentFile", prog.currentFile);
                 body.put("progress", p);
             }
+            // Live per-file status for the "View status" panel. Snapshot the
+            // map, attach each file's path, and sort by name so the list is
+            // stable between polls. Empty when nothing is in flight.
+            if (s == null || s.running) {
+                List<Map<String, Object>> active = new ArrayList<>();
+                for (Map.Entry<String, Map<String, Object>> e : fileStatuses.entrySet()) {
+                    Map<String, Object> m = new LinkedHashMap<>(e.getValue());
+                    m.put("path", e.getKey());
+                    active.add(m);
+                }
+                active.sort(Comparator.comparing(m -> String.valueOf(m.get("name"))));
+                body.put("activeFiles", active);
+            }
             sendJson(ex, 200, body);
             return;
         }
@@ -285,6 +303,7 @@ public final class ApiServer {
 
         indexingStatus.set(new IndexingStatus(true, null, null));
         currentProgress.set(null);
+        fileStatuses.clear();
 
         bgExecutor.submit(() -> {
             try {
@@ -292,9 +311,32 @@ public final class ApiServer {
                 IngestionPipeline pipeline = new IngestionPipeline(fresh, metadataStore, vectorStore, embeddingClient);
                 // Note: embeddingClient already wraps tokenStore via Main, so
                 // proxy-mode embedding calls see the active JWT automatically.
-                IngestionResult result = pipeline.run((processed, total, failed, currentFile) ->
-                        currentProgress.set(new IndexingProgress(processed, total, failed, currentFile))
-                );
+                // The per-file callbacks fire from multiple worker threads, so
+                // everything here writes only thread-safe structures.
+                IngestionResult result = pipeline.run(new IngestionPipeline.ProgressListener() {
+                    @Override public void onProgress(int processed, int total, int failed, String currentFile) {
+                        currentProgress.set(new IndexingProgress(processed, total, failed, currentFile));
+                    }
+                    @Override public void onFileStart(String fileId, String fileName) {
+                        Map<String, Object> m = new ConcurrentHashMap<>();
+                        m.put("name", fileName);
+                        m.put("stage", "starting");
+                        m.put("done", 0);
+                        m.put("total", 0);
+                        fileStatuses.put(fileId, m);
+                    }
+                    @Override public void onFileStage(String fileId, String stage, int done, int total) {
+                        Map<String, Object> m = fileStatuses.get(fileId);
+                        if (m != null) {
+                            m.put("stage", stage);
+                            m.put("done", done);
+                            m.put("total", total);
+                        }
+                    }
+                    @Override public void onFileEnd(String fileId) {
+                        fileStatuses.remove(fileId);
+                    }
+                });
                 indexingStatus.set(new IndexingStatus(false, result, null));
             } catch (Throwable t) {
                 log.error("Indexing job failed", t);
@@ -302,6 +344,7 @@ public final class ApiServer {
                 indexingStatus.set(new IndexingStatus(false, null, msg));
             } finally {
                 currentProgress.set(null);
+                fileStatuses.clear();
                 indexingRunning.set(false);
             }
         });

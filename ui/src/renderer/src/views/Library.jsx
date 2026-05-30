@@ -378,6 +378,79 @@ function SummaryModal({ file, data, error, loading, onClose }) {
   )
 }
 
+// ── Live indexing status modal ──────────────────────────────────────────────
+
+function stageLabel(f) {
+  switch (f.stage) {
+    case 'extracting': return 'Extracting text…'
+    case 'chunking':   return 'Chunking…'
+    case 'embedding':  return `Embedding ${f.done ?? 0}/${f.total ?? 0} chunks`
+    case 'saving':     return 'Saving…'
+    default:           return 'Starting…'
+  }
+}
+
+/**
+ * Shows the files currently being indexed and how far along each one is.
+ * Driven by the `activeFiles` snapshot from /api/index — skipped and finished
+ * files are never in that list, so they never appear here.
+ */
+function IndexStatusModal({ files, onClose }) {
+  useEffect(() => {
+    const onKey = e => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  return (
+    <div className="summary-overlay" onClick={onClose}>
+      <div className="summary-card status-card" onClick={e => e.stopPropagation()}>
+        <div className="summary-head">
+          <div className="summary-head-main">
+            <div className="summary-head-title">Indexing status</div>
+            <div className="summary-head-sub">
+              {files.length === 0
+                ? 'Finishing up…'
+                : `${files.length} file${files.length === 1 ? '' : 's'} in progress`}
+            </div>
+          </div>
+          <button className="summary-close" onClick={onClose} aria-label="Close status">
+            <CloseIconSm />
+          </button>
+        </div>
+
+        <div className="summary-body">
+          {files.length === 0 ? (
+            <div className="files-panel-empty">No files are being indexed right now.</div>
+          ) : (
+            <ul className="status-list">
+              {files.map(f => {
+                const det = f.stage === 'embedding' && f.total > 0
+                const pct = det ? Math.min(100, Math.round((f.done / f.total) * 100)) : null
+                return (
+                  <li key={f.path} className="status-item" title={f.path}>
+                    <div className="status-item-top">
+                      <span className="status-item-name">{f.name}</span>
+                      <span className="status-item-stage">{stageLabel(f)}</span>
+                    </div>
+                    {det ? (
+                      <div className="prog-bg-real">
+                        <div className="prog-fill-real" style={{ width: `${pct}%` }} />
+                      </div>
+                    ) : (
+                      <div className="prog-bg"><div className="prog-fill" /></div>
+                    )}
+                  </li>
+                )
+              })}
+            </ul>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── Indexed files panel ─────────────────────────────────────────────────────
 
 function IndexedFilesPanel({ api, connected, refreshKey, onDeleted, toast }) {
@@ -528,7 +601,7 @@ function IndexedFilesPanel({ api, connected, refreshKey, onDeleted, toast }) {
 export default function Library({ active, onGoSettings }) {
   const {
     api, connected,
-    stats, indexing, progress,
+    stats, indexing, progress, activeFiles,
     lastJob: result,
     loadStats, triggerIndex: handleIndex,
     toast,
@@ -538,6 +611,10 @@ export default function Library({ active, onGoSettings }) {
   // job finishes or after the user deletes a file.
   const [filesRefreshKey, setFilesRefreshKey] = useState(0)
   const bumpFiles = useCallback(() => setFilesRefreshKey(k => k + 1), [])
+
+  // "View status" modal — auto-closes when the job finishes.
+  const [showStatus, setShowStatus] = useState(false)
+  useEffect(() => { if (!indexing) setShowStatus(false) }, [indexing])
 
   useEffect(() => {
     if (active && connected) loadStats()
@@ -681,6 +758,12 @@ export default function Library({ active, onGoSettings }) {
                   </div>
                 </>
               )}
+              <button
+                className="btn-ghost btn-sm prog-status-btn"
+                onClick={() => setShowStatus(true)}
+              >
+                View status{activeFiles.length > 0 ? ` (${activeFiles.length})` : ''}
+              </button>
             </div>
           )}
 
@@ -728,6 +811,10 @@ export default function Library({ active, onGoSettings }) {
           toast={toast}
         />
       </div>
+
+      {showStatus && (
+        <IndexStatusModal files={activeFiles} onClose={() => setShowStatus(false)} />
+      )}
     </div>
   )
 }

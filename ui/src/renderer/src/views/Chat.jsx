@@ -1,4 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { useApp } from '../context/AppContext'
 import BookshelfIcon from '../components/BookshelfIcon'
 import Mascot       from '../components/Mascot'
@@ -63,6 +65,53 @@ const CloseIcon = () => (
     <line x1="6" y1="6" x2="18" y2="18"/>
   </svg>
 )
+
+const CopyIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+    <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+  </svg>
+)
+const CheckIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+    <polyline points="20 6 9 17 4 12"/>
+  </svg>
+)
+const MailIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+    <rect x="2" y="4" width="20" height="16" rx="2"/>
+    <polyline points="22 6 12 13 2 6"/>
+  </svg>
+)
+
+// Renders an assistant answer as markdown (tables, lists, code, bold via GFM).
+// Links open in the user's browser, not inside the app window.
+function MarkdownView({ text }) {
+  return (
+    <div className="md">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ href, children }) => (
+            <a
+              href={href}
+              onClick={(e) => {
+                e.preventDefault()
+                if (!href) return
+                if (window.electron?.openExternal) window.electron.openExternal(href)
+                else window.open(href, '_blank')
+              }}
+            >
+              {children}
+            </a>
+          ),
+        }}
+      >
+        {text || ''}
+      </ReactMarkdown>
+    </div>
+  )
+}
 
 // Renders message text, wrapping each (case-insensitive) match of `query` in a
 // <mark>; the match whose running global index equals `activeMatch` gets the
@@ -146,15 +195,41 @@ function SourceChip({ source, onOpen }) {
   )
 }
 
-function Message({ role, text, sources = [], variant, onOpenSource,
+function Message({ role, text, sources = [], variant, onOpenSource, streaming = false,
                    highlight = '', occOffset = 0, activeMatch = -1, activeRef }) {
+  const [copied, setCopied] = useState(false)
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text || '')
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch { /* clipboard unavailable */ }
+  }
+
+  const email = () => {
+    const url = `mailto:?subject=${encodeURIComponent('Rudo — analysis')}&body=${encodeURIComponent(text || '')}`
+    if (window.electron?.openExternal) window.electron.openExternal(url)
+    else window.location.href = url
+  }
+
+  // While finding (⌘F) we fall back to plain highlighted text so matches can
+  // be marked; otherwise assistant turns render as rich markdown.
+  const body = highlight
+    ? renderHighlighted(text, highlight, occOffset, activeMatch, activeRef)
+    : role === 'ai'
+      ? <MarkdownView text={text} />
+      : text
+
+  // Copy/Email only on a finished, normal answer (not while streaming, not on
+  // error/not-found notices).
+  const showActions = role === 'ai' && !streaming && !variant && (text || '').trim().length > 0
+
   return (
     <div className={`msg-row ${role}`}>
       {role === 'ai' ? <AiAvatar /> : <UserAvatar />}
       <div className="msg-content">
-        <div className={`msg-bubble${variant ? ` ${variant}` : ''}`}>
-          {highlight ? renderHighlighted(text, highlight, occOffset, activeMatch, activeRef) : text}
-        </div>
+        <div className={`msg-bubble${variant ? ` ${variant}` : ''}`}>{body}</div>
         {sources.length > 0 && (
           <div className="msg-sources">
             {sources.map((s, i) => (
@@ -164,6 +239,18 @@ function Message({ role, text, sources = [], variant, onOpenSource,
                 onOpen={onOpenSource}
               />
             ))}
+          </div>
+        )}
+        {showActions && (
+          <div className="msg-actions">
+            <button className="msg-action" onClick={copy} title="Copy response">
+              {copied ? <CheckIcon /> : <CopyIcon />}
+              <span>{copied ? 'Copied' : 'Copy'}</span>
+            </button>
+            <button className="msg-action" onClick={email} title="Email this response">
+              <MailIcon />
+              <span>Email</span>
+            </button>
           </div>
         )}
       </div>
@@ -451,6 +538,7 @@ export default function Chat({ active }) {
                 text={m.text}
                 sources={m.sources}
                 variant={m.variant}
+                streaming={m.streaming}
                 onOpenSource={openSource}
                 highlight={findOpen ? findQuery.trim() : ''}
                 occOffset={find.offsets[i] || 0}

@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import { useApp } from '../context/AppContext'
 import BookshelfIcon from '../components/BookshelfIcon'
 import Mascot       from '../components/Mascot'
@@ -39,6 +39,59 @@ const ArrowRightIcon = () => (
     <polyline points="12 5 19 12 12 19"/>
   </svg>
 )
+
+const PlusIcon = () => (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <line x1="12" y1="5" x2="12" y2="19"/>
+    <line x1="5" y1="12" x2="19" y2="12"/>
+  </svg>
+)
+
+const ChevronUpIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <polyline points="18 15 12 9 6 15"/>
+  </svg>
+)
+const ChevronDownIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <polyline points="6 9 12 15 18 9"/>
+  </svg>
+)
+const CloseIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <line x1="18" y1="6" x2="6" y2="18"/>
+    <line x1="6" y1="6" x2="18" y2="18"/>
+  </svg>
+)
+
+// Renders message text, wrapping each (case-insensitive) match of `query` in a
+// <mark>; the match whose running global index equals `activeMatch` gets the
+// active style + ref so the find bar can scroll it into view.
+function renderHighlighted(text, query, occOffset, activeMatch, activeRef) {
+  if (!query || !text) return text
+  const lower = text.toLowerCase()
+  const ql = query.toLowerCase()
+  const nodes = []
+  let i = 0, key = 0, occ = occOffset
+  while (true) {
+    const idx = lower.indexOf(ql, i)
+    if (idx === -1) { nodes.push(text.slice(i)); break }
+    if (idx > i) nodes.push(text.slice(i, idx))
+    const isActive = occ === activeMatch
+    nodes.push(
+      <mark
+        key={key++}
+        className={`find-hit${isActive ? ' find-active' : ''}`}
+        ref={isActive ? activeRef : null}
+      >
+        {text.slice(idx, idx + query.length)}
+      </mark>
+    )
+    occ++
+    i = idx + query.length
+  }
+  return nodes
+}
 
 function AiAvatar() {
   return (
@@ -93,12 +146,15 @@ function SourceChip({ source, onOpen }) {
   )
 }
 
-function Message({ role, text, sources = [], variant, onOpenSource }) {
+function Message({ role, text, sources = [], variant, onOpenSource,
+                   highlight = '', occOffset = 0, activeMatch = -1, activeRef }) {
   return (
     <div className={`msg-row ${role}`}>
       {role === 'ai' ? <AiAvatar /> : <UserAvatar />}
       <div className="msg-content">
-        <div className={`msg-bubble${variant ? ` ${variant}` : ''}`}>{text}</div>
+        <div className={`msg-bubble${variant ? ` ${variant}` : ''}`}>
+          {highlight ? renderHighlighted(text, highlight, occOffset, activeMatch, activeRef) : text}
+        </div>
         {sources.length > 0 && (
           <div className="msg-sources">
             {sources.map((s, i) => (
@@ -134,34 +190,35 @@ function TypingIndicator() {
 }
 
 export default function Chat({ active }) {
-  const { api, connected, toast, refreshAuth } = useApp()
+  const {
+    api, connected, toast, refreshAuth,
+    activeConversationId, setActiveConversationId, newConversation, refreshConversations,
+  } = useApp()
   const [messages, setMessages]   = useState([])
   const [input,    setInput]      = useState('')
   const [loading,  setLoading]    = useState(false)
   const [justAnswered, setJustAnswered] = useState(false)
   const msgsRef  = useRef(null)
   const inputRef = useRef(null)
+  // Which conversation's messages are currently displayed. Lets us skip a
+  // reload when we *adopt* a freshly-created thread after sending (the
+  // messages are already on screen) vs. when the user *picks* a thread.
+  const loadedIdRef = useRef(null)
 
-  // Keep focus in the chat input whenever this view is active. So:
-  //   • on view mount / activation → cursor lands in the input
-  //   • after submitting a prompt   → cursor returns to the input even
-  //     though the answer is still loading. We don't disable the input
-  //     during loading anymore (see disabled prop below), so the user
-  //     can immediately type their next question and it'll send the
-  //     moment the current one finishes.
+  // In-chat find (⌘F)
+  const [findOpen,    setFindOpen]    = useState(false)
+  const [findQuery,   setFindQuery]   = useState('')
+  const [activeMatch, setActiveMatch] = useState(0)
+  const findInputRef   = useRef(null)
+  const activeMatchRef = useRef(null)
+
+  // Keep focus in the chat input whenever this view is active.
   useEffect(() => {
     if (active && inputRef.current) {
-      // Defer one tick so React has actually mounted the input before
-      // we try to grab focus (otherwise focus() silently no-ops).
       setTimeout(() => inputRef.current?.focus(), 0)
     }
   }, [active])
 
-  // Pick the right Rudo mood based on chat state.
-  //   loading      → thinking (orbit dots, eyes closed)
-  //   justAnswered → happy for 2s (eyes squint, brief bounce)
-  //   input typed  → listening (tech-colored aura)
-  //   else         → idle (gentle breathing)
   const mascotState = loading
     ? 'thinking'
     : justAnswered
@@ -176,21 +233,83 @@ export default function Chat({ active }) {
     }
   }, [messages, loading])
 
+  // Load a thread's messages when the user selects it in the sidebar. Skips
+  // the case where activeConversationId already matches what's on screen.
+  useEffect(() => {
+    if (activeConversationId === loadedIdRef.current) return
+    let cancelled = false
+    ;(async () => {
+      if (!activeConversationId) {
+        loadedIdRef.current = null
+        setMessages([])
+        return
+      }
+      try {
+        const { messages: stored } = await api.getConversation(activeConversationId)
+        if (cancelled) return
+        loadedIdRef.current = activeConversationId
+        setMessages((stored || []).map(m => {
+          let sources
+          if (m.sources) { try { sources = JSON.parse(m.sources) } catch { sources = undefined } }
+          return { role: m.role === 'assistant' ? 'ai' : 'user', text: m.content, sources }
+        }))
+      } catch (e) {
+        if (!cancelled) toast(e.message, 'e')
+      }
+    })()
+    return () => { cancelled = true }
+  }, [activeConversationId, api, toast])
+
+  // ── In-chat find (⌘F) ──────────────────────────────────────────────────────
+  const closeFind = useCallback(() => { setFindOpen(false); setFindQuery('') }, [])
+
+  useEffect(() => {
+    if (!active) return
+    const onKey = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'f') {
+        e.preventDefault()
+        setFindOpen(true)
+        setTimeout(() => findInputRef.current?.select(), 0)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [active])
+
+  // Running match offset per message + total, used to index highlights.
+  const find = useMemo(() => {
+    const q = findOpen ? findQuery.trim().toLowerCase() : ''
+    if (!q) return { total: 0, offsets: [] }
+    let total = 0
+    const offsets = messages.map(m => {
+      const off = total
+      if (m.text) {
+        const t = m.text.toLowerCase()
+        let i = t.indexOf(q)
+        while (i !== -1) { total++; i = t.indexOf(q, i + q.length) }
+      }
+      return off
+    })
+    return { total, offsets }
+  }, [messages, findQuery, findOpen])
+
+  useEffect(() => { setActiveMatch(0) }, [findQuery])
+  useEffect(() => {
+    if (findOpen) activeMatchRef.current?.scrollIntoView({ block: 'center' })
+  }, [activeMatch, findOpen, find.total])
+
+  const gotoMatch = useCallback((dir) => {
+    setActiveMatch(a => (find.total === 0 ? 0 : (a + dir + find.total) % find.total))
+  }, [find.total])
+
   const sendMessage = useCallback(async (question) => {
     if (!question?.trim() || !connected || loading) return
 
     setInput('')
     setMessages(m => [...m, { role: 'user', text: question }])
     setLoading(true)
-    // Return focus to the input the moment the user submits so they can
-    // start typing the next prompt without clicking back into the field.
-    // We still gate the actual send below on !loading so we don't fire
-    // two requests in parallel.
     setTimeout(() => inputRef.current?.focus(), 0)
 
-    // Push a placeholder AI bubble that we'll grow as tokens arrive.
-    // The streaming callback updates the LAST message's text field, so the
-    // bubble appears to type itself in real time.
     setMessages(m => [...m, { role: 'ai', text: '', streaming: true }])
 
     const appendToken = (chunk) => {
@@ -217,9 +336,13 @@ export default function Chat({ active }) {
 
     await new Promise((resolve) => {
       api.queryStream(question, {
+        conversationId: activeConversationId,
         onToken: appendToken,
-        onDone:  ({ sources = [], found = true }) => {
+        onDone:  ({ sources = [], found = true, conversationId: cid }) => {
           finalize({ sources, variant: !found ? 'not-found' : undefined })
+          // Adopt the thread id without triggering a reload of the messages
+          // we just streamed (loadedIdRef is set before the state update).
+          if (cid) { loadedIdRef.current = cid; setActiveConversationId(cid) }
           resolve()
         },
         onError: (err) => {
@@ -233,20 +356,11 @@ export default function Chat({ active }) {
     setJustAnswered(true)
     setTimeout(() => setJustAnswered(false), 2200)
     refreshAuth()
-  }, [api, connected, loading, refreshAuth])
+    refreshConversations() // surface the new/updated thread + auto-title in the rail
+  }, [api, connected, loading, refreshAuth, activeConversationId, setActiveConversationId, refreshConversations])
 
   const handleKey = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(input) }
-  }
-
-  const clearChat = async () => {
-    try {
-      await api.clearConvo()
-      setMessages([])
-      toast('Conversation cleared', 'i')
-    } catch (e) {
-      toast(e.message, 'e')
-    }
   }
 
   const openSource = useCallback(async (absolutePath, fileName) => {
@@ -263,6 +377,26 @@ export default function Chat({ active }) {
 
   return (
     <div className={`view${active ? ' active' : ''}`} id="view-chat">
+      {findOpen && (
+        <div className="find-bar">
+          <input
+            ref={findInputRef}
+            className="find-input"
+            type="text"
+            placeholder="Find in chat…"
+            value={findQuery}
+            onChange={e => setFindQuery(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter') { e.preventDefault(); gotoMatch(e.shiftKey ? -1 : 1) }
+              else if (e.key === 'Escape') { e.preventDefault(); closeFind() }
+            }}
+          />
+          <span className="find-count">{find.total ? `${activeMatch + 1}/${find.total}` : '0/0'}</span>
+          <button className="find-btn" onClick={() => gotoMatch(-1)} disabled={!find.total} title="Previous (⇧↵)"><ChevronUpIcon /></button>
+          <button className="find-btn" onClick={() => gotoMatch(1)}  disabled={!find.total} title="Next (↵)"><ChevronDownIcon /></button>
+          <button className="find-btn" onClick={closeFind} title="Close (Esc)"><CloseIcon /></button>
+        </div>
+      )}
       {hasMessages && (
         <>
           <div className="view-header">
@@ -271,11 +405,8 @@ export default function Chat({ active }) {
               <div className="view-subtitle">Conversation with your library</div>
             </div>
             <div className="header-actions">
-              <button className="icon-btn" onClick={clearChat} title="Clear conversation">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                  <polyline points="1 4 1 10 7 10"/>
-                  <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
-                </svg>
+              <button className="icon-btn" onClick={newConversation} title="New chat">
+                <PlusIcon />
               </button>
             </div>
           </div>
@@ -311,8 +442,6 @@ export default function Chat({ active }) {
       ) : (
         <div className="messages" ref={msgsRef}>
           {messages.map((m, i) => (
-            // Show the typing indicator instead of an empty bubble at the
-            // start of a streaming response (no tokens have landed yet).
             m.role === 'ai' && m.streaming && !m.text ? (
               <TypingIndicator key={i} />
             ) : (
@@ -323,6 +452,10 @@ export default function Chat({ active }) {
                 sources={m.sources}
                 variant={m.variant}
                 onOpenSource={openSource}
+                highlight={findOpen ? findQuery.trim() : ''}
+                occOffset={find.offsets[i] || 0}
+                activeMatch={activeMatch}
+                activeRef={activeMatchRef}
               />
             )
           ))}
@@ -331,8 +464,6 @@ export default function Chat({ active }) {
 
       <div className="chat-input-area">
         <div className="input-row">
-          {/* Small live-reacting Rudo next to the input. Only shown when the
-              user is mid-conversation so it doesn't compete with the big hero. */}
           {hasMessages && (
             <Mascot size="md" state={mascotState} className="chat-input-mascot" />
           )}
@@ -344,9 +475,6 @@ export default function Chat({ active }) {
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={handleKey}
-              // Stays enabled during loading so the cursor lives here
-              // and the next prompt can be typed. Only disabled when the
-              // backend is fully unreachable.
               disabled={!connected}
             />
           </div>

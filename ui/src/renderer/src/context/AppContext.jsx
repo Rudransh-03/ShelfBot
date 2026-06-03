@@ -23,6 +23,12 @@ export function AppProvider({ children }) {
   const [progress, setProgress] = useState(null) // { processed, total, failed, currentFile }
   const [activeFiles, setActiveFiles] = useState([]) // [{ name, stage, done, total, path }] in flight
 
+  // Saved chat threads — shared by the Sidebar (list/search/select) and the
+  // Chat view (load/send). activeConversationId === null means a fresh,
+  // not-yet-persisted chat.
+  const [conversations, setConversations] = useState([])
+  const [activeConversationId, setActiveConversationId] = useState(null)
+
   // Device-identity state. Mirrors what /device/bootstrap returns.
   //   checked        — false until bootstrap completes
   //   registered     — does this install have a valid JWT?
@@ -129,6 +135,34 @@ export function AppProvider({ children }) {
     }
   }, [api, indexing, startBusyPolling, toast])
 
+  // ── Chat threads ──────────────────────────────────────────────────────────
+  const refreshConversations = useCallback(async () => {
+    if (!api) return
+    try {
+      const { conversations: list } = await api.listConversations()
+      setConversations(list || [])
+    } catch { /* non-fatal: leave the list as-is */ }
+  }, [api])
+
+  const newConversation  = useCallback(() => setActiveConversationId(null), [])
+  const openConversation = useCallback((id) => setActiveConversationId(id), [])
+
+  const renameConversation = useCallback(async (id, title) => {
+    try { await api.renameConversation(id, title); refreshConversations() }
+    catch (e) { toast(e.message, 'e') }
+  }, [api, refreshConversations, toast])
+
+  const deleteConversation = useCallback(async (id) => {
+    try {
+      await api.deleteConversation(id)
+      setActiveConversationId(cur => (cur === id ? null : cur))
+      refreshConversations()
+    } catch (e) { toast(e.message, 'e') }
+  }, [api, refreshConversations, toast])
+
+  // Load the thread list once the backend is reachable.
+  useEffect(() => { if (connected) refreshConversations() }, [connected, refreshConversations])
+
   // On connect: fetch status immediately, then keep a slow background refresh
   // running so lastIndexed stays current (this is what the future file watcher
   // will piggyback on for free). The same tick also refreshes /me so the
@@ -180,6 +214,9 @@ export function AppProvider({ children }) {
       stats, indexing, progress, activeFiles, lastJob,
       loadStats, triggerIndex,
       auth, logout, refreshAuth,
+      conversations, activeConversationId, setActiveConversationId,
+      refreshConversations, newConversation, openConversation,
+      renameConversation, deleteConversation,
     }}>
       {children}
     </AppCtx.Provider>

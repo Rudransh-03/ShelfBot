@@ -6,6 +6,7 @@ import LoadingOverlay from './components/LoadingOverlay'
 import ToastContainer from './components/Toast'
 import UpdateBanner   from './components/UpdateBanner'
 import WelcomeModal   from './components/WelcomeModal'
+import SearchModal    from './components/SearchModal'
 import BackgroundFX   from './components/BackgroundFX'
 import Chat           from './views/Chat'
 import Library        from './views/Library'
@@ -21,10 +22,23 @@ function Shell() {
   const [loadMsg,   setLoadMsg]   = useState('Starting up…')
   const [loaded,    setLoaded]    = useState(false)
   const [view,      setView]      = useState('chat')
+  const [searchOpen, setSearchOpen] = useState(false)
   const [collapsed, setCollapsed] = useState(
     // Remember the user's preference between sessions
     () => localStorage.getItem('rudo.sidebar.collapsed') === 'true'
   )
+
+  // ⌘K / Ctrl+K → global chat search palette.
+  useEffect(() => {
+    const onKey = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault()
+        setSearchOpen(true)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
 
   function toggleCollapsed() {
     setCollapsed(c => {
@@ -77,6 +91,7 @@ function Shell() {
             connected={connected}
             collapsed={collapsed}
             onToggle={toggleCollapsed}
+            onOpenSearch={() => setSearchOpen(true)}
           />
           <div className="content">
             <Chat     active={view === 'chat'} />
@@ -86,6 +101,13 @@ function Shell() {
           </div>
         </div>
       </div>
+
+      {searchOpen && (
+        <SearchModal
+          onClose={() => setSearchOpen(false)}
+          onNavigate={() => setView('chat')}
+        />
+      )}
 
       <ToastContainer />
       <WelcomeModal />

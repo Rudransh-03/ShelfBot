@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.localfilebrain.auth.AuthTokenStore;
 import com.localfilebrain.config.AppConfig;
 import com.localfilebrain.embedding.EmbeddingClient;
+import com.localfilebrain.chat.ChatStore;
 import com.localfilebrain.ingestion.IndexMetadataStore;
 import com.localfilebrain.ingestion.IngestionPipeline;
 import com.localfilebrain.ingestion.TextExtractor;
@@ -83,6 +84,14 @@ public final class ApiServer {
     // OpenAI key is not yet configured.
     private volatile QueryEngine queryEngine;
 
+    // Local, on-device chat persistence (ChatGPT-style threads). Lazily opened
+    // so server startup never depends on it.
+    private volatile ChatStore chatStore;
+
+    // Serializes the rehydrate→query→persist sequence so concurrent requests
+    // can't interleave on the engine's swapped-in conversation history.
+    private final Object queryLock = new Object();
+
     // ── Indexing job state ────────────────────────────────────────────────────
     private final AtomicBoolean                    indexingRunning = new AtomicBoolean(false);
     private final AtomicReference<IndexingStatus>  indexingStatus  = new AtomicReference<>(null);
@@ -138,6 +147,8 @@ public final class ApiServer {
     public void stop() {
         server.stop(2);
         bgExecutor.shutdown();
+        ChatStore cs = chatStore;
+        if (cs != null) cs.close();
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -151,6 +162,7 @@ public final class ApiServer {
         server.createContext("/api/query",        this::handleQuery);
         server.createContext("/api/query/stream", this::handleQueryStream);
         server.createContext("/api/conversation", this::handleConversation);
+        server.createContext("/api/conversations", this::handleConversations);
         server.createContext("/api/config",       this::handleConfig);
         server.createContext("/api/files/summary", this::handleFileSummary);
         server.createContext("/api/files",        this::handleFiles);
@@ -366,13 +378,16 @@ public final class ApiServer {
                 return;
             }
 
-            QueryEngine engine = getOrInitQueryEngine();
-            QueryEngine.QueryResult result = engine.query(question);
+            getOrInitQueryEngine(); // surface config errors before creating a thread
+            String convId = resolveConversation(req.get("conversationId"), question);
+            QueryEngine.QueryResult result =
+                    answerInConversation(convId, question, e -> e.query(question));
 
             sendJson(ex, 200, map(
-                "answer",  result.answer(),
-                "sources", result.sourceFiles(),
-                "found",   result.found()
+                "answer",         result.answer(),
+                "sources",        result.sourceFiles(),
+                "found",          result.found(),
+                "conversationId", convId
             ));
         } catch (AppConfig.ConfigurationException e) {
             sendError(ex, 503, "OpenAI API key not configured: " + e.getMessage());
@@ -402,9 +417,11 @@ public final class ApiServer {
 
         // Read + validate request body before opening the stream.
         String question;
+        Object conversationIdRaw = null;
         try {
             Map<?, ?> req = readJson(ex);
             question = (String) req.get("question");
+            conversationIdRaw = req.get("conversationId");
             if (question == null || question.isBlank()) {
                 sendError(ex, 400, "question is required");
                 return;
@@ -426,17 +443,21 @@ public final class ApiServer {
         OutputStream out = ex.getResponseBody();
 
         try {
-            QueryEngine engine = getOrInitQueryEngine();
-            QueryEngine.QueryResult result = engine.queryStream(question, token -> {
-                try {
-                    writeSseEvent(out, "token", token);
-                } catch (IOException ignored) { /* client disconnected — outer try cleans up */ }
-            });
+            getOrInitQueryEngine(); // surface config errors before creating a thread
+            String convId = resolveConversation(conversationIdRaw, question);
+            QueryEngine.QueryResult result = answerInConversation(convId, question, engine ->
+                engine.queryStream(question, token -> {
+                    try {
+                        writeSseEvent(out, "token", token);
+                    } catch (IOException ignored) { /* client disconnected — outer try cleans up */ }
+                }));
 
-            // Final summary event with sources + found flag, encoded as JSON.
+            // Final summary event with sources + found flag + the thread id
+            // (lets the UI adopt a freshly-created conversation), encoded as JSON.
             Map<String, Object> summary = new LinkedHashMap<>();
-            summary.put("found",   result.found());
-            summary.put("sources", result.sourceFiles());
+            summary.put("found",          result.found());
+            summary.put("sources",        result.sourceFiles());
+            summary.put("conversationId", convId);
             writeSseEvent(out, "done", mapper.writeValueAsString(summary));
 
         } catch (Exception e) {
@@ -477,6 +498,62 @@ public final class ApiServer {
             sendJson(ex, 200, map("cleared", true));
         } catch (Exception e) {
             sendError(ex, 503, "QueryEngine not available: " + e.getMessage());
+        }
+    }
+
+    /**
+     * REST for chat threads — all local, on-device (never sent to the proxy):
+     *   GET    /api/conversations         list threads (most-recent first)
+     *   POST   /api/conversations         create { title? } → { id, title }
+     *   GET    /api/conversations/{id}     thread messages
+     *   POST   /api/conversations/{id}     rename { title }
+     *   DELETE /api/conversations/{id}     delete thread + its messages
+     */
+    private void handleConversations(HttpExchange ex) throws IOException {
+        if (preflight(ex)) return;
+        try {
+            ChatStore cs = chatStore();
+            String base = "/api/conversations";
+            String path = ex.getRequestURI().getPath();
+            String id = path.length() > base.length() ? path.substring(base.length() + 1) : "";
+            if (id.endsWith("/")) id = id.substring(0, id.length() - 1);
+
+            if (id.isEmpty()) {
+                if (isMethod(ex, "GET")) {
+                    String q = queryParam(ex, "q");
+                    if (q != null && !q.isBlank()) {
+                        // Command-palette search: results carry a match snippet.
+                        sendJson(ex, 200, map("results", cs.searchWithSnippets(q, 30)));
+                    } else {
+                        sendJson(ex, 200, map("conversations", cs.listConversations()));
+                    }
+                } else if (isMethod(ex, "POST")) {
+                    Object t = readJson(ex).get("title");
+                    String title = (t instanceof String s && !s.isBlank()) ? s.trim() : "New chat";
+                    String newId = cs.createConversation(title);
+                    sendJson(ex, 200, map("id", newId, "title", title));
+                } else {
+                    methodNotAllowed(ex);
+                }
+                return;
+            }
+
+            if (!cs.exists(id)) { sendError(ex, 404, "conversation not found"); return; }
+            if (isMethod(ex, "GET")) {
+                sendJson(ex, 200, map("id", id, "messages", cs.getMessages(id)));
+            } else if (isMethod(ex, "DELETE")) {
+                cs.deleteConversation(id);
+                sendJson(ex, 200, map("deleted", true));
+            } else if (isMethod(ex, "POST")) {
+                Object t = readJson(ex).get("title");
+                cs.renameConversation(id, t instanceof String s ? s : null);
+                sendJson(ex, 200, map("renamed", true));
+            } else {
+                methodNotAllowed(ex);
+            }
+        } catch (Exception e) {
+            log.warn("/api/conversations failed", e);
+            sendError(ex, 500, e.getMessage());
         }
     }
 
@@ -709,6 +786,73 @@ public final class ApiServer {
             }
         }
         return queryEngine;
+    }
+
+    /** Lazy chat-thread store, opened beside the index metadata DB. */
+    private ChatStore chatStore() {
+        if (chatStore != null) return chatStore;
+        synchronized (this) {
+            if (chatStore == null) {
+                Path path = config.getMetadataDbPath()
+                        .toAbsolutePath()
+                        .resolveSibling("shelfbot-chats.db");
+                chatStore = new ChatStore(path);
+            }
+        }
+        return chatStore;
+    }
+
+    /**
+     * Resolves the conversation a query belongs to. Reuses the id the client
+     * sent if it still exists; otherwise opens a fresh thread titled from the
+     * first question. Returns the id to hand back to the UI.
+     */
+    private String resolveConversation(Object conversationIdRaw, String question) {
+        ChatStore cs = chatStore();
+        String convId = conversationIdRaw instanceof String s ? s : null;
+        if (convId != null && cs.exists(convId)) return convId;
+        return cs.createConversation(deriveTitle(question));
+    }
+
+    /** First line / ~6 words of the opening question, capped, as a thread title. */
+    private static String deriveTitle(String question) {
+        String t = question.strip().replaceAll("\\s+", " ");
+        if (t.length() > 60) t = t.substring(0, 60).strip() + "…";
+        return t.isEmpty() ? "New chat" : t;
+    }
+
+    /**
+     * Rehydrates the engine with a thread's recent history and persists the
+     * user turn, then runs {@code answerer}, persists the assistant turn, and
+     * returns its result. Serialized so the shared engine's swapped-in history
+     * stays consistent across concurrent requests.
+     */
+    private QueryEngine.QueryResult answerInConversation(
+            String convId, String question,
+            java.util.function.Function<QueryEngine, QueryEngine.QueryResult> answerer) {
+        synchronized (queryLock) {
+            ChatStore cs = chatStore();
+            QueryEngine engine = getOrInitQueryEngine();
+            engine.resetHistory();
+            for (ChatStore.Exchange e : cs.getRecentExchanges(convId, 20)) {
+                engine.addHistoryExchange(e.question(), e.answer());
+            }
+            cs.addMessage(convId, "user", question);
+            QueryEngine.QueryResult result = answerer.apply(engine);
+            cs.addMessage(convId, "assistant", result.answer(), sourcesToJson(result.sourceFiles()));
+            return result;
+        }
+    }
+
+    /** Serializes source chips for storage; null/failure → no stored sources. */
+    private String sourcesToJson(Object sources) {
+        if (sources == null) return null;
+        try {
+            return mapper.writeValueAsString(sources);
+        } catch (Exception e) {
+            log.debug("Could not serialize sources for persistence: {}", e.getMessage());
+            return null;
+        }
     }
 
     /**
@@ -1212,6 +1356,21 @@ public final class ApiServer {
     private Map<?, ?> readJson(HttpExchange ex) throws IOException {
         byte[] body = ex.getRequestBody().readAllBytes();
         return mapper.readValue(body, Map.class);
+    }
+
+    /** Reads a single decoded query-string parameter, or null if absent. */
+    private static String queryParam(HttpExchange ex, String key) {
+        String raw = ex.getRequestURI().getQuery();
+        if (raw == null || raw.isEmpty()) return null;
+        for (String pair : raw.split("&")) {
+            int i = pair.indexOf('=');
+            String k = i >= 0 ? pair.substring(0, i) : pair;
+            if (k.equals(key)) {
+                String v = i >= 0 ? pair.substring(i + 1) : "";
+                return java.net.URLDecoder.decode(v, java.nio.charset.StandardCharsets.UTF_8);
+            }
+        }
+        return null;
     }
 
     private void sendJson(HttpExchange ex, int status, Object body) throws IOException {

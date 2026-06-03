@@ -143,10 +143,19 @@ public final class QueryEngine {
             "quote", "as written", "exact"
     };
 
+    // Number of recent question-answer exchanges kept as LLM context. For the
+    // per-conversation chat feature this is rehydrated from ChatStore before
+    // each query (see resetHistory/addHistoryExchange), so it bounds how far
+    // back a single thread "remembers".
+    private static final int HISTORY_SIZE = 20;
+
     private final EmbeddingClient     embeddingClient;
     private final VectorStore         vectorStore;
     private final GPT4oMiniClient     llmClient;
-    private final ConversationHistory history;
+    // Non-final + volatile: swapped per request so each chat thread gets its
+    // own rehydrated context. Mutations are guarded by the caller (ApiServer
+    // serializes load→query→persist), keeping the shared engine consistent.
+    private volatile ConversationHistory history;
     private final boolean             ownsVectorStore;
     private final boolean             ownsEmbeddingClient;
 
@@ -189,12 +198,27 @@ public final class QueryEngine {
             this.ownsVectorStore = true;
         }
         this.llmClient = new GPT4oMiniClient(config, tokenStore);
-        this.history   = new ConversationHistory(15);
+        this.history   = new ConversationHistory(HISTORY_SIZE);
     }
 
     public void close() {
         if (ownsVectorStore)     vectorStore.close();
         if (ownsEmbeddingClient) embeddingClient.close();
+    }
+
+    /**
+     * Replaces the active conversation context with an empty one. Called
+     * before rehydrating a specific chat thread's history via
+     * {@link #addHistoryExchange}. Distinct from {@link #clearHistory()},
+     * which the legacy single-conversation endpoint uses to wipe state.
+     */
+    public synchronized void resetHistory() {
+        this.history = new ConversationHistory(HISTORY_SIZE);
+    }
+
+    /** Appends a stored exchange while rehydrating a thread's context. */
+    public synchronized void addHistoryExchange(String question, String answer) {
+        this.history.add(question, answer);
     }
 
     /**

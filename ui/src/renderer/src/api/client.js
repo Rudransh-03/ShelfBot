@@ -17,7 +17,7 @@ export class ApiClient {
   status()          { return this._r('/api/status') }
   startIndex()      { return this._r('/api/index', { method: 'POST' }) }
   pollIndex()       { return this._r('/api/index') }
-  query(q)          { return this._r('/api/query', { method: 'POST', body: JSON.stringify({ question: q }) }) }
+  query(q, conversationId) { return this._r('/api/query', { method: 'POST', body: JSON.stringify({ question: q, conversationId }) }) }
 
   /**
    * Streaming chat query. POSTs to /api/query/stream and pipes the SSE
@@ -28,14 +28,14 @@ export class ApiClient {
    *
    * Returns a function that can be called to abort the stream early.
    */
-  queryStream(q, { onToken, onDone, onError }) {
+  queryStream(q, { onToken, onDone, onError, conversationId }) {
     const ctrl = new AbortController()
     ;(async () => {
       try {
         const res = await fetch(this.base + '/api/query/stream', {
           method:  'POST',
           headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
-          body:    JSON.stringify({ question: q }),
+          body:    JSON.stringify({ question: q, conversationId }),
           signal:  ctrl.signal,
         })
         if (!res.ok || !res.body) {
@@ -90,6 +90,21 @@ export class ApiClient {
     return () => ctrl.abort()
   }
   clearConvo()      { return this._r('/api/conversation', { method: 'DELETE' }) }
+
+  // ── Chat threads (local, on-device) ──────────────────────────────────────
+  /** All saved chat threads, most-recently-updated first. */
+  listConversations()          { return this._r('/api/conversations') }
+  /** Threads whose title or any message contains the keywords. */
+  searchConversations(q)       { return this._r(`/api/conversations?q=${encodeURIComponent(q)}`) }
+  /** Creates an empty thread. Returns { id, title }. */
+  createConversation(title)    { return this._r('/api/conversations', { method: 'POST', body: JSON.stringify({ title }) }) }
+  /** Full message history for one thread: { id, messages: [{role, content, createdAt}] }. */
+  getConversation(id)          { return this._r(`/api/conversations/${id}`) }
+  /** Renames a thread. */
+  renameConversation(id, title){ return this._r(`/api/conversations/${id}`, { method: 'POST', body: JSON.stringify({ title }) }) }
+  /** Deletes a thread and its messages. */
+  deleteConversation(id)       { return this._r(`/api/conversations/${id}`, { method: 'DELETE' }) }
+
   getConfig()       { return this._r('/api/config') }
   /**
    * Persists the indexed roots.

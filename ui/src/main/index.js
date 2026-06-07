@@ -6,6 +6,7 @@ import { createServer } from 'net'
 import { machineIdSync } from 'node-machine-id'
 import { randomUUID }    from 'crypto'
 import { promisify }     from 'util'
+import { buildCalendar } from './ics.js'
 
 const execFileP = promisify(execFile)
 
@@ -416,6 +417,34 @@ ipcMain.handle('open-path', async (_event, filePath) => {
   if (!existsSync(filePath)) return 'File no longer exists at: ' + filePath
   const err = await shell.openPath(filePath)
   return err || ''
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Calendar reminders — OS-agnostic via the iCalendar (.ics) standard
+// ─────────────────────────────────────────────────────────────────────────────
+// .ics generation lives in ./ics.js (dependency-free so it's unit-testable).
+
+// Create one or more calendar reminders. payload: { events: [{title, description,
+// date 'YYYY-MM-DD', time 'HH:MM', leadDays, recurring, sourceFile}] }.
+// Batching many events into one .ics means "Set all" is a single calendar import.
+ipcMain.handle('reminder:create', async (_e, payload) => {
+  try {
+    const events = Array.isArray(payload?.events)
+      ? payload.events
+      : (payload && payload.date ? [payload] : [])
+    if (events.length === 0) return { ok: false, error: 'No events to add' }
+
+    const ics  = buildCalendar(events)
+    const file = join(app.getPath('temp'), `rudo-reminder-${Date.now()}.ics`)
+    writeFileSync(file, ics, 'utf8')
+
+    const err = await shell.openPath(file)   // '' on success
+    if (err) return { ok: false, error: err }
+    return { ok: true, count: events.length }
+  } catch (e) {
+    console.error('[ShelfBot] reminder:create failed:', e.message)
+    return { ok: false, error: e.message }
+  }
 })
 
 ipcMain.on('window-minimize', () => mainWindow?.minimize())

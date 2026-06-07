@@ -71,6 +71,20 @@ public final class IngestionPipeline {
      *  every core for one call, so concurrent embeds would only contend. */
     private final Object embedLock = new Object();
 
+    // Per-file locks (striped), STATIC so they're shared across every pipeline
+    // instance in this JVM — the manual index job, the live FileWatcher, and the
+    // startup rescan. Without this, two of them could index the same file at once
+    // and interleave the vector-store delete+add, leaving duplicate chunks. The
+    // lock serialises per-file work so the second thread waits, then skips after
+    // re-checking that the file is already up-to-date. Striped (not one lock per
+    // path) to bound memory; same path always maps to the same stripe.
+    private static final int LOCK_STRIPES = 64;
+    private static final Object[] FILE_LOCKS = new Object[LOCK_STRIPES];
+    static { for (int i = 0; i < LOCK_STRIPES; i++) FILE_LOCKS[i] = new Object(); }
+    private static Object fileLock(String canonicalPath) {
+        return FILE_LOCKS[Math.floorMod(canonicalPath.hashCode(), LOCK_STRIPES)];
+    }
+
     private final AppConfig          config;
     private final IndexMetadataStore metadataStore;
     private final FileScanner        fileScanner;
@@ -212,20 +226,26 @@ public final class IngestionPipeline {
                 String fileName = file.getFileName().toString();
                 lst.onFileStart(fileId, fileName);
                 try {
-                    ProcessResult result = processFile(file,
+                    FileOutcome outcome = indexFileGuarded(file,
                             (stage, done, tot) -> lst.onFileStage(fileId, stage, done, tot));
 
-                    if (result == null || result.chunkCount == 0) {
-                        log.warn("  ✗ No text extracted from '{}'. Skipping.", fileName);
-                        recordFailed(file, "No text could be extracted");
-                        failed.incrementAndGet();
-                        failedPaths.add(fileId);
-                    } else {
-                        recordSuccess(file, result.chunkCount, result.tokenCount);
-                        processed.incrementAndGet();
-                        totalChunksCtr.addAndGet(result.chunkCount);
-                        log.info("  ✓ {} chunks ({} tokens) embedded for '{}'",
-                                result.chunkCount, result.tokenCount, fileName);
+                    switch (outcome.state()) {
+                        case INDEXED -> {
+                            processed.incrementAndGet();
+                            totalChunksCtr.addAndGet(outcome.chunkCount());
+                            log.info("  ✓ {} chunks ({} tokens) embedded for '{}'",
+                                    outcome.chunkCount(), outcome.tokenCount(), fileName);
+                        }
+                        case SKIPPED ->
+                            // Another path (watcher/startup) indexed this exact file
+                            // first; not a failure, just nothing to do.
+                            log.info("  ↦ '{}' already indexed concurrently — skipped", fileName);
+                        case EMPTY -> {
+                            log.warn("  ✗ No text extracted from '{}'. Skipping.", fileName);
+                            recordFailed(file, "No text could be extracted");
+                            failed.incrementAndGet();
+                            failedPaths.add(fileId);
+                        }
                     }
                 } catch (BudgetExceededException e) {
                     log.warn("  ⚠ Skipping '{}': {}", fileName, e.getMessage());
@@ -290,31 +310,19 @@ public final class IngestionPipeline {
      */
     public int indexOne(Path file) {
         try {
-            BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class);
-            String absolutePath  = PathNormalizer.canonical(file);
-            long   lastModified  = attrs.lastModifiedTime().toMillis();
-
-            if (metadataStore.isUpToDateByTimestamp(absolutePath, lastModified)) {
-                return 0;
+            FileOutcome outcome = indexFileGuarded(file, FileProgress.NOOP);
+            switch (outcome.state()) {
+                case INDEXED -> {
+                    log.info("[watcher] re-indexed '{}' ({} chunks, {} tokens)",
+                            file.getFileName(), outcome.chunkCount(), outcome.tokenCount());
+                    return outcome.chunkCount();
+                }
+                case EMPTY -> {
+                    recordFailed(file, "No text could be extracted");
+                    return 0;
+                }
+                default -> { return 0; } // SKIPPED — already up-to-date
             }
-
-            // Timestamp moved — confirm content actually changed before paying for embeddings.
-            String hash = com.localfilebrain.util.FileHashUtil.sha256(file);
-            if (metadataStore.isUpToDateByHash(absolutePath, hash)) {
-                metadataStore.updateTimestamp(absolutePath, lastModified);
-                return 0;
-            }
-
-            ProcessResult result = processFile(file);
-            if (result == null || result.chunkCount == 0) {
-                recordFailed(file, "No text could be extracted");
-                return 0;
-            }
-            recordSuccess(file, result.chunkCount, result.tokenCount);
-            log.info("[watcher] re-indexed '{}' ({} chunks, {} tokens)",
-                    file.getFileName(), result.chunkCount, result.tokenCount);
-            return result.chunkCount;
-
         } catch (BudgetExceededException e) {
             log.warn("[watcher] skipped '{}': {}", file.getFileName(), e.getMessage());
             recordFailed(file, e.getMessage());
@@ -339,6 +347,45 @@ public final class IngestionPipeline {
             log.info("[watcher] removed '{}' from index", file.getFileName());
         } catch (Exception e) {
             log.warn("[watcher] failed to remove '{}': {}", file, e.getMessage());
+        }
+    }
+
+    /**
+     * Indexes a single file under its per-file lock, so the manual job, the live
+     * watcher, and the startup rescan can never process the same file at the same
+     * time. Re-checks "already up-to-date" INSIDE the lock (another thread may
+     * have just finished it while we waited) and skips if so — preventing both
+     * duplicate chunks and redundant re-embedding of identical content.
+     */
+    private FileOutcome indexFileGuarded(Path file, FileProgress fp) throws Exception {
+        String absolutePath = PathNormalizer.canonical(file);
+        synchronized (fileLock(absolutePath)) {
+            // Re-check under the lock: a concurrent path may have just brought this
+            // exact file up-to-date — if so, do nothing.
+            try {
+                BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class);
+                long lastModified = attrs.lastModifiedTime().toMillis();
+                if (metadataStore.isUpToDateByTimestamp(absolutePath, lastModified)) {
+                    return FileOutcome.SKIPPED;
+                }
+                String hash = FileHashUtil.sha256(file);
+                if (metadataStore.isUpToDateByHash(absolutePath, hash)) {
+                    metadataStore.updateTimestamp(absolutePath, lastModified);
+                    return FileOutcome.SKIPPED;
+                }
+            } catch (IOException stat) {
+                // Couldn't stat/hash (e.g. file vanished) — let processFile surface
+                // the real error instead of masking it as "skipped".
+            }
+
+            ProcessResult result = processFile(file, fp);
+            if (result == null || result.chunkCount == 0) {
+                return FileOutcome.EMPTY;
+            }
+            // Commit metadata INSIDE the lock so any thread waiting on this same
+            // file then sees it up-to-date and skips.
+            recordSuccess(file, result.chunkCount, result.tokenCount);
+            return FileOutcome.indexed(result.chunkCount, result.tokenCount);
         }
     }
 
@@ -367,13 +414,13 @@ public final class IngestionPipeline {
                 extraction.text(), file, extraction.mimeType(), lastModifiedMs);
         if (chunks.isEmpty()) return null;
 
-        vectorStore.deleteBySourceFile(absolutePath);
-
         List<String>  texts      = chunks.stream().map(DocumentChunk::getText).toList();
         List<float[]> embeddings = embedWithProgress(texts, fp);
 
         fp.stage("saving", texts.size(), texts.size());
-        vectorStore.upsert(chunks, embeddings);
+        // Atomic delete-old + add-new so a concurrent re-index of the same file
+        // can't interleave and leave duplicate chunks.
+        vectorStore.replaceBySourceFile(absolutePath, chunks, embeddings);
 
         // Use the actual chunked text length for storage — slightly more
         // accurate than the pre-chunk estimate (the chunker may trim
@@ -439,6 +486,16 @@ public final class IngestionPipeline {
     }
 
     private record ProcessResult(int chunkCount, long tokenCount) {}
+
+    /** Outcome of a guarded single-file index attempt. */
+    private enum IndexState { INDEXED, SKIPPED, EMPTY }
+    private record FileOutcome(IndexState state, int chunkCount, long tokenCount) {
+        static final FileOutcome SKIPPED = new FileOutcome(IndexState.SKIPPED, 0, 0);
+        static final FileOutcome EMPTY   = new FileOutcome(IndexState.EMPTY,   0, 0);
+        static FileOutcome indexed(int chunkCount, long tokenCount) {
+            return new FileOutcome(IndexState.INDEXED, chunkCount, tokenCount);
+        }
+    }
 
     public static class BudgetExceededException extends RuntimeException {
         public BudgetExceededException(String message) { super(message); }

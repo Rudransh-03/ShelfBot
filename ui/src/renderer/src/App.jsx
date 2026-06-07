@@ -10,6 +10,7 @@ import SearchModal    from './components/SearchModal'
 import BackgroundFX   from './components/BackgroundFX'
 import Chat           from './views/Chat'
 import Library        from './views/Library'
+import Deadlines      from './views/Deadlines'
 import Organize       from './views/Organize'
 import Settings       from './views/Settings'
 
@@ -94,9 +95,10 @@ function Shell() {
             onOpenSearch={() => setSearchOpen(true)}
           />
           <div className="content">
-            <Chat     active={view === 'chat'} />
-            <Library  active={view === 'lib'}  onGoSettings={() => setView('set')} />
-            <Organize active={view === 'org'} />
+            <Chat      active={view === 'chat'} />
+            <Library   active={view === 'lib'}  onGoSettings={() => setView('set')} />
+            <Deadlines active={view === 'due'} />
+            <Organize  active={view === 'org'} />
             <Settings active={view === 'set'} />
           </div>
         </div>

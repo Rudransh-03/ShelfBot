@@ -117,6 +117,51 @@ public final class IndexMetadataStore implements AutoCloseable {
                 )
                 """);
 
+            // Cross-document deadline intelligence. document_deadlines holds the
+            // extracted items (one row per deadline/renewal/action); deadline_scan
+            // is the per-file "scanned at this content hash" marker so the scan
+            // is incremental and never re-pays for an unchanged file (even one
+            // that yielded zero deadlines); deadline_usage is a client-side daily
+            // counter that paces LLM calls so a big library scan can't burn the
+            // whole day's budget in one go. All three are invalidated for a file
+            // on re-index / delete (see upsert/delete), exactly like the summary
+            // cache, so a changed document is re-scanned next pass.
+            stmt.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS document_deadlines (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    absolute_path  TEXT    NOT NULL,
+                    file_name      TEXT    NOT NULL,
+                    content_hash   TEXT    NOT NULL,
+                    title          TEXT    NOT NULL,
+                    description    TEXT,
+                    due_date       TEXT,
+                    kind           TEXT    NOT NULL DEFAULT 'ACTION',
+                    confidence     TEXT    NOT NULL DEFAULT 'MEDIUM',
+                    recurring      TEXT    NOT NULL DEFAULT 'NONE',
+                    status         TEXT    NOT NULL DEFAULT 'PENDING',
+                    reminder_set   INTEGER NOT NULL DEFAULT 0,
+                    source_excerpt TEXT,
+                    created_at     TEXT    NOT NULL,
+                    updated_at     TEXT    NOT NULL
+                )
+                """);
+            stmt.executeUpdate("CREATE INDEX IF NOT EXISTS idx_deadlines_path ON document_deadlines(absolute_path)");
+            stmt.executeUpdate("CREATE INDEX IF NOT EXISTS idx_deadlines_status ON document_deadlines(status)");
+            stmt.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS deadline_scan (
+                    absolute_path TEXT    PRIMARY KEY,
+                    content_hash  TEXT    NOT NULL,
+                    item_count    INTEGER NOT NULL DEFAULT 0,
+                    scanned_at    TEXT    NOT NULL
+                )
+                """);
+            stmt.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS deadline_usage (
+                    date       TEXT    PRIMARY KEY,
+                    call_count INTEGER NOT NULL DEFAULT 0
+                )
+                """);
+
             // Undo log for executed reorg batches. One row per file move.
             // Written BEFORE the move actually happens so a crash mid-move
             // still leaves a recoverable record. The created_destination_dir
@@ -385,6 +430,10 @@ public final class IndexMetadataStore implements AutoCloseable {
         // any cached summary is stale — drop it. The summary will be
         // regenerated on next /api/files/summary request.
         deleteSummary(record.getAbsolutePath());
+        // Same staleness logic for extracted deadlines: a changed file may
+        // have entirely different dates, so drop its items and its scan marker
+        // — the deadline scan will re-extract this file on its next pass.
+        clearDeadlinesForFile(record.getAbsolutePath());
     }
 
     /**
@@ -441,6 +490,7 @@ public final class IndexMetadataStore implements AutoCloseable {
         }
         deleteFileVector(absolutePath);
         deleteSummary(absolutePath);
+        clearDeadlinesForFile(absolutePath);
     }
 
     // -------------------------------------------------------------------------
@@ -740,6 +790,315 @@ public final class IndexMetadataStore implements AutoCloseable {
         float[] out = new float[expectedDim];
         for (int i = 0; i < expectedDim; i++) out[i] = buf.getFloat();
         return out;
+    }
+
+    // -------------------------------------------------------------------------
+    // Cross-document deadlines
+    // -------------------------------------------------------------------------
+
+    /** A stored deadline/renewal/action row. */
+    public record DeadlineRow(long id,
+                              String absolutePath,
+                              String fileName,
+                              String contentHash,
+                              String title,
+                              String description,
+                              String dueDate,
+                              String kind,
+                              String confidence,
+                              String recurring,
+                              String status,
+                              boolean reminderSet,
+                              String sourceExcerpt,
+                              String createdAt,
+                              String updatedAt) {}
+
+    /** Input for inserting a freshly-extracted deadline (id/timestamps assigned by the store). */
+    public record NewDeadline(String title,
+                              String description,
+                              String dueDate,
+                              String kind,
+                              String confidence,
+                              String recurring,
+                              String sourceExcerpt) {}
+
+    /**
+     * Returns true if {@code absolutePath} has already been scanned for
+     * deadlines at its current {@code contentHash}. Lets the scan skip files
+     * that are unchanged since their last scan — even ones that yielded zero
+     * deadlines (so we never re-pay an LLM call for a deadline-free file).
+     */
+    public synchronized boolean isDeadlineScanned(String absolutePath, String contentHash) {
+        String sql = "SELECT content_hash FROM deadline_scan WHERE absolute_path = ?";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, absolutePath);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() && contentHash.equals(rs.getString("content_hash"));
+            }
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to check deadline scan for: " + absolutePath, e);
+        }
+    }
+
+    /**
+     * Atomically replaces a file's extracted deadlines and stamps it scanned at
+     * the given content hash. Preserves nothing of the prior rows — a file is
+     * only re-scanned when its content changed, so old items are stale by then.
+     * Done in a single transaction so a crash can't leave a "scanned" marker
+     * without its rows (or vice-versa).
+     */
+    public synchronized void replaceDeadlinesForFile(String absolutePath,
+                                                     String fileName,
+                                                     String contentHash,
+                                                     List<NewDeadline> items) {
+        String now = Instant.now().toString();
+        boolean priorAutoCommit = true;
+        try {
+            priorAutoCommit = connection.getAutoCommit();
+            connection.setAutoCommit(false);
+
+            try (PreparedStatement del = connection.prepareStatement(
+                    "DELETE FROM document_deadlines WHERE absolute_path = ?")) {
+                del.setString(1, absolutePath);
+                del.executeUpdate();
+            }
+
+            String ins = """
+                INSERT INTO document_deadlines
+                  (absolute_path, file_name, content_hash, title, description, due_date,
+                   kind, confidence, recurring, status, reminder_set, source_excerpt,
+                   created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, ?, ?, ?)
+                """;
+            try (PreparedStatement ps = connection.prepareStatement(ins)) {
+                for (NewDeadline d : items) {
+                    ps.setString(1,  absolutePath);
+                    ps.setString(2,  fileName);
+                    ps.setString(3,  contentHash);
+                    ps.setString(4,  d.title());
+                    ps.setString(5,  d.description());
+                    ps.setString(6,  d.dueDate());
+                    ps.setString(7,  d.kind());
+                    ps.setString(8,  d.confidence());
+                    ps.setString(9,  d.recurring());
+                    ps.setString(10, d.sourceExcerpt());
+                    ps.setString(11, now);
+                    ps.setString(12, now);
+                    ps.addBatch();
+                }
+                ps.executeBatch();
+            }
+
+            try (PreparedStatement scan = connection.prepareStatement("""
+                INSERT INTO deadline_scan (absolute_path, content_hash, item_count, scanned_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(absolute_path) DO UPDATE SET
+                  content_hash = excluded.content_hash,
+                  item_count   = excluded.item_count,
+                  scanned_at   = excluded.scanned_at
+                """)) {
+                scan.setString(1, absolutePath);
+                scan.setString(2, contentHash);
+                scan.setInt   (3, items.size());
+                scan.setString(4, now);
+                scan.executeUpdate();
+            }
+
+            connection.commit();
+        } catch (SQLException e) {
+            try { connection.rollback(); } catch (SQLException ignored) {}
+            throw new MetadataStoreException("Failed to store deadlines for: " + absolutePath, e);
+        } finally {
+            try { connection.setAutoCommit(priorAutoCommit); } catch (SQLException ignored) {}
+        }
+    }
+
+    /** Removes a file's extracted deadlines and its scan marker (invalidation). */
+    public synchronized void clearDeadlinesForFile(String absolutePath) {
+        try (PreparedStatement a = connection.prepareStatement(
+                "DELETE FROM document_deadlines WHERE absolute_path = ?");
+             PreparedStatement b = connection.prepareStatement(
+                "DELETE FROM deadline_scan WHERE absolute_path = ?")) {
+            a.setString(1, absolutePath); a.executeUpdate();
+            b.setString(1, absolutePath); b.executeUpdate();
+        } catch (SQLException e) {
+            // Best-effort invalidation — log and continue.
+            log.warn("Failed to clear deadlines for '{}': {}", absolutePath, e.getMessage());
+        }
+    }
+
+    /**
+     * Lists deadlines, optionally filtered by status (PENDING | DONE |
+     * DISMISSED). Null/blank/"all" returns every row. Ordered so the soonest
+     * dated item leads and undated items sort last.
+     */
+    public synchronized List<DeadlineRow> listDeadlines(String statusFilter) {
+        boolean filtered = statusFilter != null && !statusFilter.isBlank()
+                && !"all".equalsIgnoreCase(statusFilter);
+        String sql = "SELECT * FROM document_deadlines "
+                   + (filtered ? "WHERE status = ? " : "")
+                   + "ORDER BY (due_date IS NULL), due_date ASC, created_at ASC";
+        List<DeadlineRow> out = new ArrayList<>();
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            if (filtered) ps.setString(1, statusFilter.toUpperCase());
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) out.add(mapDeadline(rs));
+            }
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to list deadlines", e);
+        }
+        return out;
+    }
+
+    /** Single deadline by id. */
+    public synchronized Optional<DeadlineRow> getDeadline(long id) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT * FROM document_deadlines WHERE id = ?")) {
+            ps.setLong(1, id);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? Optional.of(mapDeadline(rs)) : Optional.empty();
+            }
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to get deadline " + id, e);
+        }
+    }
+
+    /** Count of PENDING deadlines — drives the sidebar badge. */
+    public synchronized int countPendingDeadlines() {
+        try (Statement st = connection.createStatement();
+             ResultSet rs = st.executeQuery(
+                     "SELECT COUNT(*) FROM document_deadlines WHERE status = 'PENDING'")) {
+            return rs.next() ? rs.getInt(1) : 0;
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to count pending deadlines", e);
+        }
+    }
+
+    /**
+     * Partial update of a deadline. Any null argument leaves that column
+     * unchanged; {@code reminderSet} is a {@link Boolean} so null means "don't
+     * touch". Returns true if a row was updated. {@code updated_at} is always
+     * refreshed when at least one field changes.
+     */
+    public synchronized boolean updateDeadline(long id,
+                                               String status,
+                                               Boolean reminderSet,
+                                               String title,
+                                               String description,
+                                               String dueDate,
+                                               String recurring) {
+        List<String> sets = new ArrayList<>();
+        List<Object> args = new ArrayList<>();
+        if (status      != null) { sets.add("status = ?");       args.add(status.toUpperCase()); }
+        if (reminderSet != null) { sets.add("reminder_set = ?"); args.add(reminderSet ? 1 : 0); }
+        if (title       != null) { sets.add("title = ?");        args.add(title); }
+        if (description != null) { sets.add("description = ?");  args.add(description); }
+        if (dueDate     != null) { sets.add("due_date = ?");     args.add(dueDate); }
+        if (recurring   != null) { sets.add("recurring = ?");    args.add(recurring.toUpperCase()); }
+        if (sets.isEmpty()) return false;
+        sets.add("updated_at = ?"); args.add(Instant.now().toString());
+
+        String sql = "UPDATE document_deadlines SET " + String.join(", ", sets) + " WHERE id = ?";
+        args.add(id);
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            for (int i = 0; i < args.size(); i++) ps.setObject(i + 1, args.get(i));
+            return ps.executeUpdate() > 0;
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to update deadline " + id, e);
+        }
+    }
+
+    /** Deletes one deadline. Returns true if a row was removed. */
+    public synchronized boolean deleteDeadline(long id) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "DELETE FROM document_deadlines WHERE id = ?")) {
+            ps.setLong(1, id);
+            return ps.executeUpdate() > 0;
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to delete deadline " + id, e);
+        }
+    }
+
+    /**
+     * Deletes one-time (non-recurring) deadlines whose due date is strictly
+     * before {@code todayIso} (YYYY-MM-DD) — they're past and no longer
+     * actionable. Recurring ones are NOT deleted here (they're rolled forward
+     * separately). ISO dates compare correctly as strings. Returns rows removed.
+     */
+    public synchronized int deleteOneTimePastDeadlines(String todayIso) {
+        String sql = "DELETE FROM document_deadlines "
+                   + "WHERE due_date IS NOT NULL AND due_date < ? "
+                   + "AND (recurring IS NULL OR recurring = 'NONE')";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, todayIso);
+            return ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to purge past one-time deadlines", e);
+        }
+    }
+
+    /** Recurring deadlines whose due date is strictly before {@code todayIso} — to be rolled forward. */
+    public synchronized List<DeadlineRow> listRecurringPastDeadlines(String todayIso) {
+        String sql = "SELECT * FROM document_deadlines "
+                   + "WHERE due_date IS NOT NULL AND due_date < ? "
+                   + "AND recurring IS NOT NULL AND recurring != 'NONE'";
+        List<DeadlineRow> out = new ArrayList<>();
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, todayIso);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) out.add(mapDeadline(rs));
+            }
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to list recurring past deadlines", e);
+        }
+        return out;
+    }
+
+    /** Today's deadline-extraction LLM call count for the given day key (0 if none). */
+    public synchronized int getDeadlineCallsToday(String dayKey) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT call_count FROM deadline_usage WHERE date = ?")) {
+            ps.setString(1, dayKey);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : 0;
+            }
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to read deadline usage", e);
+        }
+    }
+
+    /** Atomically increments the day's deadline-call counter and returns the new value. */
+    public synchronized int incrementDeadlineCallsToday(String dayKey) {
+        String sql = """
+            INSERT INTO deadline_usage (date, call_count) VALUES (?, 1)
+            ON CONFLICT(date) DO UPDATE SET call_count = call_count + 1
+            """;
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, dayKey);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to bump deadline usage", e);
+        }
+        return getDeadlineCallsToday(dayKey);
+    }
+
+    private DeadlineRow mapDeadline(ResultSet rs) throws SQLException {
+        return new DeadlineRow(
+                rs.getLong("id"),
+                rs.getString("absolute_path"),
+                rs.getString("file_name"),
+                rs.getString("content_hash"),
+                rs.getString("title"),
+                rs.getString("description"),
+                rs.getString("due_date"),
+                rs.getString("kind"),
+                rs.getString("confidence"),
+                rs.getString("recurring"),
+                rs.getString("status"),
+                rs.getInt("reminder_set") != 0,
+                rs.getString("source_excerpt"),
+                rs.getString("created_at"),
+                rs.getString("updated_at"));
     }
 
     // -------------------------------------------------------------------------

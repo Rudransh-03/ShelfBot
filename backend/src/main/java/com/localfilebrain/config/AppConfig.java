@@ -130,6 +130,17 @@ public final class AppConfig {
         return Paths.get(getOrDefault("metadata.db.path", "shelfbot-metadata.db"));
     }
 
+    /**
+     * Max deadline-extraction LLM calls per (UTC) day. Client-side pacing so a
+     * one-shot scan of a huge freshly-added library can't burn the whole day's
+     * budget at once — it processes this many batched calls, then resumes on the
+     * next pass once the day rolls over. Each call covers many documents (they're
+     * batched), so the per-day document throughput is far higher than this number.
+     */
+    public int getDeadlineDailyCallBudget() {
+        return getInt("deadline.daily.call.budget", 25);
+    }
+
     public int getChunkSizeChars() {
         return getInt("chunk.size.chars", 1800);
     }

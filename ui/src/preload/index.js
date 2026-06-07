@@ -10,6 +10,9 @@ contextBridge.exposeInMainWorld('electron', {
   onApiPort:      (cb)   => ipcRenderer.on('api-port', (_e, p) => cb(p)),
   platform:       process.platform,
 
+  // Calendar reminders (.ics — works on every OS with a calendar app)
+  createReminder: (payload) => ipcRenderer.invoke('reminder:create', payload),
+
   // Auto-updater
   onUpdateStatus:    (cb) => ipcRenderer.on('update-status', (_e, s) => cb(s)),
   installUpdate:     ()   => ipcRenderer.invoke('updater:install'),

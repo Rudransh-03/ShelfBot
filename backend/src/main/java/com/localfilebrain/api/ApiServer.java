@@ -3,6 +3,7 @@ package com.localfilebrain.api;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.localfilebrain.auth.AuthTokenStore;
 import com.localfilebrain.config.AppConfig;
+import com.localfilebrain.deadline.DeadlineScanService;
 import com.localfilebrain.embedding.EmbeddingClient;
 import com.localfilebrain.chat.ChatStore;
 import com.localfilebrain.ingestion.IndexMetadataStore;
@@ -107,6 +108,16 @@ public final class ApiServer {
         return t;
     });
 
+    // ── Deadline-scan job state (independent of indexing) ──────────────────────
+    private final AtomicBoolean                     deadlineScanRunning  = new AtomicBoolean(false);
+    private final AtomicReference<DeadlineScanState> deadlineScanStatus  = new AtomicReference<>(null);
+    private final AtomicReference<DeadlineProgress>  deadlineProgress    = new AtomicReference<>(null);
+    private final ExecutorService                   deadlineExecutor     = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "shelfbot-deadline-scan");
+        t.setDaemon(true);
+        return t;
+    });
+
     // ─────────────────────────────────────────────────────────────────────────
     // Constructor
     // ─────────────────────────────────────────────────────────────────────────
@@ -147,6 +158,7 @@ public final class ApiServer {
     public void stop() {
         server.stop(2);
         bgExecutor.shutdown();
+        deadlineExecutor.shutdown();
         ChatStore cs = chatStore;
         if (cs != null) cs.close();
     }
@@ -166,6 +178,8 @@ public final class ApiServer {
         server.createContext("/api/config",       this::handleConfig);
         server.createContext("/api/files/summary", this::handleFileSummary);
         server.createContext("/api/files",        this::handleFiles);
+        server.createContext("/api/deadlines/scan", this::handleDeadlineScan);
+        server.createContext("/api/deadlines",      this::handleDeadlines);
         server.createContext("/api/auth",         this::handleAuth);
         server.createContext("/api/reorg/preview", this::handleReorgPreview);
         server.createContext("/api/reorg/execute", this::handleReorgExecute);
@@ -770,6 +784,206 @@ public final class ApiServer {
             log.warn("/api/files/summary failed", e);
             sendError(ex, 500, e.getMessage());
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Deadlines (cross-document intelligence)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * POST /api/deadlines/scan — start an incremental scan of indexed files for
+     * deadlines (one batched LLM call per group of date-bearing documents).
+     * GET  /api/deadlines/scan — poll the running/last scan's status + progress.
+     *
+     * The scan is paced by a per-(UTC)-day call budget and stops cleanly on the
+     * upstream daily quota, so it's safe to call after every index — it simply
+     * resumes where it left off on the next pass.
+     */
+    private void handleDeadlineScan(HttpExchange ex) throws IOException {
+        if (preflight(ex)) return;
+
+        if (isMethod(ex, "GET")) {
+            Map<String, Object> body = new LinkedHashMap<>();
+            DeadlineScanState s = deadlineScanStatus.get();
+            body.put("running", deadlineScanRunning.get());
+            body.put("hasRun",  s != null);
+            if (s != null) {
+                body.put("stop",         s.stop);
+                body.put("message",      s.message);
+                body.put("filesScanned", s.filesScanned);
+                body.put("found",        s.found);
+            }
+            DeadlineProgress p = deadlineProgress.get();
+            if (p != null && deadlineScanRunning.get()) {
+                body.put("progress", map(
+                        "processed",   p.processed,
+                        "total",       p.total,
+                        "found",       p.found,
+                        "currentFile", p.currentFile));
+            }
+            sendJson(ex, 200, body);
+            return;
+        }
+
+        if (!isMethod(ex, "POST")) { methodNotAllowed(ex); return; }
+
+        if (!tokenStore.isAuthenticated()) {
+            sendError(ex, 401, "Please sign in to ShelfBot before scanning for deadlines.");
+            return;
+        }
+        if (!deadlineScanRunning.compareAndSet(false, true)) {
+            sendJson(ex, 409, map("error", "A deadline scan is already in progress"));
+            return;
+        }
+        deadlineProgress.set(null);
+
+        deadlineExecutor.submit(() -> {
+            try {
+                AppConfig fresh = AppConfig.load();
+                GPT4oMiniClient llm = new GPT4oMiniClient(fresh, tokenStore);
+                DeadlineScanService svc = new DeadlineScanService(metadataStore, vectorStore);
+                DeadlineScanService.ScanResult r = svc.scan(
+                        llm, fresh.getDeadlineDailyCallBudget(),
+                        (processed, total, found, currentFile) ->
+                                deadlineProgress.set(new DeadlineProgress(processed, total, found, currentFile)));
+                deadlineScanStatus.set(new DeadlineScanState(
+                        r.stop().name(), r.message(), r.filesScanned(), r.deadlinesFound()));
+                log.info("Deadline scan finished: {} ({} files, {} found, {} LLM calls)",
+                        r.stop(), r.filesScanned(), r.deadlinesFound(), r.llmCallsUsed());
+            } catch (Throwable t) {
+                log.error("Deadline scan failed", t);
+                String msg = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
+                deadlineScanStatus.set(new DeadlineScanState("ERROR", msg, 0, 0));
+            } finally {
+                deadlineProgress.set(null);
+                deadlineScanRunning.set(false);
+            }
+        });
+
+        sendJson(ex, 202, map("started", true));
+    }
+
+    /**
+     * GET    /api/deadlines           list items (+ computed buckets) and counts.
+     *                                  Optional ?status=pending|done|dismissed|all (default all).
+     * POST   /api/deadlines/{id}       partial update {status?, reminderSet?, title?, description?, dueDate?, recurring?}
+     * DELETE /api/deadlines/{id}       remove one item.
+     */
+    private void handleDeadlines(HttpExchange ex) throws IOException {
+        if (preflight(ex)) return;
+        try {
+            String base = "/api/deadlines";
+            String path = ex.getRequestURI().getPath();
+            String id   = path.length() > base.length() ? path.substring(base.length() + 1) : "";
+            if (id.endsWith("/")) id = id.substring(0, id.length() - 1);
+
+            if (id.isEmpty()) {
+                if (!isMethod(ex, "GET")) { methodNotAllowed(ex); return; }
+                String status = queryParam(ex, "status");
+                List<IndexMetadataStore.DeadlineRow> rows = metadataStore.listDeadlines(status);
+                java.time.LocalDate today = java.time.LocalDate.now();
+
+                List<Map<String, Object>> items = new ArrayList<>(rows.size());
+                int overdue = 0, dueSoon = 0, upcoming = 0, noDate = 0, pending = 0, withReminder = 0;
+                for (IndexMetadataStore.DeadlineRow r : rows) {
+                    Map<String, Object> m = serializeDeadline(r, today);
+                    items.add(m);
+                    if ("PENDING".equals(r.status())) pending++;
+                    if (r.reminderSet()) withReminder++;
+                    switch (String.valueOf(m.get("bucket"))) {
+                        case "OVERDUE"  -> overdue++;
+                        case "DUE_SOON" -> dueSoon++;
+                        case "UPCOMING" -> upcoming++;
+                        case "NO_DATE"  -> noDate++;
+                        default -> { }
+                    }
+                }
+                sendJson(ex, 200, map(
+                        "items",  items,
+                        "counts", map(
+                                "total",        rows.size(),
+                                "pending",      pending,
+                                "overdue",      overdue,
+                                "dueSoon",      dueSoon,
+                                "upcoming",     upcoming,
+                                "noDate",       noDate,
+                                "withReminder", withReminder)));
+                return;
+            }
+
+            long deadlineId;
+            try { deadlineId = Long.parseLong(id); }
+            catch (NumberFormatException e) { sendError(ex, 400, "invalid deadline id"); return; }
+
+            if (isMethod(ex, "DELETE")) {
+                boolean ok = metadataStore.deleteDeadline(deadlineId);
+                if (!ok) { sendError(ex, 404, "deadline not found"); return; }
+                sendJson(ex, 200, map("deleted", true));
+                return;
+            }
+
+            if (isMethod(ex, "POST")) {
+                Map<?, ?> body = readJson(ex);
+                String status      = strOrNull(body.get("status"));
+                Boolean reminder   = body.get("reminderSet") instanceof Boolean b ? b : null;
+                String title       = strOrNull(body.get("title"));
+                String description = strOrNull(body.get("description"));
+                String dueDate     = strOrNull(body.get("dueDate"));
+                String recurring   = strOrNull(body.get("recurring"));
+                if (status != null) {
+                    String up = status.toUpperCase();
+                    if (!up.equals("PENDING") && !up.equals("DONE") && !up.equals("DISMISSED")) {
+                        sendError(ex, 400, "status must be PENDING, DONE, or DISMISSED");
+                        return;
+                    }
+                }
+                boolean ok = metadataStore.updateDeadline(
+                        deadlineId, status, reminder, title, description, dueDate, recurring);
+                if (!ok) { sendError(ex, 404, "deadline not found or nothing to update"); return; }
+                sendJson(ex, 200, map("updated", true));
+                return;
+            }
+
+            methodNotAllowed(ex);
+        } catch (Exception e) {
+            log.warn("/api/deadlines failed", e);
+            sendError(ex, 500, e.getMessage());
+        }
+    }
+
+    /** Maps a stored deadline to JSON, adding computed daysUntil + bucket. */
+    private Map<String, Object> serializeDeadline(IndexMetadataStore.DeadlineRow r,
+                                                  java.time.LocalDate today) {
+        Long daysUntil = null;
+        String bucket  = "NO_DATE";
+        if (r.dueDate() != null && !r.dueDate().isBlank()) {
+            try {
+                java.time.LocalDate due = java.time.LocalDate.parse(r.dueDate());
+                long d = java.time.temporal.ChronoUnit.DAYS.between(today, due);
+                daysUntil = d;
+                bucket = d < 0 ? "OVERDUE" : d <= 7 ? "DUE_SOON" : "UPCOMING";
+            } catch (Exception ignored) { /* leave as NO_DATE */ }
+        }
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("id",            r.id());
+        m.put("path",          r.absolutePath());
+        m.put("fileName",      r.fileName());
+        m.put("title",         r.title());
+        m.put("description",   r.description());
+        m.put("dueDate",       r.dueDate());
+        m.put("kind",          r.kind());
+        m.put("confidence",    r.confidence());
+        m.put("recurring",     r.recurring());
+        m.put("status",        r.status());
+        m.put("reminderSet",   r.reminderSet());
+        m.put("sourceExcerpt", r.sourceExcerpt());
+        m.put("daysUntil",     daysUntil);
+        m.put("bucket",        bucket);
+        return m;
+    }
+
+    private static String strOrNull(Object o) {
+        return (o instanceof String s && !s.isBlank()) ? s.trim() : null;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1397,6 +1611,28 @@ public final class ApiServer {
     // ─────────────────────────────────────────────────────────────────────────
     // Indexing job status DTO
     // ─────────────────────────────────────────────────────────────────────────
+
+    /** Snapshot of the in-flight deadline scan, streamed via {@code progress} on /api/deadlines/scan GET. */
+    public static final class DeadlineProgress {
+        final int processed;
+        final int total;
+        final int found;
+        final String currentFile;
+        DeadlineProgress(int processed, int total, int found, String currentFile) {
+            this.processed = processed; this.total = total; this.found = found; this.currentFile = currentFile;
+        }
+    }
+
+    /** Terminal state of the last deadline scan. */
+    public static final class DeadlineScanState {
+        final String stop;        // COMPLETE | PAUSED_QUOTA | NOT_SIGNED_IN | ERROR
+        final String message;
+        final int    filesScanned;
+        final int    found;
+        DeadlineScanState(String stop, String message, int filesScanned, int found) {
+            this.stop = stop; this.message = message; this.filesScanned = filesScanned; this.found = found;
+        }
+    }
 
     /** Snapshot of the in-flight indexing job, streamed via {@code progress} on /api/index GET. */
     public static final class IndexingProgress {

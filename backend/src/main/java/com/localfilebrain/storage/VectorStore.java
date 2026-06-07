@@ -147,30 +147,61 @@ public final class VectorStore implements AutoCloseable {
         try {
             for (int i = 0; i < chunks.size(); i++) {
                 DocumentChunk chunk = chunks.get(i);
-                float[]       vec   = embeddings.get(i);
-
-                Document doc = new Document();
-                doc.add(new StringField(F_ID,        chunk.getChunkId(),        Field.Store.YES));
-                doc.add(new StringField(F_SRC_PATH,  chunk.getSourceFilePath(), Field.Store.YES));
-                doc.add(new StringField(F_FILE_NAME, chunk.getFileName(),       Field.Store.YES));
-                doc.add(new StoredField(F_TEXT,      chunk.getText()));
-                doc.add(new StoredField(F_MIME,      chunk.getMimeType()));
-                doc.add(new StoredField(F_MTIME,     chunk.getFileLastModifiedMs()));
-                doc.add(new StoredField(F_CHAR_CNT,  chunk.getCharCount()));
-                doc.add(new StoredField(F_CHUNK_IDX, chunk.getChunkIndex()));
-                doc.add(new StoredField(F_TOTAL,     chunk.getTotalChunks()));
-                // Indexed AND stored so we can both filter and retrieve.
-                doc.add(new IntPoint(F_CHUNK_IDX, chunk.getChunkIndex()));
-
-                doc.add(new KnnFloatVectorField(F_VECTOR, vec, VectorSimilarityFunction.COSINE));
-
-                writer.updateDocument(new Term(F_ID, chunk.getChunkId()), doc);
+                writer.updateDocument(new Term(F_ID, chunk.getChunkId()),
+                        buildChunkDoc(chunk, embeddings.get(i)));
             }
             writer.commit();
             searchers.maybeRefresh();
             log.debug("Upserted {} chunks", chunks.size());
         } catch (IOException e) {
             throw new VectorStoreException("Failed to upsert chunks", e);
+        }
+    }
+
+    /** Builds the Lucene document for one chunk. Shared by upsert + replaceBySourceFile. */
+    private static Document buildChunkDoc(DocumentChunk chunk, float[] vec) {
+        Document doc = new Document();
+        doc.add(new StringField(F_ID,        chunk.getChunkId(),        Field.Store.YES));
+        doc.add(new StringField(F_SRC_PATH,  chunk.getSourceFilePath(), Field.Store.YES));
+        doc.add(new StringField(F_FILE_NAME, chunk.getFileName(),       Field.Store.YES));
+        doc.add(new StoredField(F_TEXT,      chunk.getText()));
+        doc.add(new StoredField(F_MIME,      chunk.getMimeType()));
+        doc.add(new StoredField(F_MTIME,     chunk.getFileLastModifiedMs()));
+        doc.add(new StoredField(F_CHAR_CNT,  chunk.getCharCount()));
+        doc.add(new StoredField(F_CHUNK_IDX, chunk.getChunkIndex()));
+        doc.add(new StoredField(F_TOTAL,     chunk.getTotalChunks()));
+        // Indexed AND stored so we can both filter and retrieve.
+        doc.add(new IntPoint(F_CHUNK_IDX, chunk.getChunkIndex()));
+        doc.add(new KnnFloatVectorField(F_VECTOR, vec, VectorSimilarityFunction.COSINE));
+        return doc;
+    }
+
+    /**
+     * Atomically replaces all chunks of one source file — deletes the file's
+     * existing chunks and writes the new ones in a single synchronized,
+     * single-commit operation. Because the whole delete+add pair holds the
+     * writer monitor, two threads re-indexing the SAME file (e.g. the live
+     * watcher and a manual job) can never interleave their delete/add and leave
+     * duplicate chunks: one fully replaces the other.
+     */
+    public synchronized void replaceBySourceFile(String absoluteFilePath,
+                                                 List<DocumentChunk> chunks,
+                                                 List<float[]> embeddings) {
+        if (chunks.size() != embeddings.size()) {
+            throw new IllegalArgumentException("chunks and embeddings must have the same size");
+        }
+        try {
+            writer.deleteDocuments(new Term(F_SRC_PATH, absoluteFilePath));
+            for (int i = 0; i < chunks.size(); i++) {
+                DocumentChunk chunk = chunks.get(i);
+                writer.updateDocument(new Term(F_ID, chunk.getChunkId()),
+                        buildChunkDoc(chunk, embeddings.get(i)));
+            }
+            writer.commit();
+            searchers.maybeRefresh();
+            log.debug("Replaced {} chunks for: {}", chunks.size(), absoluteFilePath);
+        } catch (IOException e) {
+            throw new VectorStoreException("Failed to replace chunks for: " + absoluteFilePath, e);
         }
     }
 

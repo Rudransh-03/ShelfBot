@@ -294,9 +294,18 @@ public final class GPT4oMiniClient {
      * summarization pipeline where the prompt is fully self-contained.
      */
     public String oneShot(String systemPrompt, String userPrompt) {
+        return oneShot(systemPrompt, userPrompt, MAX_TOKENS);
+    }
+
+    /**
+     * One-shot call with an explicit output token ceiling. Used by tasks whose
+     * structured output can exceed the default 1000 tokens — e.g. batched
+     * deadline extraction emitting JSON for several documents at once.
+     */
+    public String oneShot(String systemPrompt, String userPrompt, int maxTokens) {
         ObjectNode body = mapper.createObjectNode();
         body.put("model", MODEL);
-        body.put("max_tokens", MAX_TOKENS);
+        body.put("max_tokens", maxTokens);
         body.put("temperature", 0.2);
         ArrayNode messages = body.putArray("messages");
         addMessage(messages, "system", systemPrompt);

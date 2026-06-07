@@ -170,6 +170,17 @@ public final class Main {
         // and "others2/foo" as two separate files.
         deduplicateCasePaths(metadataStore, vectorStore);
 
+        // One-time deadline housekeeping on app open: drop past one-time
+        // deadlines (no longer actionable) and roll past recurring ones forward
+        // to their next occurrence, so both deadline lists show only what's ahead.
+        try {
+            String summary = com.localfilebrain.deadline.DeadlineMaintenance
+                    .purgeAndRoll(metadataStore, java.time.LocalDate.now());
+            log.info("[startup] deadline maintenance: {}", summary);
+        } catch (Exception e) {
+            log.warn("[startup] deadline maintenance failed: {}", e.getMessage());
+        }
+
         final EmbeddingClient finalEmbedding = embeddingClient;
 
         // QueryEngine requires a valid OpenAI key (for the answer LLM, not

@@ -629,6 +629,15 @@ export default function Library({ active, onGoSettings }) {
     }
   }, [result, bumpFiles, loadStats])
 
+  // Keep the indexed-files list in sync with the actual index even when files
+  // were indexed OUTSIDE a manual job — e.g. the live file-watcher picking up a
+  // dropped-in file, or the startup re-scan. stats.lastIndexed / indexedFiles
+  // refresh on the idle poll, so a newly-indexed file shows up on its own
+  // without the user clicking "Index".
+  useEffect(() => {
+    bumpFiles()
+  }, [stats?.lastIndexed, stats?.indexedFiles, bumpFiles])
+
   return (
     <div className={`view${active ? ' active' : ''}`} id="view-lib">
       <div className="view-header">

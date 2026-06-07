@@ -11,6 +11,17 @@ const IDLE_POLL_MS  = 30_000
 // progress UI in Library and the "Indexing…" label in the Sidebar stay live.
 const BUSY_POLL_MS  = 1_200
 
+// TODO(pro-gate): Deadlines is meant to be a Pro feature. Until payments/Pro
+// exist, unlock it for every device so it can be used and tested. Flip to
+// `false` to gate it — free devices then get an upgrade prompt instead of the
+// scan, and the auto-scan only fires for Pro.
+const DEADLINES_DEV_UNLOCK = true
+
+// After indexing changes the corpus, wait this long with no further index
+// activity before auto-scanning — so a bulk drop of files settles into ONE
+// batched scan instead of several small ones.
+const DEADLINE_SCAN_DEBOUNCE_MS = 8_000
+
 export function AppProvider({ children }) {
   const [apiBase,   setApiBase]   = useState(null)
   const [connected, setConnected] = useState(false)
@@ -22,6 +33,11 @@ export function AppProvider({ children }) {
   const [lastJob,  setLastJob]  = useState(null) // { ok, data?, msg? }
   const [progress, setProgress] = useState(null) // { processed, total, failed, currentFile }
   const [activeFiles, setActiveFiles] = useState([]) // [{ name, stage, done, total, path }] in flight
+
+  // Cross-document deadlines — shared by the Sidebar badge and the Deadlines view.
+  const [deadlineStats,        setDeadlineStats]        = useState(null) // { pending, overdue, ... }
+  const [scanningDeadlines,    setScanningDeadlines]    = useState(false)
+  const [deadlineScanProgress, setDeadlineScanProgress] = useState(null) // { processed, total, found }
 
   // Saved chat threads — shared by the Sidebar (list/search/select) and the
   // Chat view (load/send). activeConversationId === null means a fresh,
@@ -38,6 +54,9 @@ export function AppProvider({ children }) {
   const [auth, setAuth] = useState({
     checked: false, registered: false, plan: 'free', usage: null, offline: false,
   })
+
+  // Is the Deadlines feature available to this device? (see DEADLINES_DEV_UNLOCK)
+  const deadlinesEnabled = DEADLINES_DEV_UNLOCK || auth.plan === 'pro'
 
   const refreshAuth = useCallback(async () => {
     const E = window.electron
@@ -67,8 +86,13 @@ export function AppProvider({ children }) {
     setAuth({ checked: true, registered: false, plan: 'free', usage: null, offline: false })
   }, [])
 
-  const busyTimer = useRef(null)
-  const idleTimer = useRef(null)
+  const busyTimer        = useRef(null)
+  const idleTimer        = useRef(null)
+  const deadlineTimer    = useRef(null)
+  const prevLastIndexed  = useRef(undefined)
+  const scanDebounce     = useRef(null)
+  const indexingRef      = useRef(false)
+  const scanDeadlinesRef = useRef(null)
 
   const toast = useCallback((msg, type = 'i', ms = 3600) => {
     const id = Date.now() + Math.random()
@@ -135,6 +159,58 @@ export function AppProvider({ children }) {
     }
   }, [api, indexing, startBusyPolling, toast])
 
+  // ── Deadlines ───────────────────────────────────────────────────────────────
+  const loadDeadlineStats = useCallback(async () => {
+    if (!api) return
+    try {
+      const d = await api.listDeadlines('all')
+      const items = d.items ?? []
+      // Badge counts only OPEN + UPCOMING items (what the Deadlines list shows):
+      // overdue/undated/handled items are hidden there, so they shouldn't inflate it.
+      const openUpcoming = items.filter(
+        it => it.status === 'PENDING' && (it.bucket === 'DUE_SOON' || it.bucket === 'UPCOMING')
+      ).length
+      setDeadlineStats({ ...(d.counts ?? {}), openUpcoming })
+    } catch { /* non-fatal */ }
+  }, [api])
+
+  // Poll the running scan until it finishes, then refresh stats + surface outcome.
+  const startDeadlinePolling = useCallback(() => {
+    if (deadlineTimer.current) clearInterval(deadlineTimer.current)
+    deadlineTimer.current = setInterval(async () => {
+      if (!api) return
+      try {
+        const s = await api.pollDeadlineScan()
+        setDeadlineScanProgress(s.progress ?? null)
+        if (!s.running) {
+          clearInterval(deadlineTimer.current); deadlineTimer.current = null
+          setScanningDeadlines(false); setDeadlineScanProgress(null)
+          loadDeadlineStats()
+          if (s.hasRun && s.message) {
+            if (s.stop === 'PAUSED_QUOTA')      toast(s.message, 'i')
+            else if (s.stop && s.stop !== 'COMPLETE' && s.stop !== 'NOT_SIGNED_IN') toast(s.message, 'e')
+            else if (s.found > 0)               toast(`Found ${s.found} new deadline${s.found === 1 ? '' : 's'}`, 's')
+          }
+        }
+      } catch {
+        clearInterval(deadlineTimer.current); deadlineTimer.current = null
+        setScanningDeadlines(false); setDeadlineScanProgress(null)
+      }
+    }, 1500)
+  }, [api, loadDeadlineStats, toast])
+
+  const scanDeadlines = useCallback(async () => {
+    if (!api || scanningDeadlines) return
+    try {
+      await api.scanDeadlines()
+      setScanningDeadlines(true)
+      startDeadlinePolling()
+    } catch (e) {
+      // 409 = already running (harmless); anything else is worth surfacing.
+      if (!String(e.message).toLowerCase().includes('progress')) toast(e.message, 'e')
+    }
+  }, [api, scanningDeadlines, startDeadlinePolling, toast])
+
   // ── Chat threads ──────────────────────────────────────────────────────────
   const refreshConversations = useCallback(async () => {
     if (!api) return
@@ -170,15 +246,50 @@ export function AppProvider({ children }) {
   useEffect(() => {
     if (!connected || !api) return
     loadStats()
+    loadDeadlineStats()
     idleTimer.current = setInterval(() => {
       if (!indexing) loadStats()
+      loadDeadlineStats()
       refreshAuth()
     }, IDLE_POLL_MS)
     return () => {
       if (idleTimer.current) clearInterval(idleTimer.current)
       idleTimer.current = null
     }
-  }, [connected, api, loadStats, refreshAuth, indexing])
+  }, [connected, api, loadStats, loadDeadlineStats, refreshAuth, indexing])
+
+  // Keep refs to the latest indexing flag + scanDeadlines so the debounced
+  // timer below always sees current state (no stale closures).
+  useEffect(() => { indexingRef.current = indexing }, [indexing])
+  useEffect(() => { scanDeadlinesRef.current = scanDeadlines }, [scanDeadlines])
+
+  // Auto-scan for deadlines whenever the corpus changes — fires when
+  // stats.lastIndexed moves, which covers BOTH a manual "Index" job and the
+  // live watcher silently indexing a dropped-in file (lastIndexed refreshes on
+  // the idle poll). Skips the initial load so we don't scan on every launch.
+  //
+  // Debounced: each index event resets a timer, so a bulk drop of files settles
+  // into ONE batched scan. When the timer fires we also wait for any in-flight
+  // manual "Index Now" job to finish (indexingRef) before scanning — so we never
+  // scan files that are still being (re)indexed; it self-reschedules until the
+  // index job is done. The scan itself is incremental + budget-capped + quota-aware.
+  useEffect(() => {
+    const li = stats?.lastIndexed
+    if (!li) return
+    if (prevLastIndexed.current === undefined) { prevLastIndexed.current = li; return } // skip first load
+    if (prevLastIndexed.current === li) return
+    prevLastIndexed.current = li
+    if (!deadlinesEnabled) return
+
+    if (scanDebounce.current) clearTimeout(scanDebounce.current)
+    const fire = () => {
+      if (indexingRef.current) { scanDebounce.current = setTimeout(fire, 3_000); return } // index job running — wait
+      scanDebounce.current = null
+      scanDeadlinesRef.current?.() // guards against double-run internally (+ backend 409)
+    }
+    scanDebounce.current = setTimeout(fire, DEADLINE_SCAN_DEBOUNCE_MS)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stats?.lastIndexed])
 
   // Boot: register the device (or revalidate the saved JWT). Runs once
   // after the renderer mounts; the underlying IPC handler auto-registers
@@ -201,9 +312,11 @@ export function AppProvider({ children }) {
     })
   }, [])
 
-  // On unmount: make sure the busy timer is also cleared
+  // On unmount: make sure the busy + deadline timers are also cleared
   useEffect(() => () => {
     if (busyTimer.current) clearInterval(busyTimer.current)
+    if (deadlineTimer.current) clearInterval(deadlineTimer.current)
+    if (scanDebounce.current) clearTimeout(scanDebounce.current)
   }, [])
 
   return (
@@ -213,6 +326,8 @@ export function AppProvider({ children }) {
       toast, toasts,
       stats, indexing, progress, activeFiles, lastJob,
       loadStats, triggerIndex,
+      deadlineStats, scanningDeadlines, deadlineScanProgress, deadlinesEnabled,
+      scanDeadlines, loadDeadlineStats,
       auth, logout, refreshAuth,
       conversations, activeConversationId, setActiveConversationId,
       refreshConversations, newConversation, openConversation,

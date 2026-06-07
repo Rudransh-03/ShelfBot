@@ -137,6 +137,22 @@ export class ApiClient {
     })
   }
 
+  // ── Deadlines (cross-document intelligence) ──────────────────────────────
+
+  /** Starts the incremental deadline scan (one batched LLM call per group). */
+  scanDeadlines()      { return this._r('/api/deadlines/scan', { method: 'POST' }) }
+  /** Polls the running/last scan: { running, hasRun, stop?, message?, progress? }. */
+  pollDeadlineScan()   { return this._r('/api/deadlines/scan') }
+  /**
+   * Lists extracted deadlines + counts. status: 'pending' | 'done' | 'dismissed' | 'all'.
+   * Each item carries computed { daysUntil, bucket } (OVERDUE|DUE_SOON|UPCOMING|NO_DATE).
+   */
+  listDeadlines(status = 'all') { return this._r(`/api/deadlines?status=${encodeURIComponent(status)}`) }
+  /** Partial update: { status?, reminderSet?, title?, description?, dueDate?, recurring? }. */
+  updateDeadline(id, patch)     { return this._r(`/api/deadlines/${id}`, { method: 'POST', body: JSON.stringify(patch) }) }
+  /** Removes one deadline. */
+  deleteDeadline(id)            { return this._r(`/api/deadlines/${id}`, { method: 'DELETE' }) }
+
   // ── Reorg pipeline ───────────────────────────────────────────────────────
 
   /**

@@ -152,6 +152,11 @@ export class ApiClient {
   updateDeadline(id, patch)     { return this._r(`/api/deadlines/${id}`, { method: 'POST', body: JSON.stringify(patch) }) }
   /** Removes one deadline. */
   deleteDeadline(id)            { return this._r(`/api/deadlines/${id}`, { method: 'DELETE' }) }
+  /**
+   * Gaps in recurring document series, computed locally (no LLM): each item is
+   * { series, issuer, period, cadence, confidence, presentCount, message }.
+   */
+  listMissingDocuments()        { return this._r('/api/missing') }
 
   // ── Reorg pipeline ───────────────────────────────────────────────────────
 

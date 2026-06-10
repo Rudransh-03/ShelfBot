@@ -410,8 +410,13 @@ public final class IngestionPipeline {
         long lastModifiedMs = attrs.lastModifiedTime().toMillis();
 
         fp.stage("chunking", 0, 0);
+        // Page locator is best-effort and PDF-only: it reads per-page PDF text to
+        // tag each chunk with its page(s). It never touches the canonical text
+        // above, so chunk text / embeddings / retrieval are unchanged; it's null
+        // for non-PDFs and scanned PDFs, in which case chunks carry no page.
+        PageLocator pageLocator = PdfPageLocator.forFile(file);
         List<DocumentChunk> chunks = textChunker.chunk(
-                extraction.text(), file, extraction.mimeType(), lastModifiedMs);
+                extraction.text(), file, extraction.mimeType(), lastModifiedMs, pageLocator);
         if (chunks.isEmpty()) return null;
 
         List<String>  texts      = chunks.stream().map(DocumentChunk::getText).toList();

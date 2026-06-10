@@ -307,7 +307,7 @@ public final class QueryEngine {
         logChunksGoingToLlm(relevantMatches);
         String answer = llmClient.answerStream(trimmed, relevantMatches, history, onToken);
 
-        List<Source> sources = trimSourcesToCited(groupMatchesByFile(relevantMatches), answer);
+        List<Source> sources = trimSourcesToCited(groupMatchesByFile(relevantMatches, answer), answer);
         history.add(trimmed, answer);
 
         boolean answerFound = !isFallbackAnswer(answer);
@@ -404,7 +404,7 @@ public final class QueryEngine {
 
         String answer = llmClient.answer(trimmed, relevantMatches, history);
 
-        List<Source> sources = trimSourcesToCited(groupMatchesByFile(relevantMatches), answer);
+        List<Source> sources = trimSourcesToCited(groupMatchesByFile(relevantMatches, answer), answer);
 
         history.add(trimmed, answer);
 
@@ -611,21 +611,88 @@ public final class QueryEngine {
         return cited.isEmpty() ? all : cited;
     }
 
-    private List<Source> groupMatchesByFile(List<SearchResult> matches) {
+    private List<Source> groupMatchesByFile(List<SearchResult> matches, String answer) {
         // LinkedHashMap preserves the diversified ordering produced earlier
         // — most relevant file first, then per-file the best chunks first.
-        LinkedHashMap<String, Source.Builder> byPath = new LinkedHashMap<>();
-
+        LinkedHashMap<String, List<SearchResult>> byPath = new LinkedHashMap<>();
         for (SearchResult m : matches) {
-            byPath.computeIfAbsent(
-                    m.sourceFilePath(),
-                    p -> new Source.Builder(m.fileName(), p)
-            ).addSnippet(snippet(m.text()));
+            byPath.computeIfAbsent(m.sourceFilePath(), k -> new ArrayList<>()).add(m);
         }
 
-        return byPath.values().stream()
-                .map(Source.Builder::build)
-                .collect(Collectors.toList());
+        List<Source> out = new ArrayList<>();
+        for (Map.Entry<String, List<SearchResult>> e : byPath.entrySet()) {
+            List<SearchResult> chunks = e.getValue();
+
+            // Narrow to the chunks whose content actually surfaces in the answer
+            // so the page citation pinpoints WHERE the answer came from instead
+            // of listing every retrieved page. This matters most on the
+            // file-scope path, where `chunks` is the whole document. Falls back
+            // to all chunks when nothing overlaps (e.g. a heavily paraphrased
+            // answer) so we never show fewer sources than before.
+            List<SearchResult> contributing = chunksOverlappingAnswer(chunks, answer);
+            List<SearchResult> use = contributing.isEmpty() ? chunks : contributing;
+
+            Source.Builder b = new Source.Builder(chunks.get(0).fileName(), e.getKey());
+            for (SearchResult m : use) {
+                b.addSnippet(snippet(m.text()));
+                b.addPages(m.pageStart(), m.pageEnd());
+            }
+            out.add(b.build());
+        }
+        return out;
+    }
+
+    // Alphanumeric tokens of length >= 4 — long enough to skip filler words and
+    // to make distinctive values (IDs, amounts, GSTINs) the deciding signal.
+    private static final Pattern OVERLAP_TOKEN = Pattern.compile("[a-z0-9]{4,}");
+
+    /**
+     * Returns the subset of {@code chunks} whose text overlaps the answer the
+     * most, by shared significant tokens. Used to pin a source's cited page(s)
+     * to the chunk(s) the answer actually drew from. Returns an empty list to
+     * signal "couldn't tell" (no answer, or nothing overlapped) — the caller
+     * then keeps all chunks.
+     *
+     * Filename tokens are excluded from the answer side because the model
+     * prefixes answers with "From <filename>:", and the filename often recurs
+     * across a document's pages (headers), which would otherwise wash out the
+     * signal.
+     */
+    private static List<SearchResult> chunksOverlappingAnswer(List<SearchResult> chunks, String answer) {
+        if (answer == null || answer.isBlank() || chunks.size() <= 1) return List.of();
+
+        Set<String> fileTokens = chunks.isEmpty() ? Set.of()
+                : tokenSet(chunks.get(0).fileName());
+        Set<String> answerTokens = tokenSet(answer);
+        answerTokens.removeAll(fileTokens);
+        if (answerTokens.isEmpty()) return List.of();
+
+        int[] scores = new int[chunks.size()];
+        int best = 0;
+        for (int i = 0; i < chunks.size(); i++) {
+            Set<String> ct = tokenSet(chunks.get(i).text());
+            int score = 0;
+            for (String t : answerTokens) if (ct.contains(t)) score++;
+            scores[i] = score;
+            best = Math.max(best, score);
+        }
+        if (best == 0) return List.of();
+
+        // Keep chunks within 60% of the best overlap, so a multi-part answer
+        // that genuinely spans two chunks/pages keeps both, while a single-fact
+        // answer collapses to the one chunk that carries it.
+        int threshold = Math.max(1, (int) Math.ceil(best * 0.6));
+        List<SearchResult> kept = new ArrayList<>();
+        for (int i = 0; i < chunks.size(); i++) if (scores[i] >= threshold) kept.add(chunks.get(i));
+        return kept;
+    }
+
+    private static Set<String> tokenSet(String text) {
+        Set<String> out = new java.util.HashSet<>();
+        if (text == null) return out;
+        java.util.regex.Matcher m = OVERLAP_TOKEN.matcher(text.toLowerCase());
+        while (m.find()) out.add(m.group());
+        return out;
     }
 
     private static final int SNIPPET_MAX_CHARS = 320;
@@ -646,28 +713,61 @@ public final class QueryEngine {
             "(/[^\\s\\n]+\\.[A-Za-z0-9]{1,8})"
     );
 
+    // A bare file name typed into the question (e.g. "summarize PERCENTAGE-1.pdf"),
+    // as opposed to a full absolute path. Word chars, hyphens and parentheses
+    // before a 1-8 char extension. Deliberately does NOT allow spaces — a
+    // space-containing name can't be reliably delimited from surrounding prose,
+    // and those are rare in typed questions (pasted absolute paths still work).
+    private static final Pattern FILENAME_IN_QUESTION = Pattern.compile(
+            "([\\w][\\w()\\-]*\\.[A-Za-z0-9]{1,8})"
+    );
+
     /**
      * Returns the canonical path of an indexed file explicitly named in the
-     * question (typically pasted as an absolute path), or empty if no such
-     * file is found in the index. A path is considered indexed only when
-     * the Lucene store has at least one chunk tagged with it.
+     * question, or empty if no such file is found in the index.
+     *
+     * Two forms are recognised: a full absolute path pasted into the question,
+     * and (as a fallback) a bare file name like "PERCENTAGE-1.pdf". The bare
+     * name only auto-scopes when it resolves to EXACTLY one indexed file — if
+     * the same name lives in two folders we can't tell which the user meant, so
+     * we fall through to semantic search rather than guess. A path/name is
+     * considered indexed only when the Lucene store has at least one chunk for it.
      */
     private java.util.Optional<String> detectFileScope(String question) {
         if (question == null) return java.util.Optional.empty();
+
+        // 1. Explicit absolute path pasted into the question.
         java.util.regex.Matcher m = ABS_PATH_IN_QUESTION.matcher(question);
         while (m.find()) {
-            String candidate = m.group(1);
-            // Trim trailing punctuation that's almost never part of a real path.
-            while (candidate.endsWith(".") || candidate.endsWith(",")
-                    || candidate.endsWith(";") || candidate.endsWith(":")
-                    || candidate.endsWith(")") || candidate.endsWith("]")) {
-                candidate = candidate.substring(0, candidate.length() - 1);
-            }
+            String candidate = stripTrailingPunctuation(m.group(1));
             String canonical = PathNormalizer.canonical(candidate);
-            List<SearchResult> chunks = vectorStore.getChunksForFile(canonical);
-            if (!chunks.isEmpty()) return java.util.Optional.of(canonical);
+            if (!vectorStore.getChunksForFile(canonical).isEmpty()) {
+                return java.util.Optional.of(canonical);
+            }
+        }
+
+        // 2. Bare file name typed in the question — resolve it to an indexed
+        //    path so naming a file loads that whole file deterministically
+        //    instead of leaning on semantic search.
+        java.util.regex.Matcher fm = FILENAME_IN_QUESTION.matcher(question);
+        while (fm.find()) {
+            String name = stripTrailingPunctuation(fm.group(1));
+            List<String> paths = vectorStore.findPathsByFileName(name);
+            if (paths.size() == 1) {
+                log.info("File-scope resolved bare filename '{}' → {}", name, paths.get(0));
+                return java.util.Optional.of(paths.get(0));
+            }
         }
         return java.util.Optional.empty();
+    }
+
+    /** Trims trailing punctuation that's almost never part of a real path/name. */
+    private static String stripTrailingPunctuation(String s) {
+        while (s.endsWith(".") || s.endsWith(",") || s.endsWith(";")
+                || s.endsWith(":") || s.endsWith(")") || s.endsWith("]")) {
+            s = s.substring(0, s.length() - 1);
+        }
+        return s;
     }
 
     /**
@@ -699,7 +799,7 @@ public final class QueryEngine {
     /** Wraps a file-scoped answer in the same result shape as semantic search. */
     private QueryResult scopedAnswerResult(String question, String path, String answer) {
         List<SearchResult> chunks = vectorStore.getChunksForFile(path);
-        List<Source> sources = groupMatchesByFile(chunks);
+        List<Source> sources = groupMatchesByFile(chunks, answer);
         history.add(question, answer);
         return isFallbackAnswer(answer)
                 ? QueryResult.notFound(answer)
@@ -893,16 +993,26 @@ public final class QueryEngine {
      * @param fileName     display name shown on the chip
      * @param absolutePath full path used by the UI to open the file in the default app
      * @param snippets     truncated chunk excerpts that contributed to the answer
+     * @param pages        1-based page numbers (sorted, distinct) of this file
+     *                     that actually contributed to the answer; empty when
+     *                     the source has no page info (non-PDF, scan, or
+     *                     pre-page-feature chunks)
      */
     public record Source(
-            String       fileName,
-            String       absolutePath,
-            List<String> snippets
+            String        fileName,
+            String        absolutePath,
+            List<String>  snippets,
+            List<Integer> pages
     ) {
+        // Defensive cap so a whole-file answer can't emit hundreds of page
+        // numbers per source chip.
+        private static final int MAX_PAGES_PER_RANGE = 50;
+
         static final class Builder {
             private final String       fileName;
             private final String       absolutePath;
             private final List<String> snippets = new ArrayList<>();
+            private final java.util.TreeSet<Integer> pages = new java.util.TreeSet<>();
 
             Builder(String fileName, String absolutePath) {
                 this.fileName     = fileName;
@@ -913,8 +1023,19 @@ public final class QueryEngine {
                 if (snippet != null && !snippet.isBlank()) snippets.add(snippet);
             }
 
+            /** Records the page span [start, end] of a contributing chunk.
+             *  Ignored when start is 0 (page unknown). */
+            void addPages(int start, int end) {
+                if (start <= 0) return;
+                int s = start;
+                int e = (end >= start) ? end : start;
+                if (e - s > MAX_PAGES_PER_RANGE) e = s + MAX_PAGES_PER_RANGE;
+                for (int p = s; p <= e; p++) pages.add(p);
+            }
+
             Source build() {
-                return new Source(fileName, absolutePath, List.copyOf(snippets));
+                return new Source(fileName, absolutePath,
+                        List.copyOf(snippets), List.copyOf(pages));
             }
         }
     }

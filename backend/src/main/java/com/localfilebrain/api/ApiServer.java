@@ -180,6 +180,7 @@ public final class ApiServer {
         server.createContext("/api/files",        this::handleFiles);
         server.createContext("/api/deadlines/scan", this::handleDeadlineScan);
         server.createContext("/api/deadlines",      this::handleDeadlines);
+        server.createContext("/api/missing",        this::handleMissing);
         server.createContext("/api/auth",         this::handleAuth);
         server.createContext("/api/reorg/preview", this::handleReorgPreview);
         server.createContext("/api/reorg/execute", this::handleReorgExecute);
@@ -869,6 +870,44 @@ public final class ApiServer {
      * POST   /api/deadlines/{id}       partial update {status?, reminderSet?, title?, description?, dueDate?, recurring?}
      * DELETE /api/deadlines/{id}       remove one item.
      */
+    /**
+     * GET /api/missing — gaps in recurring document series (e.g. "GST return for
+     * February 2024 may be missing"), computed locally from the series
+     * classifications captured during the deadline scan. No LLM call here.
+     */
+    private void handleMissing(HttpExchange ex) throws IOException {
+        if (preflight(ex)) return;
+        if (!isMethod(ex, "GET")) { methodNotAllowed(ex); return; }
+        try {
+            List<IndexMetadataStore.SeriesRow> series = metadataStore.listAllSeries();
+            List<com.localfilebrain.deadline.MissingDocumentDetector.MissingDoc> missing =
+                    com.localfilebrain.deadline.MissingDocumentDetector.detect(series);
+
+            List<Map<String, Object>> items = new ArrayList<>(missing.size());
+            for (var d : missing) {
+                items.add(map(
+                        "series",       d.series(),
+                        "issuer",       d.issuer(),
+                        "period",       d.periodLabel(),
+                        "cadence",      d.cadence(),
+                        "confidence",   d.confidence(),
+                        "presentCount", d.presentCount(),
+                        "message",      missingMessage(d)));
+            }
+            sendJson(ex, 200, map("items", items, "count", items.size()));
+        } catch (Exception e) {
+            log.warn("/api/missing failed", e);
+            sendError(ex, 500, "Failed to compute missing documents");
+        }
+    }
+
+    /** Human-readable, deliberately tentative phrasing for a missing-doc alert. */
+    private static String missingMessage(
+            com.localfilebrain.deadline.MissingDocumentDetector.MissingDoc d) {
+        String who = (d.issuer() == null || d.issuer().isBlank()) ? "" : " from " + d.issuer();
+        return "Looks like your " + d.series() + who + " for " + d.periodLabel() + " may be missing.";
+    }
+
     private void handleDeadlines(HttpExchange ex) throws IOException {
         if (preflight(ex)) return;
         try {

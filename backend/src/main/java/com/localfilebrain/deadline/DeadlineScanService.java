@@ -171,9 +171,11 @@ public final class DeadlineScanService {
         }
 
         List<ExtractedDeadline> items;
+        DeadlineExtractionEngine.BatchResult result;
         try {
-            items = DeadlineExtractionEngine.extractBatch(payloads, today,
+            result = DeadlineExtractionEngine.extractBatchFull(payloads, today,
                     (sys, user) -> llm.oneShot(sys, user, EXTRACTION_MAX_TOKENS));
+            items = result.deadlines();
             meta.incrementDeadlineCallsToday(dayKey);
         } catch (GPT4oMiniClient.LLMException e) {
             String msg = e.getMessage() == null ? "" : e.getMessage().toLowerCase();
@@ -196,6 +198,12 @@ public final class DeadlineScanService {
         for (ExtractedDeadline it : items) {
             grouped.computeIfAbsent(it.docId(), k -> new ArrayList<>()).add(it);
         }
+        // Per-document series classification from the SAME call (for the
+        // Missing-Document detector).
+        Map<Integer, DeadlineExtractionEngine.DocClassification> classByDoc = new LinkedHashMap<>();
+        for (DeadlineExtractionEngine.DocClassification dc : result.documents()) {
+            classByDoc.put(dc.docId(), dc);
+        }
 
         int found = 0;
         for (Map.Entry<Integer, DocEntry> en : byId.entrySet()) {
@@ -214,6 +222,13 @@ public final class DeadlineScanService {
             // never re-read until its content changes.
             meta.replaceDeadlinesForFile(doc.absolutePath, doc.fileName, doc.contentHash, toStore);
             found += toStore.size();
+
+            // Store (or clear) this document's recurring-series classification.
+            DeadlineExtractionEngine.DocClassification dc = classByDoc.get(en.getKey());
+            meta.upsertSeries(doc.absolutePath, doc.fileName, doc.contentHash,
+                    dc == null ? null : dc.series(),
+                    dc == null ? null : dc.issuer(),
+                    dc == null ? null : dc.period());
         }
         return new FlushResult(found, null, null);
     }

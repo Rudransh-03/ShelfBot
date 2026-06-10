@@ -40,6 +40,15 @@
             <version>${tika.version}</version>
         </dependency>
 
+        <!-- Apache PDFBox: per-page PDF text for page-number citations. Already on
+             the classpath transitively via Tika 2.9.2; pinned here so the page
+             locator's compile-time API can't drift if Tika is bumped. -->
+        <dependency>
+            <groupId>org.apache.pdfbox</groupId>
+            <artifactId>pdfbox</artifactId>
+            <version>2.0.31</version>
+        </dependency>
+
         <!-- SQLite JDBC: local metadata store for tracking indexed files. FREE / Apache 2.0 -->
         <dependency>
             <groupId>org.xerial</groupId>

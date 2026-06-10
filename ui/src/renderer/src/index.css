@@ -813,6 +813,8 @@ input:focus-visible {
   color: var(--text-1);
 }
 .src-chip:disabled { cursor: default; opacity: .85; }
+/* Page citation appended to the source chip, e.g. "GST_Q1.pdf · p. 18". */
+.src-chip-page { opacity: .6; font-variant-numeric: tabular-nums; }
 
 /* Hover-only preview popover with the matched chunk text. */
 .src-preview {
@@ -3511,6 +3513,23 @@ input:focus-visible {
 .dl-stat.overdue .dl-stat-n { color: var(--red); }
 .dl-stat.soon .dl-stat-n    { color: var(--warn); }
 .dl-stat.up .dl-stat-n      { color: var(--accent-bright); }
+
+/* Possibly-missing recurring documents */
+.dl-missing {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--r-md);
+  padding: 12px 14px;
+  margin-bottom: 18px;
+}
+.dl-missing-head { font-size: 12px; font-weight: 700; color: var(--text-1); text-transform: uppercase; letter-spacing: .04em; display: flex; align-items: center; gap: 8px; }
+.dl-missing-list { list-style: none; margin: 8px 0 6px; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.dl-missing-item { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; color: var(--text-2); }
+.dl-missing-msg { line-height: 1.4; }
+.dl-missing-tag { flex: none; font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-3); border: 1px solid var(--border); border-radius: 999px; padding: 1px 7px; }
+.dl-missing-item.conf-low .dl-missing-tag { color: var(--text-3); }
+.dl-missing-note { font-size: 11px; color: var(--text-3); margin-top: 2px; }
 
 .dl-tabs { display: flex; gap: 6px; margin-bottom: 16px; }
 .dl-tab {

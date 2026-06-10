@@ -33,22 +33,33 @@ public final class DeadlineExtractionEngine {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     static final String SYSTEM_PROMPT = """
-            You extract concrete deadlines, renewals, and required actions from
-            document excerpts, for a personal life-admin assistant that will turn
-            each one into a calendar reminder.
+            You read excerpts from one or more documents for a personal life-admin
+            assistant. In a SINGLE reply you do two jobs and return ONE JSON object.
 
-            Return ONLY a JSON array (no prose, no markdown fences). Each element:
-              {
-                "doc":         <integer document id, copied from the excerpt header>,
-                "title":       "<= 8 words, specific: who + what (e.g. 'HDFC car insurance renewal')",
-                "description": "one short sentence of context for the reminder body",
-                "date":        "YYYY-MM-DD"  (the actual due/renewal/action date),
-                "kind":        "deadline" | "renewal" | "action",
-                "confidence":  "high" | "medium" | "low",
-                "recurring":   "none" | "weekly" | "monthly" | "quarterly" | "yearly"
-              }
+            Return ONLY a JSON object (no prose, no markdown fences):
+            {
+              "deadlines": [
+                {
+                  "doc":         <integer document id, copied from the excerpt header>,
+                  "title":       "<= 8 words, specific: who + what (e.g. 'HDFC car insurance renewal')",
+                  "description": "one short sentence of context for the reminder body",
+                  "date":        "YYYY-MM-DD"  (the actual due/renewal/action date),
+                  "kind":        "deadline" | "renewal" | "action",
+                  "confidence":  "high" | "medium" | "low",
+                  "recurring":   "none" | "weekly" | "monthly" | "quarterly" | "yearly"
+                }
+              ],
+              "documents": [
+                {
+                  "doc":    <integer document id>,
+                  "series": "<the recurring TYPE of document, normalized and issuer-agnostic, e.g. 'GST return', 'bank statement', 'salary slip', 'electricity bill'; null if it is NOT a periodic/recurring document>",
+                  "issuer": "<organisation it is from, e.g. 'HDFC Bank', 'GSTN'; null if unclear>",
+                  "period": "<the single period the document COVERS: 'YYYY-MM' monthly, 'YYYY-Qn' quarterly, 'YYYY' annual; null if it does not cover one specific recurring period>"
+                }
+              ]
+            }
 
-            Rules:
+            Rules for "deadlines":
               - Use ONLY the excerpts. Never invent dates or facts.
               - Resolve relative dates against the provided "Today" date
                 (e.g. "within 30 days", "next quarter", "by the 20th").
@@ -60,7 +71,16 @@ public final class DeadlineExtractionEngine {
               - Drop excerpts that are not actually a deadline/obligation
                 (a date alone, like an issue date or a year in prose, is not one).
               - De-duplicate: if the same deadline appears multiple times, emit it once.
-              - If there are no real deadlines in any document, return exactly: []
+              - If there are no real deadlines, use an empty "deadlines" array.
+
+            Rules for "documents":
+              - Emit exactly ONE entry per document id you were given.
+              - "series" is the recurring TYPE, not the title — issuer-agnostic and
+                stable across periods, so January and February of the same thing
+                share the SAME series string.
+              - "period" is what the document is ABOUT/covers and may differ from any
+                deadline date. Use null for series/period when the document is not a
+                recurring periodic document (e.g. a one-off contract, an ID card).
             """;
 
     /** Seam over the LLM so prompt-building + parsing can be tested with a fake. */
@@ -75,27 +95,59 @@ public final class DeadlineExtractionEngine {
     public record DocPayload(int docId, String fileName, String header, List<String> snippets) {}
 
     /**
+     * One document's recurring-series classification, used by the missing-document
+     * detector. {@code series}/{@code period} are null when the document isn't a
+     * periodic/recurring document. {@code period} is a raw label
+     * ('YYYY-MM' | 'YYYY-Qn' | 'YYYY'); canonicalisation happens in the detector.
+     */
+    public record DocClassification(int docId, String series, String issuer, String period) {}
+
+    /** Both products of the single extraction call. */
+    public record BatchResult(List<ExtractedDeadline> deadlines, List<DocClassification> documents) {}
+
+    /**
      * Extracts deadlines for one batch of documents in a single LLM call.
-     * The returned items carry the batch-local {@code docId}; the caller maps
-     * those back to absolute paths.
+     * Back-compat entry point (deadlines only); see {@link #extractBatchFull}.
      */
     public static List<ExtractedDeadline> extractBatch(List<DocPayload> docs,
                                                        LocalDate today,
                                                        LlmCall llm) {
-        if (docs == null || docs.isEmpty()) return List.of();
+        return extractBatchFull(docs, today, llm).deadlines();
+    }
+
+    /**
+     * Extracts BOTH deadlines and per-document series classifications for one
+     * batch in a single LLM call. Hallucinated/unknown doc ids are dropped from
+     * both lists.
+     */
+    public static BatchResult extractBatchFull(List<DocPayload> docs,
+                                               LocalDate today,
+                                               LlmCall llm) {
+        if (docs == null || docs.isEmpty()) return new BatchResult(List.of(), List.of());
         String userPrompt = buildPrompt(docs, today);
         String raw = llm.call(SYSTEM_PROMPT, userPrompt);
-        List<ExtractedDeadline> items = parse(raw);
-        // Guard against hallucinated doc ids — only keep ids we actually sent.
+
         java.util.Set<Integer> validIds = new java.util.HashSet<>();
         for (DocPayload d : docs) validIds.add(d.docId());
-        List<ExtractedDeadline> kept = new ArrayList<>(items.size());
-        for (ExtractedDeadline it : items) {
-            if (validIds.contains(it.docId())) kept.add(it);
+
+        com.fasterxml.jackson.databind.JsonNode root = rootJson(raw);
+
+        List<ExtractedDeadline> deadlines = parseDeadlines(root, raw);
+        List<ExtractedDeadline> keptDeadlines = new ArrayList<>(deadlines.size());
+        for (ExtractedDeadline it : deadlines) {
+            if (validIds.contains(it.docId())) keptDeadlines.add(it);
             else log.debug("Dropping extracted item with unknown docId {}: {}", it.docId(), it.title());
         }
-        log.info("Extraction batch: {} doc(s) -> {} deadline(s) (1 LLM call)", docs.size(), kept.size());
-        return kept;
+
+        List<DocClassification> docsClass = parseDocuments(root);
+        List<DocClassification> keptDocs = new ArrayList<>(docsClass.size());
+        for (DocClassification dc : docsClass) {
+            if (validIds.contains(dc.docId())) keptDocs.add(dc);
+        }
+
+        log.info("Extraction batch: {} doc(s) -> {} deadline(s), {} classified (1 LLM call)",
+                docs.size(), keptDeadlines.size(), keptDocs.size());
+        return new BatchResult(keptDeadlines, keptDocs);
     }
 
     static String buildPrompt(List<DocPayload> docs, LocalDate today) {
@@ -118,7 +170,7 @@ public final class DeadlineExtractionEngine {
             }
             sb.append("\n");
         }
-        sb.append("Return the JSON array now.");
+        sb.append("Return the JSON object now.");
         return sb.toString();
     }
 
@@ -128,53 +180,97 @@ public final class DeadlineExtractionEngine {
      * without a usable date are dropped (they can't become reminders); kind /
      * confidence / recurring are normalized.
      */
+    /** Back-compat: parse deadlines from a raw reply (bare array or {deadlines:[...]}). */
     static List<ExtractedDeadline> parse(String raw) {
-        List<ExtractedDeadline> out = new ArrayList<>();
-        if (raw == null || raw.isBlank()) return out;
+        return parseDeadlines(rootJson(raw), raw);
+    }
 
-        String json = isolateJsonArray(raw);
-        if (json == null) {
-            log.warn("Deadline extraction returned no JSON array; raw head: {}",
+    /**
+     * Isolates the JSON value from a model reply, tolerating code fences and
+     * surrounding prose. Returns the wrapper OBJECT for the
+     * {@code {"deadlines":[...],"documents":[...]}} shape, or the bare ARRAY for
+     * the legacy deadlines-only shape. Null when no JSON value is present.
+     *
+     * Heuristic: it's a wrapper object only when its {@code '{'} precedes the
+     * first {@code '['} and its {@code '}'} follows the last {@code ']'} — an
+     * array-of-objects always has {@code '['} before the first {@code '{'}.
+     */
+    static JsonNode rootJson(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        int ob = raw.indexOf('{'), cb = raw.lastIndexOf('}');
+        int oa = raw.indexOf('['), ca = raw.lastIndexOf(']');
+        try {
+            boolean objectWrapper = ob >= 0 && cb > ob
+                    && (oa < 0 || ob < oa) && (ca < 0 || cb > ca);
+            if (objectWrapper) return MAPPER.readTree(raw.substring(ob, cb + 1));
+            if (oa >= 0 && ca > oa) return MAPPER.readTree(raw.substring(oa, ca + 1));
+        } catch (Exception e) {
+            log.warn("Extraction reply was not valid JSON; head: {}",
                     raw.substring(0, Math.min(raw.length(), 160)));
+        }
+        return null;
+    }
+
+    private static List<ExtractedDeadline> parseDeadlines(JsonNode root, String raw) {
+        List<ExtractedDeadline> out = new ArrayList<>();
+        if (root == null) {
+            log.warn("Deadline extraction returned no JSON; raw head: {}",
+                    raw == null ? "" : raw.substring(0, Math.min(raw.length(), 160)));
             return out;
         }
+        JsonNode arr = root.isArray() ? root
+                : (root.isObject() ? root.get("deadlines") : null);
+        if (arr == null || !arr.isArray()) return out;
+        for (JsonNode node : arr) {
+            String date = textOrNull(node, "date");
+            if (date != null) date = date.trim();
+            // Drop undated items — they can't be turned into a reminder.
+            if (date == null || date.isBlank() || !looksLikeIsoDate(date)) continue;
 
-        try {
-            JsonNode arr = MAPPER.readTree(json);
-            if (!arr.isArray()) return out;
-            for (JsonNode node : arr) {
-                String date = textOrNull(node, "date");
-                if (date != null) date = date.trim();
-                // Drop undated items — they can't be turned into a reminder.
-                if (date == null || date.isBlank() || !looksLikeIsoDate(date)) continue;
+            int docId = node.path("doc").asInt(node.path("docId").asInt(0));
+            String title = textOrNull(node, "title");
+            if (title == null || title.isBlank()) title = "Deadline";
+            String desc  = textOrNull(node, "description");
 
-                int docId = node.path("doc").asInt(node.path("docId").asInt(0));
-                String title = textOrNull(node, "title");
-                if (title == null || title.isBlank()) title = "Deadline";
-                String desc  = textOrNull(node, "description");
-
-                out.add(new ExtractedDeadline(
-                        docId,
-                        title.trim(),
-                        desc == null ? "" : desc.trim(),
-                        date,
-                        ExtractedDeadline.normalizeKind(textOrNull(node, "kind")),
-                        ExtractedDeadline.normalizeConfidence(textOrNull(node, "confidence")),
-                        ExtractedDeadline.normalizeRecurring(textOrNull(node, "recurring"))));
-            }
-        } catch (Exception e) {
-            log.warn("Failed to parse deadline JSON ({}): {}", e.getMessage(),
-                    json.substring(0, Math.min(json.length(), 200)));
+            out.add(new ExtractedDeadline(
+                    docId,
+                    title.trim(),
+                    desc == null ? "" : desc.trim(),
+                    date,
+                    ExtractedDeadline.normalizeKind(textOrNull(node, "kind")),
+                    ExtractedDeadline.normalizeConfidence(textOrNull(node, "confidence")),
+                    ExtractedDeadline.normalizeRecurring(textOrNull(node, "recurring"))));
         }
         return out;
     }
 
-    /** Returns the substring from the first '[' to the matching last ']', or null. */
-    private static String isolateJsonArray(String raw) {
-        int start = raw.indexOf('[');
-        int end   = raw.lastIndexOf(']');
-        if (start < 0 || end < 0 || end <= start) return null;
-        return raw.substring(start, end + 1);
+    /** Parses per-document series classifications from the wrapper object (empty
+     *  for the legacy array shape). Only documents that are actually periodic
+     *  (non-null series AND period) are kept. */
+    static List<DocClassification> parseDocuments(JsonNode root) {
+        List<DocClassification> out = new ArrayList<>();
+        if (root == null || !root.isObject()) return out;
+        JsonNode arr = root.get("documents");
+        if (arr == null || !arr.isArray()) return out;
+        for (JsonNode node : arr) {
+            int docId = node.path("doc").asInt(node.path("docId").asInt(0));
+            if (docId <= 0) continue;
+            String series = blankToNull(textOrNull(node, "series"));
+            String period = blankToNull(textOrNull(node, "period"));
+            if (series == null || period == null) continue; // not a recurring doc
+            String issuer = blankToNull(textOrNull(node, "issuer"));
+            out.add(new DocClassification(docId, series, issuer, period));
+        }
+        return out;
+    }
+
+    /** Treats blank and the literal strings null/none/n/a as absent. */
+    private static String blankToNull(String s) {
+        if (s == null) return null;
+        String t = s.trim();
+        if (t.isEmpty() || t.equalsIgnoreCase("null") || t.equalsIgnoreCase("none")
+                || t.equalsIgnoreCase("n/a")) return null;
+        return t;
     }
 
     /** Cheap sanity check: YYYY-MM-DD with plausible ranges. */

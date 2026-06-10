@@ -51,6 +51,15 @@ public final class DocumentChunk {
     /** MIME type detected by Tika (e.g. "application/pdf") */
     private final String mimeType;
 
+    /** 1-based first page this chunk's text came from; 0 when unknown (non-PDF,
+     *  scan, or the page locator couldn't place it). */
+    private final int pageStart;
+
+    /** 1-based last page this chunk's text spans; 0 when unknown. Equals
+     *  {@link #pageStart} for a chunk contained in a single page, greater when
+     *  the chunk straddles a page break. */
+    private final int pageEnd;
+
     private DocumentChunk(Builder builder) {
         this.chunkId            = Objects.requireNonNull(builder.chunkId, "chunkId");
         this.sourceFilePath     = Objects.requireNonNull(builder.sourceFilePath, "sourceFilePath");
@@ -63,6 +72,8 @@ public final class DocumentChunk {
         this.fileLastModifiedMs = builder.fileLastModifiedMs;
         this.indexedAt          = builder.indexedAt != null ? builder.indexedAt : Instant.now();
         this.mimeType           = builder.mimeType != null ? builder.mimeType : "application/octet-stream";
+        this.pageStart          = builder.pageStart;
+        this.pageEnd            = builder.pageEnd;
     }
 
     // -------------------------------------------------------------------------
@@ -80,6 +91,8 @@ public final class DocumentChunk {
     public long   getFileLastModifiedMs() { return fileLastModifiedMs; }
     public Instant getIndexedAt()         { return indexedAt; }
     public String getMimeType()           { return mimeType; }
+    public int    getPageStart()          { return pageStart; }
+    public int    getPageEnd()            { return pageEnd; }
 
     // -------------------------------------------------------------------------
     // Builder
@@ -98,6 +111,8 @@ public final class DocumentChunk {
         private long   fileLastModifiedMs;
         private Instant indexedAt;
         private String mimeType;
+        private int    pageStart;
+        private int    pageEnd;
 
         private Builder() {}
 
@@ -111,6 +126,8 @@ public final class DocumentChunk {
         public Builder fileLastModifiedMs(long fileLastModifiedMs) { this.fileLastModifiedMs = fileLastModifiedMs; return this; }
         public Builder indexedAt(Instant indexedAt)                { this.indexedAt = indexedAt; return this; }
         public Builder mimeType(String mimeType)                   { this.mimeType = mimeType; return this; }
+        public Builder pageStart(int pageStart)                    { this.pageStart = pageStart; return this; }
+        public Builder pageEnd(int pageEnd)                        { this.pageEnd = pageEnd; return this; }
 
         public DocumentChunk build() { return new DocumentChunk(this); }
     }

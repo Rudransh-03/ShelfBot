@@ -50,7 +50,7 @@ public final class TextChunker {
     // -------------------------------------------------------------------------
 
     /**
-     * Splits the given text into DocumentChunk objects.
+     * Splits the given text into DocumentChunk objects (no page metadata).
      *
      * @param text          the full extracted text of a file
      * @param sourceFile    the file this text came from
@@ -59,6 +59,21 @@ public final class TextChunker {
      * @return ordered list of chunks (may be empty if text is blank)
      */
     public List<DocumentChunk> chunk(String text, Path sourceFile, String mimeType, long lastModifiedMs) {
+        return chunk(text, sourceFile, mimeType, lastModifiedMs, null);
+    }
+
+    /**
+     * Splits the given text into DocumentChunk objects, optionally attaching the
+     * page span of each chunk via {@code pageLocator}.
+     *
+     * The chunk TEXT and boundaries are computed identically whether or not a
+     * locator is supplied — the locator only reads finished chunk text to tag a
+     * page, so it can never change embeddings or retrieval. A {@code null}
+     * locator (or one that can't place a given chunk) leaves the chunk's pages
+     * at 0 (unknown), exactly as before this feature existed.
+     */
+    public List<DocumentChunk> chunk(String text, Path sourceFile, String mimeType,
+                                     long lastModifiedMs, PageLocator pageLocator) {
         if (text == null || text.isBlank()) {
             log.debug("Empty text for '{}', producing no chunks", sourceFile.getFileName());
             return List.of();
@@ -84,7 +99,7 @@ public final class TextChunker {
             if (chunkText.isBlank()) continue;
 
             String chunkId = absolutePath + "::chunk-" + i;
-            chunks.add(DocumentChunk.builder()
+            DocumentChunk.Builder b = DocumentChunk.builder()
                 .chunkId(chunkId)
                 .sourceFilePath(absolutePath)
                 .fileName(fileName)
@@ -94,8 +109,20 @@ public final class TextChunker {
                 .text(chunkText)
                 .fileLastModifiedMs(lastModifiedMs)
                 .indexedAt(now)
-                .mimeType(mimeType)
-                .build());
+                .mimeType(mimeType);
+
+            if (pageLocator != null) {
+                int[] span = pageLocator.locate(chunkText);
+                if (span != null) {
+                    b.pageStart(span[0]).pageEnd(span[1]);
+                }
+            }
+            chunks.add(b.build());
+        }
+
+        if (pageLocator != null) {
+            long withPages = chunks.stream().filter(c -> c.getPageStart() > 0).count();
+            log.debug("'{}' → {}/{} chunks tagged with a page", fileName, withPages, chunks.size());
         }
 
         return chunks;

@@ -56,14 +56,20 @@ public final class SummarizationEngine {
             You write tight, scannable one-page briefs of documents.
 
             Output sections in this exact order:
-              **TL;DR** — one sentence that captures the document's purpose.
-              **Key Points** — 3 to 6 bullets, each a fact or argument from the document.
+              **TL;DR** — one sentence that captures what the document is and its purpose.
+              **Key Points** — 3 to 6 bullets that DESCRIBE the document for someone \
+                who hasn't opened it: what kind of document it is, what it's about, \
+                the main topics or sections it covers, and how it's organised. \
+                Summarise the content — do NOT copy individual questions, problems, \
+                list entries, or line items verbatim. \
+                (e.g. "A 25-question practice worksheet on percentages, covering \
+                profit/loss, discounts, and successive change" — NOT the questions themselves.)
               **Entities** — people, organisations, products, places that appear (comma-separated).
               **Dates & Numbers** — important dates, deadlines, amounts (comma-separated).
 
             Rules:
               - Use only what's in the excerpts. Never invent.
-              - Be concrete. Names, amounts, dates over generic phrases.
+              - Be concrete about what the document contains, but describe — don't transcribe.
               - If a section has no content in the source, write "—" for it.
               - Keep the whole brief under ~250 words.
             """;
@@ -83,13 +89,18 @@ public final class SummarizationEngine {
             one-page brief.
 
             Output sections in this exact order:
-              **TL;DR** — one sentence that captures the document's purpose.
-              **Key Points** — 3 to 6 bullets covering the document end-to-end.
+              **TL;DR** — one sentence that captures what the document is and its purpose.
+              **Key Points** — 3 to 6 bullets that DESCRIBE the document end-to-end: \
+                what kind of document it is, what it's about, the main topics or \
+                sections it covers, and how it's organised. Summarise the content — \
+                do NOT copy individual questions, problems, list entries, or line \
+                items verbatim.
               **Entities** — people, organisations, products, places (comma-separated).
               **Dates & Numbers** — important dates, deadlines, amounts (comma-separated).
 
             Rules:
               - Use only the section summaries provided. Never invent.
+              - Describe what the document contains; don't transcribe individual items.
               - De-duplicate entities/dates that appear in multiple sections.
               - Keep the whole brief under ~250 words.
             """;

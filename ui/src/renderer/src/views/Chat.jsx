@@ -161,13 +161,27 @@ function UserAvatar() {
   )
 }
 
+// Formats the contributing page numbers for display: "(page 18)",
+// "(page 17-18)" (contiguous), or "(pages 5, 9, 14)" (scattered, capped).
+// Empty when no pages.
+function formatPages(pages) {
+  if (!Array.isArray(pages) || pages.length === 0) return ''
+  const ps = [...new Set(pages)].sort((a, b) => a - b)
+  if (ps.length === 1) return `(page ${ps[0]})`
+  const contiguous = ps.every((v, i) => i === 0 || v === ps[i - 1] + 1)
+  if (contiguous) return `(page ${ps[0]}-${ps[ps.length - 1]})`
+  const shown = ps.slice(0, 4).join(', ')
+  return `(pages ${shown}${ps.length > 4 ? '…' : ''})`
+}
+
 function SourceChip({ source, onOpen }) {
-  // Backend now returns objects { fileName, absolutePath, snippets }.
+  // Backend now returns objects { fileName, absolutePath, snippets, pages }.
   // We still accept plain strings so older messages / fallback shapes don't break.
   const isString = typeof source === 'string'
   const fileName = isString ? source : source.fileName
   const absPath  = isString ? null   : source.absolutePath
   const snippets = isString ? []     : (source.snippets ?? [])
+  const pageLabel = isString ? ''    : formatPages(source.pages)
 
   const clickable = Boolean(absPath)
   const handleClick = () => { if (clickable) onOpen(absPath, fileName) }
@@ -179,13 +193,14 @@ function SourceChip({ source, onOpen }) {
         className={`src-chip${clickable ? ' clickable' : ''}`}
         onClick={handleClick}
         disabled={!clickable}
-        title={clickable ? `Open ${fileName}` : fileName}
+        title={clickable ? `Open ${fileName}${pageLabel ? ` ${pageLabel}` : ''}` : fileName}
       >
         {fileName}
+        {pageLabel && <span className="src-chip-page"> {pageLabel}</span>}
       </button>
       {snippets.length > 0 && (
         <span className="src-preview" role="tooltip">
-          <span className="src-preview-head">From {fileName}</span>
+          <span className="src-preview-head">From {fileName}{pageLabel ? ` ${pageLabel}` : ''}</span>
           {snippets.map((s, i) => (
             <span className="src-preview-snippet" key={i}>“{s}”</span>
           ))}

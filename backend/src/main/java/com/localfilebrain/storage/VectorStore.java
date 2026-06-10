@@ -79,6 +79,8 @@ public final class VectorStore implements AutoCloseable {
     private static final String F_MIME       = "mime";
     private static final String F_MTIME      = "mtime";
     private static final String F_CHAR_CNT   = "chars";
+    private static final String F_PAGE_START = "pgs";  // 1-based first page; absent/0 = unknown
+    private static final String F_PAGE_END   = "pge";  // 1-based last page;  absent/0 = unknown
 
     // HNSW build parameters. Defaults are conservative — slightly higher recall
     // than Lucene's defaults at the cost of a bit more memory during build.
@@ -170,6 +172,8 @@ public final class VectorStore implements AutoCloseable {
         doc.add(new StoredField(F_CHAR_CNT,  chunk.getCharCount()));
         doc.add(new StoredField(F_CHUNK_IDX, chunk.getChunkIndex()));
         doc.add(new StoredField(F_TOTAL,     chunk.getTotalChunks()));
+        doc.add(new StoredField(F_PAGE_START, chunk.getPageStart()));
+        doc.add(new StoredField(F_PAGE_END,   chunk.getPageEnd()));
         // Indexed AND stored so we can both filter and retrieve.
         doc.add(new IntPoint(F_CHUNK_IDX, chunk.getChunkIndex()));
         doc.add(new KnnFloatVectorField(F_VECTOR, vec, VectorSimilarityFunction.COSINE));
@@ -294,7 +298,9 @@ public final class VectorStore implements AutoCloseable {
                             d.get(F_FILE_NAME),
                             intField(d, F_CHUNK_IDX),
                             d.get(F_TEXT),
-                            0.0
+                            0.0,
+                            intField(d, F_PAGE_START),
+                            intField(d, F_PAGE_END)
                     ));
                 }
                 // Restore the original document order so the LLM reads chunks
@@ -306,6 +312,44 @@ public final class VectorStore implements AutoCloseable {
             }
         } catch (IOException e) {
             log.warn("Failed to fetch all chunks for '{}': {}", absolutePath, e.getMessage());
+            return List.of();
+        }
+    }
+
+    /**
+     * Resolves a bare file name (e.g. "PERCENTAGE-1.pdf") to the absolute
+     * path(s) of indexed files that carry that exact name. Used by the query
+     * engine's file-scope fallback so a user who types just the file name —
+     * not its full absolute path — still gets the deterministic "load this
+     * whole file" path instead of leaning on semantic search (which
+     * underperforms on worksheets / forms / question banks).
+     *
+     * Match is exact and case-sensitive ({@link #F_FILE_NAME} is a non-analyzed
+     * StringField), so it keys off the name exactly as stored at index time —
+     * which is what the Library UI shows the user. Returns distinct source
+     * paths (one name can collide across folders), or empty when no indexed
+     * file has that name.
+     */
+    public List<String> findPathsByFileName(String fileName) {
+        if (fileName == null || fileName.isBlank()) return List.of();
+        try {
+            searchers.maybeRefresh();
+            IndexSearcher searcher = searchers.acquire();
+            try {
+                TermQuery q = new TermQuery(new Term(F_FILE_NAME, fileName));
+                TopDocs td = searcher.search(q, 1000);
+                java.util.LinkedHashSet<String> paths = new java.util.LinkedHashSet<>();
+                for (ScoreDoc sd : td.scoreDocs) {
+                    Document d = searcher.storedFields().document(sd.doc);
+                    String p = d.get(F_SRC_PATH);
+                    if (p != null) paths.add(p);
+                }
+                return new ArrayList<>(paths);
+            } finally {
+                searchers.release(searcher);
+            }
+        } catch (IOException e) {
+            log.warn("Failed to resolve filename '{}': {}", fileName, e.getMessage());
             return List.of();
         }
     }
@@ -398,7 +442,9 @@ public final class VectorStore implements AutoCloseable {
                             d.get(F_FILE_NAME),
                             intField(d, F_CHUNK_IDX),
                             d.get(F_TEXT),
-                            distance
+                            distance,
+                            intField(d, F_PAGE_START),
+                            intField(d, F_PAGE_END)
                     ));
                 }
                 return results;
@@ -427,8 +473,20 @@ public final class VectorStore implements AutoCloseable {
             String fileName,
             int    chunkIndex,
             String text,
-            double distance   // cosine distance: 0 = identical, ~2 = opposite
-    ) {}
+            double distance,  // cosine distance: 0 = identical, ~2 = opposite
+            int    pageStart, // 1-based first page of source; 0 = unknown
+            int    pageEnd    // 1-based last page of source;  0 = unknown
+    ) {
+        /**
+         * Backwards-compatible constructor for callers/tests that don't carry
+         * page info — pages default to 0 (unknown). Lets existing six-arg call
+         * sites compile unchanged.
+         */
+        public SearchResult(String chunkId, String sourceFilePath, String fileName,
+                            int chunkIndex, String text, double distance) {
+            this(chunkId, sourceFilePath, fileName, chunkIndex, text, distance, 0, 0);
+        }
+    }
 
     @Override
     public synchronized void close() {

@@ -187,6 +187,7 @@ export default function Deadlines({ active }) {
   const onUpgrade = () => toast('Pro plans are coming soon — this is where upgrade will live.', 'i')
 
   const [items, setItems] = useState(null)       // ALL items; filtered client-side
+  const [missing, setMissing] = useState([])      // gaps in recurring series
   const [tab, setTab] = useState('open')          // 'open' | 'reminders'
   const [loading, setLoading] = useState(false)
   const [reminderItem, setReminderItem] = useState(null)
@@ -194,7 +195,12 @@ export default function Deadlines({ active }) {
   const load = useCallback(async () => {
     if (!api || !connected) return
     setLoading(true)
-    try { const d = await api.listDeadlines('all'); setItems(d.items ?? []) }
+    try {
+      const d = await api.listDeadlines('all'); setItems(d.items ?? [])
+      // Best-effort: missing-document gaps share the deadline scan's data.
+      try { const mz = await api.listMissingDocuments(); setMissing(mz.items ?? []) }
+      catch { setMissing([]) }
+    }
     catch (e) { toast(e.message, 'e') }
     finally { setLoading(false) }
   }, [api, connected, toast])
@@ -333,6 +339,22 @@ export default function Deadlines({ active }) {
           <div className="dl-stat up"><div className="dl-stat-n">{stat.upcoming}</div><div className="dl-stat-l">Upcoming</div></div>
           <div className="dl-stat"><div className="dl-stat-n">{stat.reminders}</div><div className="dl-stat-l">Reminders set</div></div>
         </div>
+
+        {/* Possibly-missing recurring documents (gaps in a series). */}
+        {missing.length > 0 && (
+          <div className="dl-missing">
+            <div className="dl-missing-head">Possibly missing <span className="dl-group-n">{missing.length}</span></div>
+            <ul className="dl-missing-list">
+              {missing.map((mz, i) => (
+                <li key={i} className={`dl-missing-item conf-${(mz.confidence || '').toLowerCase()}`}>
+                  <span className="dl-missing-msg">{mz.message}</span>
+                  <span className="dl-missing-tag">{mz.confidence === 'LOW' ? 'guess' : (mz.cadence || '')}</span>
+                </li>
+              ))}
+            </ul>
+            <div className="dl-missing-note">Inferred from the pattern of documents you’ve indexed — double-check before assuming.</div>
+          </div>
+        )}
 
         {/* Tabs */}
         <div className="dl-tabs">

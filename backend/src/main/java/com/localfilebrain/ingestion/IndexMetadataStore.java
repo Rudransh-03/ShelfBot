@@ -162,6 +162,24 @@ public final class IndexMetadataStore implements AutoCloseable {
                 )
                 """);
 
+            // Per-document recurring-series classification, produced by the same
+            // LLM call as the deadline scan (no extra call). One row per indexed
+            // file that the model judged to be a periodic document (e.g. a GST
+            // return or a monthly statement). The Missing-Document detector reads
+            // this whole table locally to spot gaps in a series. Invalidated for a
+            // file on re-index / delete alongside its deadlines.
+            stmt.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS document_series (
+                    absolute_path TEXT    PRIMARY KEY,
+                    file_name     TEXT    NOT NULL,
+                    content_hash  TEXT    NOT NULL,
+                    series        TEXT    NOT NULL,
+                    issuer        TEXT,
+                    period        TEXT    NOT NULL,
+                    detected_at   TEXT    NOT NULL
+                )
+                """);
+
             // Undo log for executed reorg batches. One row per file move.
             // Written BEFORE the move actually happens so a crash mid-move
             // still leaves a recoverable record. The created_destination_dir
@@ -913,18 +931,89 @@ public final class IndexMetadataStore implements AutoCloseable {
         }
     }
 
-    /** Removes a file's extracted deadlines and its scan marker (invalidation). */
+    /** Removes a file's extracted deadlines, its scan marker, and its series
+     *  classification (invalidation — all produced by the same scan pass). */
     public synchronized void clearDeadlinesForFile(String absolutePath) {
         try (PreparedStatement a = connection.prepareStatement(
                 "DELETE FROM document_deadlines WHERE absolute_path = ?");
              PreparedStatement b = connection.prepareStatement(
-                "DELETE FROM deadline_scan WHERE absolute_path = ?")) {
+                "DELETE FROM deadline_scan WHERE absolute_path = ?");
+             PreparedStatement c = connection.prepareStatement(
+                "DELETE FROM document_series WHERE absolute_path = ?")) {
             a.setString(1, absolutePath); a.executeUpdate();
             b.setString(1, absolutePath); b.executeUpdate();
+            c.setString(1, absolutePath); c.executeUpdate();
         } catch (SQLException e) {
             // Best-effort invalidation — log and continue.
             log.warn("Failed to clear deadlines for '{}': {}", absolutePath, e.getMessage());
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Document series (for the Missing-Document detector)
+    // -------------------------------------------------------------------------
+
+    /** A stored recurring-document classification. {@code issuer} may be null. */
+    public record SeriesRow(String absolutePath, String fileName, String contentHash,
+                            String series, String issuer, String period) {}
+
+    /**
+     * Upserts one file's series classification. Called from the deadline scan
+     * flush for documents the model judged periodic; non-recurring documents get
+     * no row. A no-op delete-then-skip when {@code series} or {@code period} is
+     * blank keeps the table clean if a re-scan reclassifies a doc as non-periodic.
+     */
+    public synchronized void upsertSeries(String absolutePath, String fileName, String contentHash,
+                                          String series, String issuer, String period) {
+        if (series == null || series.isBlank() || period == null || period.isBlank()) {
+            // Reclassified as non-recurring (or unknown) — ensure no stale row remains.
+            try (PreparedStatement del = connection.prepareStatement(
+                    "DELETE FROM document_series WHERE absolute_path = ?")) {
+                del.setString(1, absolutePath); del.executeUpdate();
+            } catch (SQLException e) {
+                log.warn("Failed to clear series for '{}': {}", absolutePath, e.getMessage());
+            }
+            return;
+        }
+        String sql = """
+            INSERT INTO document_series
+              (absolute_path, file_name, content_hash, series, issuer, period, detected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(absolute_path) DO UPDATE SET
+              file_name = excluded.file_name, content_hash = excluded.content_hash,
+              series = excluded.series, issuer = excluded.issuer,
+              period = excluded.period, detected_at = excluded.detected_at
+            """;
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, absolutePath);
+            ps.setString(2, fileName);
+            ps.setString(3, contentHash);
+            ps.setString(4, series.trim());
+            ps.setString(5, issuer == null ? null : issuer.trim());
+            ps.setString(6, period.trim());
+            ps.setString(7, Instant.now().toString());
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to store series for: " + absolutePath, e);
+        }
+    }
+
+    /** All recurring-document classifications across the library (for gap detection). */
+    public synchronized List<SeriesRow> listAllSeries() {
+        List<SeriesRow> out = new ArrayList<>();
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT absolute_path, file_name, content_hash, series, issuer, period FROM document_series");
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                out.add(new SeriesRow(
+                        rs.getString("absolute_path"), rs.getString("file_name"),
+                        rs.getString("content_hash"), rs.getString("series"),
+                        rs.getString("issuer"), rs.getString("period")));
+            }
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to list document series", e);
+        }
+        return out;
     }
 
     /**

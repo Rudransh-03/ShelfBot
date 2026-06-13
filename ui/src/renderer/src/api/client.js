@@ -28,14 +28,14 @@ export class ApiClient {
    *
    * Returns a function that can be called to abort the stream early.
    */
-  queryStream(q, { onToken, onDone, onError, conversationId }) {
+  queryStream(q, { onToken, onDone, onError, conversationId, clientId }) {
     const ctrl = new AbortController()
     ;(async () => {
       try {
         const res = await fetch(this.base + '/api/query/stream', {
           method:  'POST',
           headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
-          body:    JSON.stringify({ question: q, conversationId }),
+          body:    JSON.stringify({ question: q, conversationId, clientId }),
           signal:  ctrl.signal,
         })
         if (!res.ok || !res.body) {
@@ -157,6 +157,28 @@ export class ApiClient {
    * { series, issuer, period, cadence, confidence, presentCount, message }.
    */
   listMissingDocuments()        { return this._r('/api/missing') }
+
+  // ── Per-client workspaces ────────────────────────────────────────────────
+  /** [{ id, name, identifiers, fileCount }] */
+  listClients()                  { return this._r('/api/clients') }
+  /** Create a client with a name and optional identifier strings. */
+  createClient(name, identifiers = []) {
+    return this._r('/api/clients', { method: 'POST', body: JSON.stringify({ name, identifiers }) })
+  }
+  editClient(id, patch)          { return this._r(`/api/clients/${id}`, { method: 'POST', body: JSON.stringify(patch) }) }
+  deleteClient(id)               { return this._r(`/api/clients/${id}`, { method: 'DELETE' }) }
+  /** Re-tag every file against the current client list (local, no LLM). */
+  recomputeClients()             { return this._r('/api/clients/recompute', { method: 'POST' }) }
+  /** Manually pin a file to a client (clientId null = unassign). */
+  assignFileToClient(path, clientId) {
+    return this._r('/api/clients/assign', { method: 'POST', body: JSON.stringify({ path, clientId }) })
+  }
+  /** Auto-detected clients (from the scan) the user can accept: [{ key, name, gstin, pan, fileCount }]. */
+  listClientSuggestions()        { return this._r('/api/clients/suggestions') }
+  /** Accept a suggestion → creates the client + tags its files. */
+  acceptClientSuggestion(s)      { return this._r('/api/clients/accept', { method: 'POST', body: JSON.stringify(s) }) }
+  /** Hide a suggestion so it won't reappear. */
+  dismissClientSuggestion(key)   { return this._r('/api/clients/dismiss', { method: 'POST', body: JSON.stringify({ key }) }) }
 
   // ── Reorg pipeline ───────────────────────────────────────────────────────
 

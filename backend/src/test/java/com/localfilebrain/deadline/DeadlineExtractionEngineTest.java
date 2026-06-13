@@ -97,6 +97,30 @@ class DeadlineExtractionEngineTest {
     }
 
     @Test
+    void parsesDocumentEntityAndValidatesIds() {
+        String reply = """
+            { "deadlines": [],
+              "documents": [
+                {"doc":1,"series":null,"period":null,"entity":"Acme Corp",
+                 "gstin":"29ABCDE1234F1Z5","pan":"ABCDE1234F"},
+                {"doc":1,"entity":"Bad IDs Co","gstin":"NOPE","pan":"123"}
+              ] }
+            """;
+        var br = DeadlineExtractionEngine.extractBatchFull(List.of(DOC1), LocalDate.now(), (s, u) -> reply);
+        assertEquals(2, br.documents().size());
+        var d0 = br.documents().get(0);
+        assertEquals("Acme Corp", d0.entity());
+        assertEquals("29ABCDE1234F1Z5", d0.gstin());
+        assertEquals("ABCDE1234F", d0.pan());
+        assertTrue(d0.hasEntity());
+        // Malformed GSTIN/PAN are dropped (kept only when shape is valid).
+        var d1 = br.documents().get(1);
+        assertNull(d1.gstin());
+        assertNull(d1.pan());
+        assertEquals("Bad IDs Co", d1.entity());
+    }
+
+    @Test
     void promptIncludesTodayAndDocContext() {
         StringBuilder captured = new StringBuilder();
         DeadlineExtractionEngine.extractBatch(List.of(DOC1), LocalDate.of(2026, 6, 6),

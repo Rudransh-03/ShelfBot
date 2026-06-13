@@ -95,6 +95,22 @@ public final class IngestionPipeline {
     private final boolean            ownsVectorStore;
     private final boolean            ownsEmbeddingClient;
 
+    /** Optional hook invoked with a file's canonical path right after it is
+     *  (re)indexed or removed via {@link #indexOne}/{@link #removeFile} — used to
+     *  refresh that file's client membership on live watcher edits. Kept as a
+     *  plain Consumer so this package stays decoupled from the client package. */
+    private volatile java.util.function.Consumer<String> postIndexHook;
+
+    public void setPostIndexHook(java.util.function.Consumer<String> hook) { this.postIndexHook = hook; }
+
+    private void notifyIndexed(String canonicalPath) {
+        var hook = postIndexHook;
+        if (hook != null) {
+            try { hook.accept(canonicalPath); }
+            catch (Exception e) { log.warn("post-index hook failed for '{}': {}", canonicalPath, e.getMessage()); }
+        }
+    }
+
     public IngestionPipeline(AppConfig config, IndexMetadataStore metadataStore) {
         this(config, metadataStore, null, null);
     }
@@ -315,6 +331,7 @@ public final class IngestionPipeline {
                 case INDEXED -> {
                     log.info("[watcher] re-indexed '{}' ({} chunks, {} tokens)",
                             file.getFileName(), outcome.chunkCount(), outcome.tokenCount());
+                    notifyIndexed(PathNormalizer.canonical(file)); // refresh client tag
                     return outcome.chunkCount();
                 }
                 case EMPTY -> {
@@ -344,6 +361,7 @@ public final class IngestionPipeline {
         try {
             vectorStore.deleteBySourceFile(absolutePath);
             metadataStore.delete(absolutePath);
+            notifyIndexed(absolutePath); // clear any client tag for the removed file
             log.info("[watcher] removed '{}' from index", file.getFileName());
         } catch (Exception e) {
             log.warn("[watcher] failed to remove '{}': {}", file, e.getMessage());

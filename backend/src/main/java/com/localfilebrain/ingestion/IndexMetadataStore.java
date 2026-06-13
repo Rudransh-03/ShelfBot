@@ -10,7 +10,9 @@ import java.nio.file.Path;
 import java.sql.*;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -177,6 +179,63 @@ public final class IndexMetadataStore implements AutoCloseable {
                     issuer        TEXT,
                     period        TEXT    NOT NULL,
                     detected_at   TEXT    NOT NULL
+                )
+                """);
+
+            // ── Per-client workspaces (data isolation) ──────────────────────
+            // clients: the user's client list. client_identifiers: the literal
+            // tokens (GSTIN/PAN/name/alias) that identify a client inside a
+            // document or a question — matched on word boundaries. file_client:
+            // which client each indexed file belongs to; `pinned=1` means the
+            // user assigned it by hand (sticky — auto-tagging never overrides it).
+            // Isolation is enforced by filtering retrieval to a client's paths,
+            // so no cross-client chunk can ever surface.
+            stmt.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS clients (
+                    id         TEXT PRIMARY KEY,
+                    name       TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """);
+            stmt.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS client_identifiers (
+                    client_id TEXT NOT NULL,
+                    value     TEXT NOT NULL,   -- as entered (display)
+                    norm      TEXT NOT NULL,   -- normalized for matching
+                    PRIMARY KEY (client_id, norm),
+                    FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
+                )
+                """);
+            stmt.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS file_client (
+                    absolute_path TEXT PRIMARY KEY,
+                    client_id     TEXT NOT NULL,
+                    pinned        INTEGER NOT NULL DEFAULT 0,
+                    assigned_at   TEXT NOT NULL,
+                    FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
+                )
+                """);
+            stmt.executeUpdate("CREATE INDEX IF NOT EXISTS idx_file_client_client ON file_client(client_id)");
+
+            // Per-document OWNER identity captured during the scan (same LLM call
+            // as deadlines/series). Aggregated locally into suggested clients the
+            // user can accept. Invalidated with the file on re-index/delete.
+            stmt.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS document_entity (
+                    absolute_path TEXT PRIMARY KEY,
+                    content_hash  TEXT NOT NULL,
+                    entity_name   TEXT,
+                    gstin         TEXT,
+                    pan           TEXT,
+                    detected_at   TEXT NOT NULL
+                )
+                """);
+            // Suggestions the user explicitly dismissed, by canonical key, so they
+            // don't keep reappearing.
+            stmt.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS dismissed_suggestions (
+                    entity_key   TEXT PRIMARY KEY,
+                    dismissed_at TEXT NOT NULL
                 )
                 """);
 
@@ -509,6 +568,7 @@ public final class IndexMetadataStore implements AutoCloseable {
         deleteFileVector(absolutePath);
         deleteSummary(absolutePath);
         clearDeadlinesForFile(absolutePath);
+        unassignFile(absolutePath); // the file is gone — drop its client assignment
     }
 
     // -------------------------------------------------------------------------
@@ -939,10 +999,13 @@ public final class IndexMetadataStore implements AutoCloseable {
              PreparedStatement b = connection.prepareStatement(
                 "DELETE FROM deadline_scan WHERE absolute_path = ?");
              PreparedStatement c = connection.prepareStatement(
-                "DELETE FROM document_series WHERE absolute_path = ?")) {
+                "DELETE FROM document_series WHERE absolute_path = ?");
+             PreparedStatement e = connection.prepareStatement(
+                "DELETE FROM document_entity WHERE absolute_path = ?")) {
             a.setString(1, absolutePath); a.executeUpdate();
             b.setString(1, absolutePath); b.executeUpdate();
             c.setString(1, absolutePath); c.executeUpdate();
+            e.setString(1, absolutePath); e.executeUpdate();
         } catch (SQLException e) {
             // Best-effort invalidation — log and continue.
             log.warn("Failed to clear deadlines for '{}': {}", absolutePath, e.getMessage());
@@ -1013,6 +1076,272 @@ public final class IndexMetadataStore implements AutoCloseable {
         } catch (SQLException e) {
             throw new MetadataStoreException("Failed to list document series", e);
         }
+        return out;
+    }
+
+    // -------------------------------------------------------------------------
+    // Per-document owner identity (for client suggestions)
+    // -------------------------------------------------------------------------
+
+    /** A document's captured owner identity. Any field may be null. */
+    public record EntityRow(String absolutePath, String entityName, String gstin, String pan) {}
+
+    /** Stores (or clears, when all three are blank) a file's owner identity. */
+    public synchronized void upsertEntity(String absolutePath, String contentHash,
+                                          String entityName, String gstin, String pan) {
+        boolean empty = (entityName == null || entityName.isBlank())
+                && (gstin == null || gstin.isBlank()) && (pan == null || pan.isBlank());
+        if (empty) {
+            try (PreparedStatement del = connection.prepareStatement(
+                    "DELETE FROM document_entity WHERE absolute_path = ?")) {
+                del.setString(1, absolutePath); del.executeUpdate();
+            } catch (SQLException e) { log.warn("Failed to clear entity for '{}': {}", absolutePath, e.getMessage()); }
+            return;
+        }
+        String sql = """
+            INSERT INTO document_entity (absolute_path, content_hash, entity_name, gstin, pan, detected_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(absolute_path) DO UPDATE SET
+              content_hash = excluded.content_hash, entity_name = excluded.entity_name,
+              gstin = excluded.gstin, pan = excluded.pan, detected_at = excluded.detected_at
+            """;
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, absolutePath);
+            ps.setString(2, contentHash);
+            ps.setString(3, entityName);
+            ps.setString(4, gstin);
+            ps.setString(5, pan);
+            ps.setString(6, Instant.now().toString());
+            ps.executeUpdate();
+        } catch (SQLException e) { throw new MetadataStoreException("Failed to store entity for: " + absolutePath, e); }
+    }
+
+    public synchronized List<EntityRow> listAllEntities() {
+        List<EntityRow> out = new ArrayList<>();
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT absolute_path, entity_name, gstin, pan FROM document_entity");
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) out.add(new EntityRow(
+                    rs.getString("absolute_path"), rs.getString("entity_name"),
+                    rs.getString("gstin"), rs.getString("pan")));
+        } catch (SQLException e) { throw new MetadataStoreException("Failed to list entities", e); }
+        return out;
+    }
+
+    public synchronized void dismissSuggestion(String entityKey) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "INSERT OR IGNORE INTO dismissed_suggestions (entity_key, dismissed_at) VALUES (?, ?)")) {
+            ps.setString(1, entityKey); ps.setString(2, Instant.now().toString());
+            ps.executeUpdate();
+        } catch (SQLException e) { throw new MetadataStoreException("Failed to dismiss suggestion", e); }
+    }
+
+    public synchronized java.util.Set<String> dismissedSuggestionKeys() {
+        java.util.Set<String> out = new java.util.HashSet<>();
+        try (PreparedStatement ps = connection.prepareStatement("SELECT entity_key FROM dismissed_suggestions");
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) out.add(rs.getString(1));
+        } catch (SQLException e) { throw new MetadataStoreException("Failed to list dismissed suggestions", e); }
+        return out;
+    }
+
+    // -------------------------------------------------------------------------
+    // Per-client workspaces
+    // -------------------------------------------------------------------------
+
+    /** A client and its match tokens (normalized + display forms). */
+    public record Client(String id, String name, List<String> identifiers, List<String> norms) {}
+
+    /** Normalizes an identifier/match token: lowercase, trimmed, single-spaced.
+     *  Centralized so document-tagging and question-matching agree exactly. */
+    public static String normToken(String s) {
+        return s == null ? "" : s.trim().toLowerCase().replaceAll("\\s+", " ");
+    }
+
+    // Legal-form words stripped to derive a short alias, so a client registered
+    // as "Sharma Bakery Private Limited" also matches the user typing
+    // "Sharma Bakery". Without this, matching required the full legal name.
+    private static final java.util.Set<String> LEGAL_SUFFIXES = java.util.Set.of(
+            "private", "pvt", "limited", "ltd", "llp", "llc", "inc", "incorporated",
+            "corporation", "corp", "company", "co", "plc", "gmbh", "sons");
+
+    /** A short alias for a company name with legal-form suffixes stripped
+     *  (e.g. "Acme Corporation" → "Acme"), or null when nothing was stripped. */
+    static String shortName(String name) {
+        if (name == null) return null;
+        String[] toks = name.trim().split("\\s+");
+        int end = toks.length;
+        while (end > 1) {
+            String t = toks[end - 1].toLowerCase().replaceAll("[^a-z]", "");
+            if (!LEGAL_SUFFIXES.contains(t)) break;
+            end--;
+        }
+        if (end == toks.length || end == 0) return null; // nothing stripped
+        return String.join(" ", java.util.Arrays.copyOfRange(toks, 0, end));
+    }
+
+    public synchronized String createClient(String name) {
+        String id  = java.util.UUID.randomUUID().toString();
+        String now = Instant.now().toString();
+        String safe = (name == null || name.isBlank()) ? "Client" : name.trim();
+        try (PreparedStatement ps = connection.prepareStatement(
+                "INSERT INTO clients (id, name, created_at) VALUES (?, ?, ?)")) {
+            ps.setString(1, id); ps.setString(2, safe); ps.setString(3, now);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to create client", e);
+        }
+        // A client is identified by its own name out of the box, plus a
+        // legal-suffix-stripped short alias so "Sharma Bakery Private Limited"
+        // also matches "Sharma Bakery".
+        addClientIdentifier(id, safe);
+        String alias = shortName(safe);
+        if (alias != null && !normToken(alias).equals(normToken(safe))) addClientIdentifier(id, alias);
+        return id;
+    }
+
+    public synchronized void renameClient(String id, String name) {
+        if (name == null || name.isBlank()) return;
+        try (PreparedStatement ps = connection.prepareStatement(
+                "UPDATE clients SET name = ? WHERE id = ?")) {
+            ps.setString(1, name.trim()); ps.setString(2, id); ps.executeUpdate();
+        } catch (SQLException e) { throw new MetadataStoreException("Failed to rename client", e); }
+    }
+
+    /** Deletes a client and all its identifiers + file assignments. */
+    public synchronized void deleteClient(String id) {
+        try {
+            for (String sql : new String[]{
+                    "DELETE FROM file_client WHERE client_id = ?",
+                    "DELETE FROM client_identifiers WHERE client_id = ?",
+                    "DELETE FROM clients WHERE id = ?"}) {
+                try (PreparedStatement ps = connection.prepareStatement(sql)) {
+                    ps.setString(1, id); ps.executeUpdate();
+                }
+            }
+        } catch (SQLException e) { throw new MetadataStoreException("Failed to delete client", e); }
+    }
+
+    /** Adds a match token to a client. Blank or too-short (<3 chars normalized)
+     *  tokens are rejected — they'd cause false matches. Idempotent. */
+    public synchronized boolean addClientIdentifier(String clientId, String value) {
+        if (value == null) return false;
+        String norm = normToken(value);
+        if (norm.length() < 3) return false;
+        try (PreparedStatement ps = connection.prepareStatement(
+                "INSERT OR IGNORE INTO client_identifiers (client_id, value, norm) VALUES (?, ?, ?)")) {
+            ps.setString(1, clientId); ps.setString(2, value.trim()); ps.setString(3, norm);
+            ps.executeUpdate();
+            return true;
+        } catch (SQLException e) { throw new MetadataStoreException("Failed to add identifier", e); }
+    }
+
+    public synchronized void removeClientIdentifier(String clientId, String value) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "DELETE FROM client_identifiers WHERE client_id = ? AND norm = ?")) {
+            ps.setString(1, clientId); ps.setString(2, normToken(value)); ps.executeUpdate();
+        } catch (SQLException e) { throw new MetadataStoreException("Failed to remove identifier", e); }
+    }
+
+    public synchronized List<Client> listClients() {
+        Map<String, Client> byId = new LinkedHashMap<>();
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT id, name FROM clients ORDER BY name COLLATE NOCASE");
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                byId.put(rs.getString("id"),
+                        new Client(rs.getString("id"), rs.getString("name"),
+                                new ArrayList<>(), new ArrayList<>()));
+            }
+        } catch (SQLException e) { throw new MetadataStoreException("Failed to list clients", e); }
+        if (byId.isEmpty()) return List.of();
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT client_id, value, norm FROM client_identifiers");
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                Client c = byId.get(rs.getString("client_id"));
+                if (c != null) { c.identifiers().add(rs.getString("value")); c.norms().add(rs.getString("norm")); }
+            }
+        } catch (SQLException e) { throw new MetadataStoreException("Failed to list identifiers", e); }
+        return new ArrayList<>(byId.values());
+    }
+
+    public synchronized int countClients() {
+        try (PreparedStatement ps = connection.prepareStatement("SELECT COUNT(*) FROM clients");
+             ResultSet rs = ps.executeQuery()) {
+            return rs.next() ? rs.getInt(1) : 0;
+        } catch (SQLException e) { throw new MetadataStoreException("Failed to count clients", e); }
+    }
+
+    /** Whether a client id exists (guards stale focus / bad input). */
+    public synchronized boolean clientExists(String clientId) {
+        if (clientId == null) return false;
+        try (PreparedStatement ps = connection.prepareStatement("SELECT 1 FROM clients WHERE id = ?")) {
+            ps.setString(1, clientId);
+            try (ResultSet rs = ps.executeQuery()) { return rs.next(); }
+        } catch (SQLException e) { throw new MetadataStoreException("Failed to check client", e); }
+    }
+
+    /** Assigns a file to a client. {@code pinned} marks a manual (sticky) assignment. */
+    public synchronized void assignFileToClient(String absolutePath, String clientId, boolean pinned) {
+        try (PreparedStatement ps = connection.prepareStatement("""
+                INSERT INTO file_client (absolute_path, client_id, pinned, assigned_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(absolute_path) DO UPDATE SET
+                  client_id = excluded.client_id, pinned = excluded.pinned,
+                  assigned_at = excluded.assigned_at
+                """)) {
+            ps.setString(1, absolutePath); ps.setString(2, clientId);
+            ps.setInt(3, pinned ? 1 : 0); ps.setString(4, Instant.now().toString());
+            ps.executeUpdate();
+        } catch (SQLException e) { throw new MetadataStoreException("Failed to assign file", e); }
+    }
+
+    /** Removes a file's client assignment. */
+    public synchronized void unassignFile(String absolutePath) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "DELETE FROM file_client WHERE absolute_path = ?")) {
+            ps.setString(1, absolutePath); ps.executeUpdate();
+        } catch (SQLException e) { log.warn("Failed to unassign '{}': {}", absolutePath, e.getMessage()); }
+    }
+
+    public synchronized boolean isFilePinned(String absolutePath) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT pinned FROM file_client WHERE absolute_path = ?")) {
+            ps.setString(1, absolutePath);
+            try (ResultSet rs = ps.executeQuery()) { return rs.next() && rs.getInt("pinned") == 1; }
+        } catch (SQLException e) { throw new MetadataStoreException("Failed to check pin", e); }
+    }
+
+    /** All file paths belonging to a client. */
+    public synchronized List<String> pathsForClient(String clientId) {
+        List<String> out = new ArrayList<>();
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT absolute_path FROM file_client WHERE client_id = ?")) {
+            ps.setString(1, clientId);
+            try (ResultSet rs = ps.executeQuery()) { while (rs.next()) out.add(rs.getString(1)); }
+        } catch (SQLException e) { throw new MetadataStoreException("Failed to list client paths", e); }
+        return out;
+    }
+
+    /** Every assigned path (any client) — used to derive the "unassigned" set. */
+    public synchronized java.util.Set<String> allAssignedPaths() {
+        java.util.Set<String> out = new java.util.HashSet<>();
+        try (PreparedStatement ps = connection.prepareStatement("SELECT absolute_path FROM file_client");
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) out.add(rs.getString(1));
+        } catch (SQLException e) { throw new MetadataStoreException("Failed to list assigned paths", e); }
+        return out;
+    }
+
+    /** All indexed file paths (INDEXED status). */
+    public synchronized List<String> listIndexedPaths() {
+        List<String> out = new ArrayList<>();
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT absolute_path FROM file_index WHERE status = 'INDEXED'");
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) out.add(rs.getString(1));
+        } catch (SQLException e) { throw new MetadataStoreException("Failed to list indexed paths", e); }
         return out;
     }
 

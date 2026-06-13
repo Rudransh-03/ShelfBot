@@ -211,7 +211,8 @@ function SourceChip({ source, onOpen }) {
 }
 
 function Message({ role, text, sources = [], variant, onOpenSource, streaming = false,
-                   highlight = '', occOffset = 0, activeMatch = -1, activeRef }) {
+                   highlight = '', occOffset = 0, activeMatch = -1, activeRef,
+                   clarify, clarifyQuestion, scope, onClarify }) {
   const [copied, setCopied] = useState(false)
 
   const copy = async () => {
@@ -245,6 +246,17 @@ function Message({ role, text, sources = [], variant, onOpenSource, streaming = 
       {role === 'ai' ? <AiAvatar /> : <UserAvatar />}
       <div className="msg-content">
         <div className={`msg-bubble${variant ? ` ${variant}` : ''}`}>{body}</div>
+        {Array.isArray(clarify) && clarify.length > 0 && (
+          <div className="clarify-chips">
+            {clarify.map(opt => (
+              <button key={opt.id} className="clarify-chip"
+                      onClick={() => onClarify?.(clarifyQuestion, opt.id)}>
+                {opt.name}
+              </button>
+            ))}
+          </div>
+        )}
+        {scope && <div className="msg-scope">Answering about: {scope}</div>}
         {sources.length > 0 && (
           <div className="msg-sources">
             {sources.map((s, i) => (
@@ -300,6 +312,11 @@ export default function Chat({ active }) {
   const [input,    setInput]      = useState('')
   const [loading,  setLoading]    = useState(false)
   const [justAnswered, setJustAnswered] = useState(false)
+  // Per-client workspaces. `clients` drives the scope picker (hidden when none
+  // exist, so the feature is invisible until set up). `scopeChoice`: 'auto'
+  // (let Rudo decide / ask), a client id, '__unassigned__', or '__all__'.
+  const [clients, setClients] = useState([])
+  const [scopeChoice, setScopeChoice] = useState('auto')
   const msgsRef  = useRef(null)
   const inputRef = useRef(null)
   // Which conversation's messages are currently displayed. Lets us skip a
@@ -404,7 +421,13 @@ export default function Chat({ active }) {
     setActiveMatch(a => (find.total === 0 ? 0 : (a + dir + find.total) % find.total))
   }, [find.total])
 
-  const sendMessage = useCallback(async (question) => {
+  // Load the client list so the scope picker can appear (only when clients exist).
+  useEffect(() => {
+    if (!api || !connected) return
+    api.listClients().then(d => setClients(d.clients ?? [])).catch(() => {})
+  }, [api, connected, active])
+
+  const sendMessage = useCallback(async (question, overrideClientId) => {
     if (!question?.trim() || !connected || loading) return
 
     setInput('')
@@ -437,11 +460,16 @@ export default function Chat({ active }) {
     }
 
     await new Promise((resolve) => {
+      const clientId = overrideClientId ?? (scopeChoice === 'auto' ? undefined : scopeChoice)
       api.queryStream(question, {
         conversationId: activeConversationId,
+        clientId,
         onToken: appendToken,
-        onDone:  ({ sources = [], found = true, conversationId: cid }) => {
-          finalize({ sources, variant: !found ? 'not-found' : undefined })
+        onDone:  ({ sources = [], found = true, conversationId: cid, clarify, scope }) => {
+          // `clarify` (array of {id,name}) means Rudo needs to know which client;
+          // we stash it + the question on the bubble so its chips can re-ask.
+          finalize({ sources, variant: !found ? 'not-found' : undefined,
+                     clarify, clarifyQuestion: question, scope })
           // Adopt the thread id without triggering a reload of the messages
           // we just streamed (loadedIdRef is set before the state update).
           if (cid) { loadedIdRef.current = cid; setActiveConversationId(cid) }
@@ -459,7 +487,7 @@ export default function Chat({ active }) {
     setTimeout(() => setJustAnswered(false), 2200)
     refreshAuth()
     refreshConversations() // surface the new/updated thread + auto-title in the rail
-  }, [api, connected, loading, refreshAuth, activeConversationId, setActiveConversationId, refreshConversations])
+  }, [api, connected, loading, refreshAuth, activeConversationId, setActiveConversationId, refreshConversations, scopeChoice])
 
   const handleKey = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(input) }
@@ -507,6 +535,19 @@ export default function Chat({ active }) {
               <div className="view-subtitle">Conversation with your library</div>
             </div>
             <div className="header-actions">
+              {clients.length > 0 && (
+                <select
+                  className="scope-picker"
+                  value={scopeChoice}
+                  onChange={e => setScopeChoice(e.target.value)}
+                  title="Which client this chat is about"
+                >
+                  <option value="auto">Auto (ask if unsure)</option>
+                  {clients.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                  <option value="__unassigned__">Personal / unfiled</option>
+                  <option value="__all__">All documents</option>
+                </select>
+              )}
               <button className="icon-btn" onClick={newConversation} title="New chat">
                 <PlusIcon />
               </button>
@@ -559,6 +600,10 @@ export default function Chat({ active }) {
                 occOffset={find.offsets[i] || 0}
                 activeMatch={activeMatch}
                 activeRef={activeMatchRef}
+                clarify={m.clarify}
+                clarifyQuestion={m.clarifyQuestion}
+                scope={m.scope}
+                onClarify={(q, cid) => sendMessage(q, cid)}
               />
             )
           ))}

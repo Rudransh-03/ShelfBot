@@ -6,6 +6,9 @@ import com.localfilebrain.config.AppConfig;
 import com.localfilebrain.deadline.DeadlineScanService;
 import com.localfilebrain.embedding.EmbeddingClient;
 import com.localfilebrain.chat.ChatStore;
+import com.localfilebrain.client.ClientResolver;
+import com.localfilebrain.client.EntitySuggester;
+import com.localfilebrain.client.MembershipEngine;
 import com.localfilebrain.ingestion.IndexMetadataStore;
 import com.localfilebrain.ingestion.IngestionPipeline;
 import com.localfilebrain.ingestion.TextExtractor;
@@ -181,6 +184,7 @@ public final class ApiServer {
         server.createContext("/api/deadlines/scan", this::handleDeadlineScan);
         server.createContext("/api/deadlines",      this::handleDeadlines);
         server.createContext("/api/missing",        this::handleMissing);
+        server.createContext("/api/clients",         this::handleClients);
         server.createContext("/api/auth",         this::handleAuth);
         server.createContext("/api/reorg/preview", this::handleReorgPreview);
         server.createContext("/api/reorg/execute", this::handleReorgExecute);
@@ -365,6 +369,13 @@ public final class ApiServer {
                     }
                 });
                 indexingStatus.set(new IndexingStatus(false, result, null));
+                // Refresh client membership after indexing so newly-added files
+                // get auto-filed to their client and changed files lose any stale
+                // tag (manual pins are preserved). No-op when no clients exist.
+                if (metadataStore.countClients() > 0) {
+                    try { recomputeMembership(); }
+                    catch (Exception e) { log.warn("post-index membership recompute failed: {}", e.getMessage()); }
+                }
             } catch (Throwable t) {
                 log.error("Indexing job failed", t);
                 String msg = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
@@ -395,14 +406,31 @@ public final class ApiServer {
 
             getOrInitQueryEngine(); // surface config errors before creating a thread
             String convId = resolveConversation(req.get("conversationId"), question);
+
+            ScopeDecision sd = resolveScope(req.get("clientId"), convId, question);
+            if (sd.clarify) {
+                ChatStore cs = chatStore();
+                cs.addMessage(convId, "user", question);
+                cs.addMessage(convId, "assistant", sd.message, null);
+                sendJson(ex, 200, map(
+                    "answer",         sd.message,
+                    "sources",        List.of(),
+                    "found",          true,
+                    "conversationId", convId,
+                    "clarify",        sd.options
+                ));
+                return;
+            }
+
             QueryEngine.QueryResult result =
-                    answerInConversation(convId, question, e -> e.query(question));
+                    answerInConversation(convId, question, e -> e.query(question, sd.allowedPaths));
 
             sendJson(ex, 200, map(
                 "answer",         result.answer(),
                 "sources",        result.sourceFiles(),
                 "found",          result.found(),
-                "conversationId", convId
+                "conversationId", convId,
+                "scope",          sd.label
             ));
         } catch (AppConfig.ConfigurationException e) {
             sendError(ex, 503, "OpenAI API key not configured: " + e.getMessage());
@@ -433,10 +461,12 @@ public final class ApiServer {
         // Read + validate request body before opening the stream.
         String question;
         Object conversationIdRaw = null;
+        Object clientIdRaw = null;
         try {
             Map<?, ?> req = readJson(ex);
             question = (String) req.get("question");
             conversationIdRaw = req.get("conversationId");
+            clientIdRaw = req.get("clientId");
             if (question == null || question.isBlank()) {
                 sendError(ex, 400, "question is required");
                 return;
@@ -460,12 +490,30 @@ public final class ApiServer {
         try {
             getOrInitQueryEngine(); // surface config errors before creating a thread
             String convId = resolveConversation(conversationIdRaw, question);
+
+            ScopeDecision sd = resolveScope(clientIdRaw, convId, question);
+            if (sd.clarify) {
+                // Ambiguous client → emit the clarifying question as one token and
+                // close with the options; no retrieval happens.
+                ChatStore cs = chatStore();
+                cs.addMessage(convId, "user", question);
+                cs.addMessage(convId, "assistant", sd.message, null);
+                writeSseEvent(out, "token", sd.message);
+                Map<String, Object> cl = new LinkedHashMap<>();
+                cl.put("found", true);
+                cl.put("sources", List.of());
+                cl.put("conversationId", convId);
+                cl.put("clarify", sd.options);
+                writeSseEvent(out, "done", mapper.writeValueAsString(cl));
+                return;
+            }
+
             QueryEngine.QueryResult result = answerInConversation(convId, question, engine ->
                 engine.queryStream(question, token -> {
                     try {
                         writeSseEvent(out, "token", token);
                     } catch (IOException ignored) { /* client disconnected — outer try cleans up */ }
-                }));
+                }, sd.allowedPaths));
 
             // Final summary event with sources + found flag + the thread id
             // (lets the UI adopt a freshly-created conversation), encoded as JSON.
@@ -473,6 +521,7 @@ public final class ApiServer {
             summary.put("found",          result.found());
             summary.put("sources",        result.sourceFiles());
             summary.put("conversationId", convId);
+            summary.put("scope",          sd.label);
             writeSseEvent(out, "done", mapper.writeValueAsString(summary));
 
         } catch (Exception e) {
@@ -1060,6 +1109,221 @@ public final class ApiServer {
      * sent if it still exists; otherwise opens a fresh thread titled from the
      * first question. Returns the id to hand back to the UI.
      */
+    // ─────────────────────────────────────────────────────────────────────────
+    // Per-client isolation: scope resolution
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static final String UNASSIGNED = "__unassigned__";
+    private static final String ALL_SCOPE  = "__all__";
+
+    /** The outcome of resolving which client a question is about. */
+    private record ScopeDecision(
+            boolean clarify,
+            java.util.Set<String> allowedPaths,   // null = search everything
+            String clientId,                       // focus to persist (null/sentinel ok)
+            String label,                          // "Answering about: X" (null when unscoped)
+            List<Map<String, Object>> options,     // clarify chips
+            String message) {                      // clarify question text
+        static ScopeDecision unscoped() { return new ScopeDecision(false, null, null, null, null, null); }
+        static ScopeDecision scoped(java.util.Set<String> paths, String clientId, String label) {
+            return new ScopeDecision(false, paths, clientId, label, null, null);
+        }
+        static ScopeDecision clarify(List<Map<String, Object>> options, String message) {
+            return new ScopeDecision(true, null, null, null, options, message);
+        }
+    }
+
+    /**
+     * Decides the retrieval scope for this turn and updates the conversation's
+     * remembered client. Order: explicit UI/clarify override → automatic
+     * resolution from the question + carried focus. Returns a clarify decision
+     * when the target client is ambiguous or unspecified (never guesses).
+     */
+    private ScopeDecision resolveScope(Object clientIdRaw, String convId, String question) {
+        List<IndexMetadataStore.Client> clients = metadataStore.listClients();
+        if (clients.isEmpty()) return ScopeDecision.unscoped(); // feature dormant — behaves as before
+
+        ChatStore cs = chatStore();
+        String focus = cs.getFocus(convId);
+
+        // 1. Explicit choice from the UI picker or a clarify chip.
+        if (clientIdRaw instanceof String cid && !cid.isBlank()) {
+            if (ALL_SCOPE.equals(cid)) { cs.setFocus(convId, null); return ScopeDecision.unscoped(); }
+            if (UNASSIGNED.equals(cid)) {
+                cs.setFocus(convId, UNASSIGNED);
+                return ScopeDecision.scoped(unassignedPaths(), UNASSIGNED, "Personal / unfiled");
+            }
+            if (metadataStore.clientExists(cid)) {
+                cs.setFocus(convId, cid);
+                return ScopeDecision.scoped(new java.util.HashSet<>(metadataStore.pathsForClient(cid)),
+                        cid, clientName(clients, cid));
+            }
+            // Unknown id → ignore and fall through to automatic resolution.
+        }
+
+        // 2. Automatic resolution. Only a real (still-existing) client counts as focus.
+        String realFocus = (focus != null && metadataStore.clientExists(focus)) ? focus : null;
+        ClientResolver.Resolution r = ClientResolver.resolve(question, realFocus, clients);
+        switch (r.kind()) {
+            case NONE -> { return ScopeDecision.unscoped(); }
+            case SCOPED -> {
+                cs.setFocus(convId, r.clientId());
+                return ScopeDecision.scoped(new java.util.HashSet<>(metadataStore.pathsForClient(r.clientId())),
+                        r.clientId(), clientName(clients, r.clientId()));
+            }
+            case CLARIFY -> {
+                // Carry an explicit "Personal / unfiled" choice across plain follow-ups.
+                if (UNASSIGNED.equals(focus) && "no client specified".equals(r.reason())) {
+                    return ScopeDecision.scoped(unassignedPaths(), UNASSIGNED, "Personal / unfiled");
+                }
+                return ScopeDecision.clarify(clarifyOptions(clients, r.candidateIds()), clarifyMessage());
+            }
+        }
+        return ScopeDecision.unscoped();
+    }
+
+    /** Indexed files that belong to no client. */
+    private java.util.Set<String> unassignedPaths() {
+        java.util.Set<String> assigned = metadataStore.allAssignedPaths();
+        java.util.Set<String> out = new java.util.HashSet<>();
+        for (String p : metadataStore.listIndexedPaths()) if (!assigned.contains(p)) out.add(p);
+        return out;
+    }
+
+    private static String clientName(List<IndexMetadataStore.Client> clients, String id) {
+        for (var c : clients) if (c.id().equals(id)) return c.name();
+        return "this client";
+    }
+
+    private static String clarifyMessage() {
+        return "I can only answer about one client at a time, and I'm not sure which you mean. "
+             + "Which should I use?";
+    }
+
+    private List<Map<String, Object>> clarifyOptions(List<IndexMetadataStore.Client> clients, List<String> candidateIds) {
+        List<Map<String, Object>> opts = new ArrayList<>();
+        for (String id : candidateIds) opts.add(map("id", id, "name", clientName(clients, id)));
+        opts.add(map("id", UNASSIGNED, "name", "Personal / unfiled"));
+        return opts;
+    }
+
+    /** GET list · POST create · POST recompute · POST assign · POST {id} edit · DELETE {id}. */
+    private void handleClients(HttpExchange ex) throws IOException {
+        if (preflight(ex)) return;
+        try {
+            String base = "/api/clients";
+            String path = ex.getRequestURI().getPath();
+            String sub  = path.length() > base.length() ? path.substring(base.length() + 1) : "";
+            if (sub.endsWith("/")) sub = sub.substring(0, sub.length() - 1);
+
+            if (sub.isEmpty() && isMethod(ex, "GET")) { sendJson(ex, 200, map("clients", listClientsJson())); return; }
+
+            if (sub.isEmpty() && isMethod(ex, "POST")) {
+                Map<?, ?> body = readJson(ex);
+                String name = String.valueOf(body.get("name"));
+                String id = metadataStore.createClient(name);
+                // Optional identifiers supplied at creation.
+                Object ids = body.get("identifiers");
+                if (ids instanceof List<?> list) for (Object v : list) metadataStore.addClientIdentifier(id, String.valueOf(v));
+                recomputeMembership();
+                sendJson(ex, 200, map("id", id));
+                return;
+            }
+
+            if ("recompute".equals(sub) && isMethod(ex, "POST")) {
+                MembershipEngine.Result r = recomputeMembership();
+                sendJson(ex, 200, map("assigned", r.assigned(), "conflicted", r.conflicted(), "unmatched", r.unmatched()));
+                return;
+            }
+
+            if ("assign".equals(sub) && isMethod(ex, "POST")) {
+                Map<?, ?> body = readJson(ex);
+                String p = (String) body.get("path");
+                Object cidObj = body.get("clientId");
+                if (p == null || p.isBlank()) { sendError(ex, 400, "path required"); return; }
+                if (cidObj == null) { metadataStore.unassignFile(p); }
+                else { metadataStore.assignFileToClient(p, String.valueOf(cidObj), true); } // manual = pinned
+                sendJson(ex, 200, map("ok", true));
+                return;
+            }
+
+            if ("suggestions".equals(sub) && isMethod(ex, "GET")) {
+                List<EntitySuggester.Suggestion> sugg = EntitySuggester.suggest(
+                        metadataStore.listAllEntities(), metadataStore.listClients(),
+                        metadataStore.dismissedSuggestionKeys());
+                List<Map<String, Object>> items = new ArrayList<>();
+                for (var s : sugg) items.add(map(
+                        "key", s.key(), "name", s.name(), "gstin", s.gstin(),
+                        "pan", s.pan(), "fileCount", s.fileCount()));
+                sendJson(ex, 200, map("suggestions", items));
+                return;
+            }
+
+            if ("accept".equals(sub) && isMethod(ex, "POST")) {
+                Map<?, ?> body = readJson(ex);
+                String name = body.get("name") == null ? null : String.valueOf(body.get("name"));
+                if (name == null || name.isBlank()) { sendError(ex, 400, "name required"); return; }
+                String id = metadataStore.createClient(name); // name auto-added as identifier
+                if (body.get("gstin") != null) metadataStore.addClientIdentifier(id, String.valueOf(body.get("gstin")));
+                if (body.get("pan")   != null) metadataStore.addClientIdentifier(id, String.valueOf(body.get("pan")));
+                // Caller can defer the (whole-library) recompute when accepting
+                // many suggestions at once, then recompute a single time.
+                if (!Boolean.FALSE.equals(body.get("recompute"))) recomputeMembership();
+                sendJson(ex, 200, map("id", id));
+                return;
+            }
+
+            if ("dismiss".equals(sub) && isMethod(ex, "POST")) {
+                Map<?, ?> body = readJson(ex);
+                String key = body.get("key") == null ? null : String.valueOf(body.get("key"));
+                if (key == null || key.isBlank()) { sendError(ex, 400, "key required"); return; }
+                metadataStore.dismissSuggestion(key);
+                sendJson(ex, 200, map("ok", true));
+                return;
+            }
+
+            // /api/clients/{id} — edit or delete.
+            if (!sub.isEmpty()) {
+                String id = sub;
+                if (isMethod(ex, "DELETE")) {
+                    metadataStore.deleteClient(id);
+                    recomputeMembership();
+                    sendJson(ex, 200, map("ok", true));
+                    return;
+                }
+                if (isMethod(ex, "POST")) {
+                    Map<?, ?> body = readJson(ex);
+                    if (body.get("name") != null) metadataStore.renameClient(id, String.valueOf(body.get("name")));
+                    if (body.get("addIdentifier") != null) metadataStore.addClientIdentifier(id, String.valueOf(body.get("addIdentifier")));
+                    if (body.get("removeIdentifier") != null) metadataStore.removeClientIdentifier(id, String.valueOf(body.get("removeIdentifier")));
+                    recomputeMembership();
+                    sendJson(ex, 200, map("ok", true));
+                    return;
+                }
+            }
+            methodNotAllowed(ex);
+        } catch (Exception e) {
+            log.warn("/api/clients failed", e);
+            sendError(ex, 500, e.getMessage());
+        }
+    }
+
+    private MembershipEngine.Result recomputeMembership() {
+        return new MembershipEngine(metadataStore, vectorStore).recomputeAll();
+    }
+
+    private List<Map<String, Object>> listClientsJson() {
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (IndexMetadataStore.Client c : metadataStore.listClients()) {
+            out.add(map(
+                "id",          c.id(),
+                "name",        c.name(),
+                "identifiers", c.identifiers(),
+                "fileCount",   metadataStore.pathsForClient(c.id()).size()));
+        }
+        return out;
+    }
+
     private String resolveConversation(Object conversationIdRaw, String question) {
         ChatStore cs = chatStore();
         String convId = conversationIdRaw instanceof String s ? s : null;

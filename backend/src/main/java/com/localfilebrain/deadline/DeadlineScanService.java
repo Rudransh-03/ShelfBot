@@ -223,12 +223,18 @@ public final class DeadlineScanService {
             meta.replaceDeadlinesForFile(doc.absolutePath, doc.fileName, doc.contentHash, toStore);
             found += toStore.size();
 
-            // Store (or clear) this document's recurring-series classification.
+            // Store (or clear) this document's recurring-series classification
+            // and its owner identity (for client suggestions) — both from the
+            // same call.
             DeadlineExtractionEngine.DocClassification dc = classByDoc.get(en.getKey());
             meta.upsertSeries(doc.absolutePath, doc.fileName, doc.contentHash,
                     dc == null ? null : dc.series(),
                     dc == null ? null : dc.issuer(),
                     dc == null ? null : dc.period());
+            meta.upsertEntity(doc.absolutePath, doc.contentHash,
+                    dc == null ? null : dc.entity(),
+                    dc == null ? null : dc.gstin(),
+                    dc == null ? null : dc.pan());
         }
         return new FlushResult(found, null, null);
     }

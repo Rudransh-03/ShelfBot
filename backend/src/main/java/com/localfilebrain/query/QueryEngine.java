@@ -233,6 +233,18 @@ public final class QueryEngine {
      * the sources to the client once the stream ends.
      */
     public QueryResult queryStream(String question, java.util.function.Consumer<String> onToken) {
+        return queryStream(question, onToken, null);
+    }
+
+    /**
+     * Scoped streaming variant. {@code allowedPaths} restricts retrieval to a set
+     * of source files (per-client isolation): null = no restriction (default),
+     * empty = the active scope has no documents → not-found, non-empty = only
+     * those files are searchable. Enforced inside the vector search and the
+     * file-scope shortcut, so nothing outside the scope can ever surface.
+     */
+    public QueryResult queryStream(String question, java.util.function.Consumer<String> onToken,
+                                   java.util.Set<String> allowedPaths) {
         if (question == null || question.isBlank()) {
             return QueryResult.notFound("Please enter a question.");
         }
@@ -264,7 +276,10 @@ public final class QueryEngine {
         // the LLM that file's full chunk list. Semantic vectors of "give a
         // half page brief of /Users/.../foo.pdf" don't reliably hit the
         // doc's content chunks, but the user clearly meant that one file.
-        java.util.Optional<String> scoped = detectFileScope(trimmed);
+        // Active client scope has no documents → nothing to search.
+        if (allowedPaths != null && allowedPaths.isEmpty()) return notFound(trimmed);
+
+        java.util.Optional<String> scoped = detectFileScope(trimmed, allowedPaths);
         if (scoped.isPresent()) {
             String scopedAnswer = answerFromFileScopeStream(trimmed, scoped.get(), onToken);
             if (scopedAnswer != null) return scopedAnswer.isEmpty()
@@ -275,7 +290,7 @@ public final class QueryEngine {
         List<float[]> embeddings  = embeddingClient.embedBatch(List.of(trimmed));
         float[]       queryVector = embeddings.get(0);
 
-        List<SearchResult> matches = vectorStore.query(queryVector, TOP_K);
+        List<SearchResult> matches = vectorStore.query(queryVector, TOP_K, allowedPaths);
         if (matches.isEmpty() || matches.get(0).distance() > RELEVANCE_THRESHOLD) {
             return notFound(trimmed);
         }
@@ -317,6 +332,12 @@ public final class QueryEngine {
     }
 
     public QueryResult query(String question) {
+        return query(question, null);
+    }
+
+    /** Scoped variant — see {@link #queryStream(String, java.util.function.Consumer, java.util.Set)}
+     *  for what {@code allowedPaths} means. */
+    public QueryResult query(String question, java.util.Set<String> allowedPaths) {
         if (question == null || question.isBlank()) {
             return QueryResult.notFound("Please enter a question.");
         }
@@ -337,8 +358,11 @@ public final class QueryEngine {
             return QueryResult.found(followUpAnswer, List.of());
         }
 
+        // Active client scope has no documents → nothing to search.
+        if (allowedPaths != null && allowedPaths.isEmpty()) return notFound(trimmed);
+
         // File-targeted path — see streaming variant for the rationale.
-        java.util.Optional<String> scoped = detectFileScope(trimmed);
+        java.util.Optional<String> scoped = detectFileScope(trimmed, allowedPaths);
         if (scoped.isPresent()) {
             String scopedAnswer = answerFromFileScope(trimmed, scoped.get());
             if (scopedAnswer != null) return scopedAnswer.isEmpty()
@@ -349,7 +373,7 @@ public final class QueryEngine {
         List<float[]> embeddings  = embeddingClient.embedBatch(List.of(trimmed));
         float[]       queryVector = embeddings.get(0);
 
-        List<SearchResult> matches = vectorStore.query(queryVector, TOP_K);
+        List<SearchResult> matches = vectorStore.query(queryVector, TOP_K, allowedPaths);
 
         if (matches.isEmpty()) {
             log.info("VectorStore returned no matches");
@@ -732,8 +756,12 @@ public final class QueryEngine {
      * the same name lives in two folders we can't tell which the user meant, so
      * we fall through to semantic search rather than guess. A path/name is
      * considered indexed only when the Lucene store has at least one chunk for it.
+     *
+     * When {@code allowedPaths} is non-null (a client scope is active), a named
+     * file is only honoured if it's inside that scope — so naming another
+     * client's file can't cross the boundary either.
      */
-    private java.util.Optional<String> detectFileScope(String question) {
+    private java.util.Optional<String> detectFileScope(String question, java.util.Set<String> allowedPaths) {
         if (question == null) return java.util.Optional.empty();
 
         // 1. Explicit absolute path pasted into the question.
@@ -741,6 +769,7 @@ public final class QueryEngine {
         while (m.find()) {
             String candidate = stripTrailingPunctuation(m.group(1));
             String canonical = PathNormalizer.canonical(candidate);
+            if (!inScope(canonical, allowedPaths)) continue;
             if (!vectorStore.getChunksForFile(canonical).isEmpty()) {
                 return java.util.Optional.of(canonical);
             }
@@ -752,13 +781,19 @@ public final class QueryEngine {
         java.util.regex.Matcher fm = FILENAME_IN_QUESTION.matcher(question);
         while (fm.find()) {
             String name = stripTrailingPunctuation(fm.group(1));
-            List<String> paths = vectorStore.findPathsByFileName(name);
+            List<String> paths = vectorStore.findPathsByFileName(name).stream()
+                    .filter(p -> inScope(p, allowedPaths))
+                    .collect(Collectors.toList());
             if (paths.size() == 1) {
                 log.info("File-scope resolved bare filename '{}' → {}", name, paths.get(0));
                 return java.util.Optional.of(paths.get(0));
             }
         }
         return java.util.Optional.empty();
+    }
+
+    private static boolean inScope(String path, java.util.Set<String> allowedPaths) {
+        return allowedPaths == null || allowedPaths.contains(path);
     }
 
     /** Trims trailing punctuation that's almost never part of a real path/name. */

@@ -42,6 +42,130 @@ const CloseIcon = () => (
   </svg>
 )
 
+// ── Per-client workspaces management ─────────────────────────────────────────
+function ClientsCard({ api, connected, toast }) {
+  const [clients, setClients] = useState([])
+  const [suggestions, setSuggestions] = useState([])
+  const [newName, setNewName] = useState('')
+  const [newIds, setNewIds]   = useState('')
+  const [busy, setBusy]       = useState(false)
+
+  const load = () => {
+    if (!api || !connected) return
+    api.listClients().then(d => setClients(d.clients ?? [])).catch(() => {})
+    api.listClientSuggestions().then(d => setSuggestions(d.suggestions ?? [])).catch(() => {})
+  }
+  useEffect(load, [api, connected]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const accept = async (s) => {
+    try { await api.acceptClientSuggestion({ name: s.name, gstin: s.gstin, pan: s.pan }); load(); toast('Client added', 's') }
+    catch (e) { toast(e.message, 'e') }
+  }
+  const dismiss = async (key) => {
+    try { await api.dismissClientSuggestion(key); load() } catch (e) { toast(e.message, 'e') }
+  }
+
+  const create = async () => {
+    if (!newName.trim()) return
+    setBusy(true)
+    try {
+      // Identifiers: comma/newline separated GSTIN / PAN / names / aliases.
+      const ids = newIds.split(/[,\n]/).map(s => s.trim()).filter(Boolean)
+      await api.createClient(newName.trim(), ids)
+      setNewName(''); setNewIds(''); load()
+      toast('Client added — re-tagged your files', 's')
+    } catch (e) { toast(e.message, 'e') } finally { setBusy(false) }
+  }
+
+  const del = async (id) => {
+    try { await api.deleteClient(id); load() } catch (e) { toast(e.message, 'e') }
+  }
+  const addId = async (id, value) => {
+    if (!value.trim()) return
+    try { await api.editClient(id, { addIdentifier: value.trim() }); load() } catch (e) { toast(e.message, 'e') }
+  }
+  const removeId = async (id, value) => {
+    try { await api.editClient(id, { removeIdentifier: value }); load() } catch (e) { toast(e.message, 'e') }
+  }
+  const recompute = async () => {
+    setBusy(true)
+    try { const r = await api.recomputeClients(); load(); toast(`Re-tagged: ${r.assigned} assigned, ${r.conflicted} shared, ${r.unmatched} unmatched`, 's') }
+    catch (e) { toast(e.message, 'e') } finally { setBusy(false) }
+  }
+
+  return (
+    <div className="scard">
+      <div className="scard-title">Client workspaces</div>
+      <div className="scard-sub">
+        Keep each client's documents isolated. Register a client with a unique
+        identifier — their GSTIN, PAN, or exact name — and Rudo tags matching files
+        to them. In chat, answers about one client never pull from another's files.
+      </div>
+
+      {suggestions.length > 0 && (
+        <div className="client-suggest">
+          <div className="client-suggest-head">Suggested from your documents</div>
+          <ul className="clients-list">
+            {suggestions.map(s => (
+              <li className="client-row suggest" key={s.key}>
+                <div className="client-head">
+                  <span className="client-name">{s.name}</span>
+                  {s.gstin && <span className="client-id-chip">{s.gstin}</span>}
+                  {s.pan && <span className="client-id-chip">{s.pan}</span>}
+                  <span className="client-count">{s.fileCount} file{s.fileCount === 1 ? '' : 's'}</span>
+                  <div className="client-add-actions" style={{ marginLeft: 'auto' }}>
+                    <button className="btn-primary" onClick={() => accept(s)} disabled={busy}>Add</button>
+                    <button className="btn-ghost" onClick={() => dismiss(s.key)} disabled={busy}>Dismiss</button>
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {clients.length === 0 ? (
+        <div className="paths-empty">No clients yet. Add one below{suggestions.length ? ', or accept a suggestion above' : ''}.</div>
+      ) : (
+        <ul className="clients-list">
+          {clients.map(c => (
+            <li className="client-row" key={c.id}>
+              <div className="client-head">
+                <span className="client-name">{c.name}</span>
+                <span className="client-count">{c.fileCount} file{c.fileCount === 1 ? '' : 's'}</span>
+                <button className="path-remove-btn" onClick={() => del(c.id)} title="Delete client">✕</button>
+              </div>
+              <div className="client-ids">
+                {(c.identifiers || []).map(v => (
+                  <span className="client-id-chip" key={v}>
+                    {v}<button onClick={() => removeId(c.id, v)} title="Remove identifier">×</button>
+                  </span>
+                ))}
+                <input
+                  className="client-id-input"
+                  placeholder="+ add GSTIN / PAN / alias"
+                  onKeyDown={e => { if (e.key === 'Enter') { addId(c.id, e.target.value); e.target.value = '' } }}
+                />
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <div className="client-add">
+        <input className="form-input" placeholder="Client name (e.g. Sharma Bakery)"
+               value={newName} onChange={e => setNewName(e.target.value)} />
+        <input className="form-input" placeholder="Identifiers — GSTIN, PAN, aliases (comma-separated)"
+               value={newIds} onChange={e => setNewIds(e.target.value)} />
+        <div className="client-add-actions">
+          <button className="btn-primary" onClick={create} disabled={busy || !connected || !newName.trim()}>Add client</button>
+          <button className="btn-ghost" onClick={recompute} disabled={busy || !connected} title="Re-scan all files against the client list">Re-tag files</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function Settings({ active }) {
   const { api, connected, apiBase, toast, stats, auth, refreshAuth } = useApp()
 
@@ -123,6 +247,8 @@ export default function Settings({ active }) {
       <div className="view-divider" />
 
       <div className="settings-body">
+        <ClientsCard api={api} connected={connected} toast={toast} />
+
         {/* Indexed folders */}
         <div className="scard">
           <div className="scard-title">Indexed folders</div>

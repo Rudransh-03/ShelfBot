@@ -54,7 +54,10 @@ public final class DeadlineExtractionEngine {
                   "doc":    <integer document id>,
                   "series": "<the recurring TYPE of document, normalized and issuer-agnostic, e.g. 'GST return', 'bank statement', 'salary slip', 'electricity bill'; null if it is NOT a periodic/recurring document>",
                   "issuer": "<organisation it is from, e.g. 'HDFC Bank', 'GSTN'; null if unclear>",
-                  "period": "<the single period the document COVERS: 'YYYY-MM' monthly, 'YYYY-Qn' quarterly, 'YYYY' annual; null if it does not cover one specific recurring period>"
+                  "period": "<the single period the document COVERS: 'YYYY-MM' monthly, 'YYYY-Qn' quarterly, 'YYYY' annual; null if it does not cover one specific recurring period>",
+                  "entity": "<the person or business this document BELONGS TO / is ABOUT — the taxpayer on a return, the account holder on a statement, the employee on a payslip. NOT the bank/govt issuer, NOT a vendor or counterparty. null if there is no clear owner>",
+                  "gstin": "<the entity's 15-character GSTIN if present, else null>",
+                  "pan":   "<the entity's 10-character PAN if present, else null>"
                 }
               ]
             }
@@ -81,6 +84,10 @@ public final class DeadlineExtractionEngine {
               - "period" is what the document is ABOUT/covers and may differ from any
                 deadline date. Use null for series/period when the document is not a
                 recurring periodic document (e.g. a one-off contract, an ID card).
+              - "entity" is the OWNER/subject of the document — when several names
+                appear (issuer, vendors, counterparties), pick the one the document
+                is filed BY or issued TO, not the others. Prefer the one tied to the
+                GSTIN/PAN. Use null when there's no clear single owner.
             """;
 
     /** Seam over the LLM so prompt-building + parsing can be tested with a fake. */
@@ -100,7 +107,13 @@ public final class DeadlineExtractionEngine {
      * periodic/recurring document. {@code period} is a raw label
      * ('YYYY-MM' | 'YYYY-Qn' | 'YYYY'); canonicalisation happens in the detector.
      */
-    public record DocClassification(int docId, String series, String issuer, String period) {}
+    public record DocClassification(int docId, String series, String issuer, String period,
+                                    String entity, String gstin, String pan) {
+        /** True when this carries a recurring-series classification. */
+        public boolean hasSeries()  { return series != null && period != null; }
+        /** True when this identifies the document's owner (for client suggestions). */
+        public boolean hasEntity()  { return entity != null || gstin != null || pan != null; }
+    }
 
     /** Both products of the single extraction call. */
     public record BatchResult(List<ExtractedDeadline> deadlines, List<DocClassification> documents) {}
@@ -257,11 +270,36 @@ public final class DeadlineExtractionEngine {
             if (docId <= 0) continue;
             String series = blankToNull(textOrNull(node, "series"));
             String period = blankToNull(textOrNull(node, "period"));
-            if (series == null || period == null) continue; // not a recurring doc
             String issuer = blankToNull(textOrNull(node, "issuer"));
-            out.add(new DocClassification(docId, series, issuer, period));
+            String entity = blankToNull(textOrNull(node, "entity"));
+            String gstin  = validGstin(blankToNull(textOrNull(node, "gstin")));
+            String pan    = validPan(blankToNull(textOrNull(node, "pan")));
+            boolean hasSeries = series != null && period != null;
+            boolean hasEntity = entity != null || gstin != null || pan != null;
+            if (!hasSeries && !hasEntity) continue; // nothing useful for this doc
+            out.add(new DocClassification(docId, hasSeries ? series : null, issuer,
+                    hasSeries ? period : null, entity, gstin, pan));
         }
         return out;
+    }
+
+    private static final java.util.regex.Pattern GSTIN_RE =
+            java.util.regex.Pattern.compile("[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z][Zz][0-9A-Z]");
+    private static final java.util.regex.Pattern PAN_RE =
+            java.util.regex.Pattern.compile("[A-Z]{5}[0-9]{4}[A-Z]");
+
+    /** Returns the GSTIN uppercased if it matches the 15-char GSTIN shape, else null. */
+    static String validGstin(String s) {
+        if (s == null) return null;
+        String u = s.replaceAll("\\s", "").toUpperCase();
+        return GSTIN_RE.matcher(u).matches() ? u : null;
+    }
+
+    /** Returns the PAN uppercased if it matches the 10-char PAN shape, else null. */
+    static String validPan(String s) {
+        if (s == null) return null;
+        String u = s.replaceAll("\\s", "").toUpperCase();
+        return PAN_RE.matcher(u).matches() ? u : null;
     }
 
     /** Treats blank and the literal strings null/none/n/a as absent. */

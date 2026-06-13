@@ -26,10 +26,13 @@ import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.KnnFloatVectorQuery;
+import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.SearcherManager;
+import org.apache.lucene.search.TermInSetQuery;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.ArrayUtil;
 import org.apache.lucene.store.FSDirectory;
 import org.slf4j.Logger;
@@ -415,6 +418,19 @@ public final class VectorStore implements AutoCloseable {
     }
 
     public List<SearchResult> query(float[] queryEmbedding, int topK) {
+        return query(queryEmbedding, topK, null);
+    }
+
+    /**
+     * Same as {@link #query(float[], int)} but, when {@code allowedPaths} is
+     * non-null, restricts the search to chunks whose source file is in that set
+     * — applied as a Lucene pre-filter on the KNN query, so excluded files are
+     * not even candidates (a better-scoring chunk from outside the set can never
+     * surface). This is the hard guarantee behind per-client isolation: scope is
+     * enforced in the index, not by any prompt. An EMPTY set legitimately
+     * matches nothing (a client with no documents).
+     */
+    public List<SearchResult> query(float[] queryEmbedding, int topK, java.util.Set<String> allowedPaths) {
         try {
             // Ensure latest writes are visible. maybeRefresh is cheap when
             // the index hasn't changed.
@@ -424,7 +440,9 @@ public final class VectorStore implements AutoCloseable {
             try {
                 if (searcher.getIndexReader().numDocs() == 0) return List.of();
 
-                KnnFloatVectorQuery query = new KnnFloatVectorQuery(F_VECTOR, queryEmbedding, topK);
+                KnnFloatVectorQuery query = (allowedPaths == null)
+                        ? new KnnFloatVectorQuery(F_VECTOR, queryEmbedding, topK)
+                        : new KnnFloatVectorQuery(F_VECTOR, queryEmbedding, topK, pathFilter(allowedPaths));
                 TopDocs td = searcher.search(query, topK);
 
                 List<SearchResult> results = new ArrayList<>(td.scoreDocs.length);
@@ -454,6 +472,13 @@ public final class VectorStore implements AutoCloseable {
         } catch (IOException e) {
             throw new VectorStoreException("Failed to query vector store", e);
         }
+    }
+
+    /** Builds a filter that keeps only chunks whose source path is in {@code paths}. */
+    private static Query pathFilter(java.util.Set<String> paths) {
+        List<BytesRef> terms = new ArrayList<>(paths.size());
+        for (String p : paths) if (p != null) terms.add(new BytesRef(p));
+        return new TermInSetQuery(F_SRC_PATH, terms);
     }
 
     private static int intField(Document d, String name) {

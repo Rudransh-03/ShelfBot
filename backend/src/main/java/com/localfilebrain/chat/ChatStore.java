@@ -82,7 +82,40 @@ public final class ChatStore implements AutoCloseable {
             } catch (SQLException ignored) {
                 // Column already exists.
             }
+            // Per-client isolation: which client this chat is currently "about".
+            // Persisted so it survives restarts and can't drift on a long chat.
+            // Holds a client id, the sentinel "__unassigned__", or NULL (no scope).
+            try {
+                stmt.executeUpdate("ALTER TABLE conversations ADD COLUMN focus_client_id TEXT");
+            } catch (SQLException ignored) {
+                // Column already exists.
+            }
             log.debug("Chat schema initialized");
+        }
+    }
+
+    /** The client this conversation is currently scoped to, or null. */
+    public synchronized String getFocus(String conversationId) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT focus_client_id FROM conversations WHERE id = ?")) {
+            ps.setString(1, conversationId);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString("focus_client_id") : null;
+            }
+        } catch (SQLException e) {
+            throw new ChatStoreException("Failed to read conversation focus", e);
+        }
+    }
+
+    /** Sets (or clears, with null) the conversation's current client focus. */
+    public synchronized void setFocus(String conversationId, String clientId) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "UPDATE conversations SET focus_client_id = ? WHERE id = ?")) {
+            ps.setString(1, clientId);
+            ps.setString(2, conversationId);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new ChatStoreException("Failed to set conversation focus", e);
         }
     }
 

@@ -7,6 +7,7 @@ import ToastContainer from './components/Toast'
 import UpdateBanner   from './components/UpdateBanner'
 import WelcomeModal   from './components/WelcomeModal'
 import SearchModal    from './components/SearchModal'
+import ClientSuggestionModal from './components/ClientSuggestionModal'
 import BackgroundFX   from './components/BackgroundFX'
 import Chat           from './views/Chat'
 import Library        from './views/Library'
@@ -113,6 +114,7 @@ function Shell() {
 
       <ToastContainer />
       <WelcomeModal />
+      <ClientSuggestionModal />
     </>
   )
 }

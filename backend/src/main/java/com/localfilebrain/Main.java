@@ -273,6 +273,12 @@ public final class Main {
                 if (result.getFilesProcessed() > 0 || result.getFilesFailed() > 0) {
                     log.info("[startup-rescan] re-indexed {} file(s), {} failed — summary cache invalidated for those rows",
                             result.getFilesProcessed(), result.getFilesFailed());
+                    // Refresh client membership so changed/new files are re-filed
+                    // to the right client (pinned ones preserved). No-op if no clients.
+                    if (result.getFilesProcessed() > 0 && meta.countClients() > 0) {
+                        new com.localfilebrain.client.MembershipEngine(meta, vec).recomputeAll();
+                        log.info("[startup-rescan] client membership refreshed");
+                    }
                 } else {
                     log.info("[startup-rescan] no changes detected ({} files scanned, all up to date)",
                             result.getTotalFilesScanned());
@@ -293,6 +299,12 @@ public final class Main {
                                                EmbeddingClient embeddingClient) {
         try {
             IngestionPipeline pipeline = new IngestionPipeline(config, store, vectorStore, embeddingClient);
+            // Live edits re-tag the touched file to the right client immediately
+            // (cheap single-file recompute), so a freshly-dropped client doc shows
+            // up under its client without waiting for a manual re-index.
+            com.localfilebrain.client.MembershipEngine membership =
+                    new com.localfilebrain.client.MembershipEngine(store, vectorStore);
+            pipeline.setPostIndexHook(path -> { if (store.countClients() > 0) membership.recomputeFile(path); });
             FileWatcher watcher = new FileWatcher(config, pipeline);
             watcher.start();
             return watcher;

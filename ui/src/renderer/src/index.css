@@ -816,6 +816,41 @@ input:focus-visible {
 /* Page citation appended to the source chip, e.g. "GST_Q1.pdf · p. 18". */
 .src-chip-page { opacity: .6; font-variant-numeric: tabular-nums; }
 
+/* Per-client scope: chat header picker, clarify chips, and the scope label. */
+.scope-picker {
+  background: var(--surface); color: var(--text-1);
+  border: 1px solid var(--border); border-radius: var(--r-sm, 8px);
+  padding: 5px 8px; font-size: 12px; max-width: 200px;
+}
+.clarify-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.clarify-chip {
+  background: rgba(91,157,255,.12); border: 1px solid rgba(91,157,255,.38);
+  color: var(--text-1); border-radius: 999px; padding: 4px 12px; font-size: 12px; cursor: pointer;
+}
+.clarify-chip:hover { background: rgba(91,157,255,.22); }
+.msg-scope { font-size: 11px; color: var(--text-3); margin-top: 6px; }
+
+/* Client workspaces (Settings) */
+.clients-list { list-style: none; margin: 10px 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.client-row { border: 1px solid var(--border); border-radius: var(--r-sm, 8px); padding: 10px 12px; }
+.client-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.client-name { font-weight: 600; color: var(--text-1); flex: 1 1 140px; min-width: 0; overflow-wrap: anywhere; }
+.client-count { font-size: 11px; color: var(--text-3); white-space: nowrap; }
+.client-head .path-remove-btn { margin-left: auto; }
+/* Action buttons wrap to their own line if the row gets tight, never overflow. */
+.client-add-actions { flex-wrap: wrap; }
+.client-ids { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; align-items: center; }
+.client-id-chip { font-size: 11px; background: var(--surface); border: 1px solid var(--border); border-radius: 999px; padding: 2px 8px; display: inline-flex; gap: 4px; align-items: center; }
+.client-id-chip button { background: none; border: none; color: var(--text-3); cursor: pointer; font-size: 13px; line-height: 1; }
+.client-id-input { font-size: 12px; border: 1px dashed var(--border); border-radius: 999px; padding: 3px 10px; background: transparent; color: var(--text-1); min-width: 200px; }
+.client-add { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.client-add-actions { display: flex; gap: 8px; }
+/* Inside the confirm modal, cap the list height so many clients scroll. */
+.dl-modal .clients-list { max-height: 48vh; overflow-y: auto; }
+.client-suggest { margin: 8px 0 14px; padding: 10px 12px; border: 1px dashed var(--border); border-radius: var(--r-sm, 8px); background: rgba(91,157,255,.05); }
+.client-suggest-head { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--text-3); margin-bottom: 8px; }
+.client-row.suggest { border-style: dashed; }
+
 /* Hover-only preview popover with the matched chunk text. */
 .src-preview {
   position: absolute;

@@ -4,6 +4,7 @@ import remarkGfm from 'remark-gfm'
 import { useApp } from '../context/AppContext'
 import BookshelfIcon from '../components/BookshelfIcon'
 import Mascot       from '../components/Mascot'
+import { extractTables, tablesToCsv } from '../utils/tableExport'
 
 const SUGGESTIONS = [
   {
@@ -81,6 +82,14 @@ const MailIcon = () => (
   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
     <rect x="2" y="4" width="20" height="16" rx="2"/>
     <polyline points="22 6 12 13 2 6"/>
+  </svg>
+)
+const SheetIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+    <polyline points="14 2 14 8 20 8"/>
+    <line x1="8" y1="13" x2="16" y2="13"/>
+    <line x1="8" y1="17" x2="16" y2="17"/>
   </svg>
 )
 
@@ -214,6 +223,7 @@ function Message({ role, text, sources = [], variant, onOpenSource, streaming = 
                    highlight = '', occOffset = 0, activeMatch = -1, activeRef,
                    clarify, clarifyQuestion, scope, onClarify }) {
   const [copied, setCopied] = useState(false)
+  const [exported, setExported] = useState(false)
 
   const copy = async () => {
     try {
@@ -227,6 +237,35 @@ function Message({ role, text, sources = [], variant, onOpenSource, streaming = 
     const url = `mailto:?subject=${encodeURIComponent('Rudo — analysis')}&body=${encodeURIComponent(text || '')}`
     if (window.electron?.openExternal) window.electron.openExternal(url)
     else window.location.href = url
+  }
+
+  // Detect any GFM tables in a finished answer so finance-style results can be
+  // sent straight to Excel. Memoised so we don't re-parse on every render.
+  const tables = useMemo(
+    () => (role === 'ai' && !streaming ? extractTables(text || '') : []),
+    [role, streaming, text]
+  )
+
+  const exportExcel = async () => {
+    const csv = tablesToCsv(tables)
+    if (!csv) return
+    const name = `rudo-export-${new Date().toISOString().slice(0, 10)}.csv`
+    try {
+      if (window.electron?.exportFile) {
+        const res = await window.electron.exportFile({ suggestedName: name, content: csv })
+        if (!res?.ok) return                 // user cancelled or write failed
+      } else {
+        // Non-Electron fallback (e.g. browser dev): trigger a Blob download.
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
+        const url  = URL.createObjectURL(blob)
+        const a    = document.createElement('a')
+        a.href = url; a.download = name
+        document.body.appendChild(a); a.click(); a.remove()
+        setTimeout(() => URL.revokeObjectURL(url), 0)
+      }
+      setExported(true)
+      setTimeout(() => setExported(false), 1500)
+    } catch { /* export unavailable */ }
   }
 
   // While finding (⌘F) we fall back to plain highlighted text so matches can
@@ -278,6 +317,13 @@ function Message({ role, text, sources = [], variant, onOpenSource, streaming = 
               <MailIcon />
               <span>Email</span>
             </button>
+            {tables.length > 0 && (
+              <button className="msg-action" onClick={exportExcel}
+                      title="Export table to Excel (.csv)">
+                {exported ? <CheckIcon /> : <SheetIcon />}
+                <span>{exported ? 'Exported' : 'Export'}</span>
+              </button>
+            )}
           </div>
         )}
       </div>

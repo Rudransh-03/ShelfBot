@@ -13,6 +13,9 @@ contextBridge.exposeInMainWorld('electron', {
   // Calendar reminders (.ics — works on every OS with a calendar app)
   createReminder: (payload) => ipcRenderer.invoke('reminder:create', payload),
 
+  // Export a generated file (e.g. CSV for Excel) via a native Save dialog.
+  exportFile: (payload) => ipcRenderer.invoke('export:file', payload),
+
   // Auto-updater
   onUpdateStatus:    (cb) => ipcRenderer.on('update-status', (_e, s) => cb(s)),
   installUpdate:     ()   => ipcRenderer.invoke('updater:install'),

@@ -447,6 +447,41 @@ ipcMain.handle('reminder:create', async (_e, payload) => {
   }
 })
 
+// ─────────────────────────────────────────────────────────────────────────────
+// File export — "Export to Excel" (CSV) and any future generated downloads
+// ─────────────────────────────────────────────────────────────────────────────
+// The renderer builds the file contents (it knows the data); we just show a
+// native Save dialog and write the bytes locally. Stays fully offline — no
+// proxy, no run-cost. payload: { suggestedName, content }.
+ipcMain.handle('export:file', async (_e, payload) => {
+  try {
+    const content = payload?.content
+    if (typeof content !== 'string' || content.length === 0) {
+      return { ok: false, error: 'Nothing to export' }
+    }
+    if (!mainWindow) return { ok: false, error: 'No window' }
+
+    const suggested = (typeof payload?.suggestedName === 'string' && payload.suggestedName)
+      ? payload.suggestedName
+      : `rudo-export-${Date.now()}.csv`
+
+    const r = await dialog.showSaveDialog(mainWindow, {
+      title: 'Export to Excel (CSV)',
+      defaultPath: join(app.getPath('documents'), suggested),
+      filters: [{ name: 'CSV (Comma-separated values)', extensions: ['csv'] }],
+    })
+    if (r.canceled || !r.filePath) return { ok: false, canceled: true }
+
+    // content already carries a UTF-8 BOM; 'utf8' encodes it as EF BB BF so
+    // Excel detects the encoding and renders ₹/non-ASCII correctly.
+    writeFileSync(r.filePath, content, 'utf8')
+    return { ok: true, path: r.filePath }
+  } catch (e) {
+    console.error('[ShelfBot] export:file failed:', e.message)
+    return { ok: false, error: e.message }
+  }
+})
+
 ipcMain.on('window-minimize', () => mainWindow?.minimize())
 ipcMain.on('window-maximize', () =>
   mainWindow?.isMaximized() ? mainWindow.unmaximize() : mainWindow?.maximize()

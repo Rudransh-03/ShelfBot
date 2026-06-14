@@ -620,7 +620,9 @@ public final class QueryEngine {
      * of the answer text. The prompt requires the LLM to cite each used file
      * by name, so this hits the common case. Safe fallback: if the answer
      * cites NOTHING (rare — e.g. small-talk), return the full source list
-     * unchanged so the user isn't left without any provenance.
+     * unchanged so the user isn't left without any provenance — UNLESS the
+     * answer is a clarifying question (the vague-query path), where source
+     * chips are just noise because we haven't answered from any file yet.
      */
     private List<Source> trimSourcesToCited(List<Source> all, String answer) {
         if (all.isEmpty() || answer == null || answer.isBlank()) return all;
@@ -630,9 +632,17 @@ public final class QueryEngine {
                 cited.add(s);
             }
         }
-        // If nothing matched, fall back to the full list — better to show
-        // potentially-related sources than none at all.
-        return cited.isEmpty() ? all : cited;
+        if (!cited.isEmpty()) return cited;
+        // Nothing cited: a clarifying question (asks the user, ends with '?')
+        // shows no chips; any other no-citation answer keeps the full list.
+        return isClarifyingQuestion(answer) ? List.of() : all;
+    }
+
+    /** A short, question-shaped reply (the vague-query clarifier) rather than an
+     *  answer drawn from files. Used to decide whether to attach source chips. */
+    private static boolean isClarifyingQuestion(String answer) {
+        String t = answer.strip();
+        return t.endsWith("?") && t.length() <= 320;
     }
 
     private List<Source> groupMatchesByFile(List<SearchResult> matches, String answer) {

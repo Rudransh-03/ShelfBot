@@ -25,26 +25,11 @@ function fmtBytes(n) {
   return `${(n / (k * k * k)).toFixed(2)} GB`
 }
 
-function fmtTokens(n) {
-  if (n == null) return '—'
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`
-  if (n >= 1_000)     return `${(n / 1_000).toFixed(0)}K`
-  return String(n)
-}
-
 // ── Icons ───────────────────────────────────────────────────────────────────
 const FilesIcon = () => (
   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
     <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
     <polyline points="14 2 14 8 20 8"/>
-  </svg>
-)
-const ChunksIcon = () => (
-  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-    <rect x="3"  y="3"  width="7" height="7" rx="1.5"/>
-    <rect x="14" y="3"  width="7" height="7" rx="1.5"/>
-    <rect x="3"  y="14" width="7" height="7" rx="1.5"/>
-    <rect x="14" y="14" width="7" height="7" rx="1.5"/>
   </svg>
 )
 const FailedIcon = () => (
@@ -176,42 +161,6 @@ function AccessBanner({ stats }) {
   )
 }
 
-// ── Token budget meter ──────────────────────────────────────────────────────
-
-function TokenMeter({ used = 0, limit = 1, perFileLimit = 0 }) {
-  const pct = Math.min(100, Math.max(0, (used / Math.max(1, limit)) * 100))
-  const tier = pct >= 95 ? 'critical' : pct >= 75 ? 'warn' : 'ok'
-
-  return (
-    <div className={`token-meter tier-${tier}`}>
-      <div className="token-meter-head">
-        <div className="token-meter-title">Token budget</div>
-        <div className="token-meter-pct">{pct.toFixed(1)}%</div>
-      </div>
-      <div className="token-meter-bar">
-        <div className="token-meter-fill" style={{ width: `${pct}%` }} />
-      </div>
-      <div className="token-meter-foot">
-        <span>
-          <strong>{fmtTokens(used)}</strong> of {fmtTokens(limit)} tokens used
-        </span>
-        {perFileLimit > 0 && (
-          <span className="token-meter-sub">
-            Per-file limit: {fmtTokens(perFileLimit)}
-          </span>
-        )}
-      </div>
-      {tier !== 'ok' && (
-        <div className="token-meter-msg">
-          {tier === 'critical'
-            ? 'You’ve nearly hit your indexing limit. Delete files below to free up budget.'
-            : 'Approaching the indexing limit. Consider trimming large files.'}
-        </div>
-      )}
-    </div>
-  )
-}
-
 // ── Per-file row with inline delete confirmation ────────────────────────────
 
 function FileRow({ file, onDelete, onSummarise }) {
@@ -234,11 +183,7 @@ function FileRow({ file, onDelete, onSummarise }) {
         <div className="file-row-meta">
           <span>{fmtBytes(file.sizeBytes)}</span>
           <span className="dot-sep">·</span>
-          <span>{fmt(file.chunkCount)} chunks</span>
-          <span className="dot-sep">·</span>
-          <span>{fmtTokens(file.tokenCount)} tokens</span>
-          <span className="dot-sep">·</span>
-          <span>{fmtAge(file.lastIndexedAt)}</span>
+          <span>Indexed {fmtAge(file.lastIndexedAt)}</span>
         </div>
       </div>
 
@@ -390,6 +335,20 @@ function stageLabel(f) {
   }
 }
 
+// Fractional completion (0–1) for an in-flight file, by stage. Lets the overall
+// bar advance smoothly even though files finish in parallel waves — without this
+// the "files processed" count only ticks on whole-file completion, so with a few
+// files the bar sits at 0 then jumps to 100 at the end.
+function stageFraction(f) {
+  switch (f.stage) {
+    case 'extracting': return 0.15
+    case 'chunking':   return 0.30
+    case 'embedding':  return f.total > 0 ? 0.35 + 0.55 * Math.min(1, (f.done || 0) / f.total) : 0.45
+    case 'saving':     return 0.95
+    default:           return 0.05
+  }
+}
+
 /**
  * Shows the files currently being indexed and how far along each one is.
  * Driven by the `activeFiles` snapshot from /api/index — skipped and finished
@@ -433,17 +392,79 @@ function IndexStatusModal({ files, onClose }) {
                       <span className="status-item-name">{f.name}</span>
                       <span className="status-item-stage">{stageLabel(f)}</span>
                     </div>
-                    {det ? (
+                    {det && (
                       <div className="prog-bg-real">
                         <div className="prog-fill-real" style={{ width: `${pct}%` }} />
                       </div>
-                    ) : (
-                      <div className="prog-bg"><div className="prog-fill" /></div>
                     )}
                   </li>
                 )
               })}
             </ul>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Failed-files detail modal ───────────────────────────────────────────────
+// Opened from the "Failed" stat card. Shows which files couldn't be indexed and
+// why, so a dead-end number becomes something the user can actually act on.
+
+function FailedFilesModal({ api, toast, onClose }) {
+  const [files, setFiles]     = useState(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    const onKey = e => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  useEffect(() => {
+    let cancelled = false
+    api.listFailedFiles()
+      .then(r => { if (!cancelled) setFiles(r.files ?? []) })
+      .catch(e => { if (!cancelled) { toast(e.message, 'e'); setFiles([]) } })
+      .finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
+  }, [api, toast])
+
+  return (
+    <div className="summary-overlay" onClick={onClose}>
+      <div className="summary-card status-card" onClick={e => e.stopPropagation()}>
+        <div className="summary-head">
+          <div className="summary-head-main">
+            <div className="summary-head-title">Files that couldn’t be indexed</div>
+            <div className="summary-head-sub">
+              {loading
+                ? 'Loading…'
+                : files && files.length > 0
+                  ? `${files.length} file${files.length === 1 ? '' : 's'} skipped — fix the issue, then re-index.`
+                  : 'All files indexed cleanly.'}
+            </div>
+          </div>
+          <button className="summary-close" onClick={onClose} aria-label="Close"><CloseIconSm /></button>
+        </div>
+
+        <div className="summary-body">
+          {loading ? (
+            <div className="summary-loading"><div className="spin-sm" /><span>Loading…</span></div>
+          ) : files && files.length > 0 ? (
+            <ul className="status-list">
+              {files.map(f => (
+                <li key={f.path} className="status-item" title={f.path}>
+                  <div className="status-item-top">
+                    <span className="status-item-name">{f.name}</span>
+                    <span className="failed-reason-tag">failed</span>
+                  </div>
+                  <div className="failed-reason">{f.reason || 'Unknown error'}</div>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div className="files-panel-empty">No failed files.</div>
           )}
         </div>
       </div>
@@ -616,6 +637,9 @@ export default function Library({ active, onGoSettings }) {
   const [showStatus, setShowStatus] = useState(false)
   useEffect(() => { if (!indexing) setShowStatus(false) }, [indexing])
 
+  // "Failed files" detail modal (opened from the Failed stat card).
+  const [showFailed, setShowFailed] = useState(false)
+
   useEffect(() => {
     if (active && connected) loadStats()
   }, [active, connected, loadStats])
@@ -657,30 +681,31 @@ export default function Library({ active, onGoSettings }) {
         <AccessBanner stats={stats} />
 
         {/* Stats */}
-        <div className="stats-grid">
+        <div className="stats-grid two">
           <div className="stat-card g">
             <div className="stat-icon"><FilesIcon /></div>
             <div className="stat-val">{fmt(stats?.indexedFiles)}</div>
             <div className="stat-lbl">Files Indexed</div>
           </div>
-          <div className="stat-card">
-            <div className="stat-icon"><ChunksIcon /></div>
-            <div className="stat-val">{fmt(stats?.totalChunks)}</div>
-            <div className="stat-lbl">Chunks Stored</div>
-          </div>
-          <div className="stat-card r">
-            <div className="stat-icon"><FailedIcon /></div>
-            <div className="stat-val">{fmt(stats?.failedFiles)}</div>
-            <div className="stat-lbl">Failed Files</div>
-          </div>
+          {(() => {
+            const failed = stats?.failedFiles ?? 0
+            const clickable = failed > 0
+            return (
+              <div
+                className={`stat-card${failed > 0 ? ' r' : ''}${clickable ? ' clickable' : ''}`}
+                onClick={clickable ? () => setShowFailed(true) : undefined}
+                role={clickable ? 'button' : undefined}
+                tabIndex={clickable ? 0 : undefined}
+                onKeyDown={clickable ? (e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setShowFailed(true) } }) : undefined}
+                title={clickable ? 'See which files failed and why' : 'No files failed to index'}
+              >
+                <div className="stat-icon"><FailedIcon /></div>
+                <div className="stat-val">{fmt(failed)}</div>
+                <div className="stat-lbl">{clickable ? 'Failed — view details' : 'Failed Files'}</div>
+              </div>
+            )
+          })()}
         </div>
-
-        {/* Token budget */}
-        <TokenMeter
-          used={stats?.tokensUsed ?? 0}
-          limit={stats?.tokensLimit ?? 40_000_000}
-          perFileLimit={stats?.tokensLimitPerFile ?? 0}
-        />
 
         {/* Index control */}
         <div className="index-card">
@@ -730,35 +755,43 @@ export default function Library({ active, onGoSettings }) {
               )}
             </button>
             <button className="btn-ghost" onClick={onGoSettings}>
-              Configure Path
+              Configure folders
               <ArrowRightSm />
             </button>
           </div>
 
           {indexing && (
             <div className="prog-section">
-              {progress?.total > 0 ? (
-                <>
-                  <div className="prog-bg-real">
-                    <div
-                      className="prog-fill-real"
-                      style={{ width: `${Math.min(100, (progress.processed / progress.total) * 100)}%` }}
-                    />
-                  </div>
-                  <div className="prog-label-real">
-                    <div className="spin-sm" />
-                    <span>
-                      <strong>{progress.processed}</strong> of <strong>{progress.total}</strong> files
-                      {progress.failed > 0 && <span className="prog-failed"> · {progress.failed} skipped</span>}
-                    </span>
-                    {progress.currentFile && (
-                      <span className="prog-current" title={progress.currentFile}>
-                        {progress.currentFile}
+              {progress?.total > 0 ? (() => {
+                // Smooth fill: completed files + partial credit for in-flight ones
+                // (by stage), so the bar moves continuously instead of jumping.
+                const inflight = (activeFiles || []).reduce((s, f) => s + stageFraction(f), 0)
+                const pct = Math.min(100, ((progress.processed + inflight) / progress.total) * 100)
+                return (
+                  <>
+                    <div className="prog-bg-real">
+                      <div className="prog-fill-real" style={{ width: `${pct}%` }} />
+                    </div>
+                    <div className="prog-label-real">
+                      <div className="spin-sm" />
+                      <span>
+                        <strong>{progress.processed}</strong> of <strong>{progress.total}</strong> files indexed
+                        {progress.failed > 0 && <span className="prog-failed"> · {progress.failed} skipped</span>}
                       </span>
+                    </div>
+                    {activeFiles.length > 0 && (
+                      <ul className="prog-active">
+                        {activeFiles.slice(0, 3).map(f => (
+                          <li className="prog-active-row" key={f.path} title={f.path}>
+                            <span className="prog-active-name">{f.name}</span>
+                            <span className="prog-active-stage">{stageLabel(f)}</span>
+                          </li>
+                        ))}
+                      </ul>
                     )}
-                  </div>
-                </>
-              ) : (
+                  </>
+                )
+              })() : (
                 <>
                   <div className="prog-bg"><div className="prog-fill" /></div>
                   <div className="prog-label">
@@ -767,12 +800,14 @@ export default function Library({ active, onGoSettings }) {
                   </div>
                 </>
               )}
-              <button
-                className="btn-ghost btn-sm prog-status-btn"
-                onClick={() => setShowStatus(true)}
-              >
-                View status{activeFiles.length > 0 ? ` (${activeFiles.length})` : ''}
-              </button>
+              {activeFiles.length > 3 && (
+                <button
+                  className="btn-ghost btn-sm prog-status-btn"
+                  onClick={() => setShowStatus(true)}
+                >
+                  View all {activeFiles.length} files
+                </button>
+              )}
             </div>
           )}
 
@@ -789,7 +824,6 @@ export default function Library({ active, onGoSettings }) {
                       ['Processed', result.data.filesProcessed],
                       ['Skipped',   result.data.filesSkipped],
                       ['Failed',    result.data.filesFailed],
-                      ['Chunks',    result.data.totalChunksCreated],
                     ].map(([lbl, num]) => (
                       <div key={lbl} className="rg-item">
                         <div className="rg-num">{num}</div>
@@ -823,6 +857,10 @@ export default function Library({ active, onGoSettings }) {
 
       {showStatus && (
         <IndexStatusModal files={activeFiles} onClose={() => setShowStatus(false)} />
+      )}
+
+      {showFailed && (
+        <FailedFilesModal api={api} toast={toast} onClose={() => setShowFailed(false)} />
       )}
     </div>
   )

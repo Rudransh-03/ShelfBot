@@ -49,7 +49,7 @@ export default function Organize({ active }) {
 
   async function pickFolder() {
     if (!window.electron) {
-      toast('Folder picker only works in the desktop app.', 'error')
+      toast('Folder picker only works in the desktop app.', 'e')
       return
     }
     const dir = await window.electron.selectFolder()
@@ -92,7 +92,7 @@ export default function Organize({ active }) {
       setExecutionResult(r)
       setPhase('result')
       toast(`Moved ${r.successCount} of ${moves.length} file${moves.length === 1 ? '' : 's'}.`,
-            r.failedCount > 0 ? 'error' : 'success')
+            r.failedCount > 0 ? 'e' : 's')
     } catch (e) {
       setError(e.message || 'Execute failed')
       setPhase('proposal')
@@ -103,12 +103,12 @@ export default function Organize({ active }) {
     try {
       const r = await api.reorgUndo(batchId)
       toast(`Undid ${r.successCount} of ${r.outcomes.length} move${r.outcomes.length === 1 ? '' : 's'}.`,
-            r.failedCount > 0 ? 'error' : 'success')
+            r.failedCount > 0 ? 'e' : 's')
       // Refresh history; if we were viewing the result for this batch, reset.
       api.reorgHistory(5).then(rs => setHistory(rs.batches || [])).catch(() => {})
       if (executionResult && executionResult.batchId === batchId) reset()
     } catch (e) {
-      toast(e.message || 'Undo failed', 'error')
+      toast(e.message || 'Undo failed', 'e')
     }
   }
 

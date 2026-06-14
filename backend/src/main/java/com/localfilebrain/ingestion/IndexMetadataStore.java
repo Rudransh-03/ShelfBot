@@ -430,6 +430,20 @@ public final class IndexMetadataStore implements AutoCloseable {
         return out;
     }
 
+    /** Files that failed to index, with their error messages (most recent first). */
+    public synchronized List<FileRecord> listFailedFiles() {
+        String sql = "SELECT * FROM file_index WHERE status = 'FAILED' "
+                   + "ORDER BY last_indexed_at DESC, file_name ASC";
+        List<FileRecord> out = new ArrayList<>();
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            while (rs.next()) out.add(mapRow(rs));
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to list failed files", e);
+        }
+        return out;
+    }
+
     /**
      * Returns the sum of all chunk_count values for INDEXED files.
      */

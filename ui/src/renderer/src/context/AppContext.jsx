@@ -27,6 +27,10 @@ export function AppProvider({ children }) {
   const [connected, setConnected] = useState(false)
   const [toasts,    setToasts]    = useState([])
 
+  // Single shared slot for auto-opening pop-ups (client-suggestion + deadline-
+  // review) so they never overlap — one shows, the other waits until it closes.
+  const [autoModalOpen, setAutoModalOpen] = useState(false)
+
   // Shared index + status state — consumed by Sidebar and Library
   const [stats,    setStats]    = useState(null)
   const [indexing, setIndexing] = useState(false)
@@ -324,6 +328,7 @@ export function AppProvider({ children }) {
       api, apiBase, setApiBase,
       connected, setConnected,
       toast, toasts,
+      autoModalOpen, setAutoModalOpen,
       stats, indexing, progress, activeFiles, lastJob,
       loadStats, triggerIndex,
       deadlineStats, scanningDeadlines, deadlineScanProgress, deadlinesEnabled,

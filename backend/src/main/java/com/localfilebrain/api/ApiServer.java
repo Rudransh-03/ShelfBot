@@ -691,7 +691,12 @@ public final class ApiServer {
 
         if (isMethod(ex, "GET")) {
             try {
-                List<FileRecord> records = metadataStore.listIndexedFilesBySizeDesc();
+                // ?status=failed → the files that couldn't be indexed, with the
+                // reason, so the UI can show the user which/why (default: indexed).
+                boolean wantFailed = "failed".equalsIgnoreCase(queryParam(ex, "status"));
+                List<FileRecord> records = wantFailed
+                        ? metadataStore.listFailedFiles()
+                        : metadataStore.listIndexedFilesBySizeDesc();
                 List<Map<String, Object>> rows = new ArrayList<>(records.size());
                 for (FileRecord r : records) {
                     Map<String, Object> row = new LinkedHashMap<>();
@@ -699,9 +704,13 @@ public final class ApiServer {
                     row.put("name",          r.getFileName());
                     row.put("extension",     r.getFileExtension());
                     row.put("sizeBytes",     r.getFileSizeBytes());
-                    row.put("chunkCount",    r.getChunkCount());
-                    row.put("tokenCount",    r.getTokenCount());
                     row.put("lastIndexedAt", r.getLastIndexedAt() != null ? r.getLastIndexedAt().toString() : null);
+                    if (wantFailed) {
+                        row.put("reason", r.getErrorMessage());
+                    } else {
+                        row.put("chunkCount", r.getChunkCount());
+                        row.put("tokenCount", r.getTokenCount());
+                    }
                     rows.add(row);
                 }
                 sendJson(ex, 200, map("files", rows, "count", rows.size()));

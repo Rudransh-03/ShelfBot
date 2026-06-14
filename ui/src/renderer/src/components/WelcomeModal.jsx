@@ -195,13 +195,6 @@ export default function WelcomeModal() {
               <div className="welcome-bullet">
                 <CheckIcon />
                 <span>
-                  Your file <strong>text</strong> is sent to OpenAI to create embeddings —
-                  the underlying files never leave your device.
-                </span>
-              </div>
-              <div className="welcome-bullet">
-                <CheckIcon />
-                <span>
                   Indexing usually takes <strong>under a minute</strong> for typical libraries.
                   You can keep using the app while it runs.
                 </span>

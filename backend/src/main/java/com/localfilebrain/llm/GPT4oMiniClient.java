@@ -31,6 +31,15 @@ public final class GPT4oMiniClient {
         You are a personal assistant for the user's own files and documents.
         Answer using only the excerpts provided.
 
+        FIRST, gauge intent. If the user's message is too vague to know what they \
+        actually want — a single bare word or a topic name with no question or \
+        verb (e.g. "client", "invoices", "taxes") — do NOT dump excerpts. Reply \
+        with ONE short question that offers 2-3 likely intents drawn from what the \
+        excerpts contain (e.g. "I see several freelance invoices from Rohan Mehta \
+        — do you want the list, the total amount, or the due dates?"). Do this \
+        ONLY when the intent is genuinely unclear; a clear ask ("list my \
+        invoices", "who is Rohan Mehta", "summarise X") must be answered directly.
+
         Rules:
         1. NEVER invent facts. Only use what's in the excerpts. No outside knowledge.
         2. ADJUST DETAIL TO THE QUESTION.
@@ -66,8 +75,11 @@ public final class GPT4oMiniClient {
            similar but unrelated sources (e.g. someone else's resume for a question \
            about Person A; an ID-card scan that mentions the name in a work-experience \
            question).
-        5. FORMAT. When introducing information from the excerpts, use \
-           "From <filename>:" once per file with bullets for items, concise. \
+        5. FORMAT. Each excerpt block is headed "=== <filename> ===". When \
+           introducing information from a file, cite it as "From <filename>:" \
+           using that EXACT filename — never a generic placeholder like \
+           "Source 2" or "the second source". Use it once per file with bullets \
+           for items, concise. \
            BUT: if the user's current question is a brief follow-up that only \
            confirms or clarifies something you already stated in a prior turn \
            (e.g. "really?", "yes?", "these are his work experiences?"), reply \
@@ -429,12 +441,12 @@ public final class GPT4oMiniClient {
      *
      * Output shape (one section per source file, even if 5 chunks from it):
      *
-     *   === Source 1: resume.pdf ===
+     *   === resume.pdf ===
      *   <chunk-1 text>
      *
      *   <chunk-2 text>
      *
-     *   === Source 2: notes.md ===
+     *   === notes.md ===
      *   <chunk-3 text>
      *
      * File order is preserved (which itself was already diversified by the
@@ -451,9 +463,12 @@ public final class GPT4oMiniClient {
         }
 
         StringBuilder sb = new StringBuilder("Here are the relevant excerpts from your documents, grouped by source file:\n\n");
-        int n = 1;
         for (java.util.Map.Entry<String, java.util.List<String>> e : byFile.entrySet()) {
-            sb.append("=== Source ").append(n++).append(": ").append(displayName.get(e.getKey())).append(" ===\n");
+            // Label each block with the filename only. We intentionally do NOT
+            // number them ("Source 1/2/…") — the model used to echo that internal
+            // label into the answer ("From Source2:"), which is meaningless to the
+            // user and broke citation matching in QueryEngine.trimSourcesToCited.
+            sb.append("=== ").append(displayName.get(e.getKey())).append(" ===\n");
             for (int i = 0; i < e.getValue().size(); i++) {
                 sb.append(e.getValue().get(i));
                 if (i < e.getValue().size() - 1) sb.append("\n\n");

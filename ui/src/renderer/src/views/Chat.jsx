@@ -8,7 +8,7 @@ import { extractTables, tablesToCsv } from '../utils/tableExport'
 
 const SUGGESTIONS = [
   {
-    text: 'Summarize the main topics across my documents',
+    text: "Summarize what's in my documents",
     icon: (
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
         <path d="M9 11l3 3L22 4"/>
@@ -17,7 +17,7 @@ const SUGGESTIONS = [
     ),
   },
   {
-    text: 'What are the most important decisions documented?',
+    text: 'What are the most important things to know from my files?',
     icon: (
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
         <circle cx="11" cy="11" r="8"/>
@@ -26,7 +26,7 @@ const SUGGESTIONS = [
     ),
   },
   {
-    text: 'Find anything related to project requirements or specs',
+    text: 'Pull out key details — names, dates, and amounts',
     icon: (
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
         <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
@@ -224,6 +224,7 @@ function Message({ role, text, sources = [], variant, onOpenSource, streaming = 
                    clarify, clarifyQuestion, scope, onClarify }) {
   const [copied, setCopied] = useState(false)
   const [exported, setExported] = useState(false)
+  const [emailed, setEmailed] = useState(false)
 
   const copy = async () => {
     try {
@@ -233,10 +234,27 @@ function Message({ role, text, sources = [], variant, onOpenSource, streaming = 
     } catch { /* clipboard unavailable */ }
   }
 
-  const email = () => {
-    const url = `mailto:?subject=${encodeURIComponent('Rudo — analysis')}&body=${encodeURIComponent(text || '')}`
-    if (window.electron?.openExternal) window.electron.openExternal(url)
-    else window.location.href = url
+  // `mailto:` bodies get silently truncated by many mail clients past ~1–2k
+  // chars. For short answers we still prefill the body directly (nicer); for
+  // long ones we copy the full text to the clipboard and open an empty draft
+  // with a paste hint, so nothing is lost.
+  const email = async () => {
+    const body = text || ''
+    const openMail = (url) => {
+      if (window.electron?.openExternal) window.electron.openExternal(url)
+      else window.location.href = url
+    }
+    const subject = encodeURIComponent('Rudo — analysis')
+    if (body.length <= 1200) {
+      openMail(`mailto:?subject=${subject}&body=${encodeURIComponent(body)}`)
+      return
+    }
+    let copiedOk = false
+    try { await navigator.clipboard.writeText(body); copiedOk = true } catch { /* clipboard unavailable */ }
+    openMail(`mailto:?subject=${subject}&body=${encodeURIComponent(
+      copiedOk ? 'The full answer is on your clipboard — paste it here (⌘V).' : ''
+    )}`)
+    if (copiedOk) { setEmailed(true); setTimeout(() => setEmailed(false), 1800) }
   }
 
   // Detect any GFM tables in a finished answer so finance-style results can be
@@ -314,8 +332,8 @@ function Message({ role, text, sources = [], variant, onOpenSource, streaming = 
               <span>{copied ? 'Copied' : 'Copy'}</span>
             </button>
             <button className="msg-action" onClick={email} title="Email this response">
-              <MailIcon />
-              <span>Email</span>
+              {emailed ? <CheckIcon /> : <MailIcon />}
+              <span>{emailed ? 'Copied' : 'Email'}</span>
             </button>
             {tables.length > 0 && (
               <button className="msg-action" onClick={exportExcel}
@@ -358,11 +376,6 @@ export default function Chat({ active }) {
   const [input,    setInput]      = useState('')
   const [loading,  setLoading]    = useState(false)
   const [justAnswered, setJustAnswered] = useState(false)
-  // Per-client workspaces. `clients` drives the scope picker (hidden when none
-  // exist, so the feature is invisible until set up). `scopeChoice`: 'auto'
-  // (let Rudo decide / ask), a client id, '__unassigned__', or '__all__'.
-  const [clients, setClients] = useState([])
-  const [scopeChoice, setScopeChoice] = useState('auto')
   const msgsRef  = useRef(null)
   const inputRef = useRef(null)
   // Which conversation's messages are currently displayed. Lets us skip a
@@ -467,12 +480,6 @@ export default function Chat({ active }) {
     setActiveMatch(a => (find.total === 0 ? 0 : (a + dir + find.total) % find.total))
   }, [find.total])
 
-  // Load the client list so the scope picker can appear (only when clients exist).
-  useEffect(() => {
-    if (!api || !connected) return
-    api.listClients().then(d => setClients(d.clients ?? [])).catch(() => {})
-  }, [api, connected, active])
-
   const sendMessage = useCallback(async (question, overrideClientId) => {
     if (!question?.trim() || !connected || loading) return
 
@@ -506,7 +513,11 @@ export default function Chat({ active }) {
     }
 
     await new Promise((resolve) => {
-      const clientId = overrideClientId ?? (scopeChoice === 'auto' ? undefined : scopeChoice)
+      // No manual scope picker: Rudo auto-detects which client a question is
+      // about and only asks (clarify chips) when it's genuinely ambiguous.
+      // `overrideClientId` is set when the user taps a clarify chip; otherwise
+      // undefined = let the backend resolve the scope.
+      const clientId = overrideClientId
       api.queryStream(question, {
         conversationId: activeConversationId,
         clientId,
@@ -533,7 +544,7 @@ export default function Chat({ active }) {
     setTimeout(() => setJustAnswered(false), 2200)
     refreshAuth()
     refreshConversations() // surface the new/updated thread + auto-title in the rail
-  }, [api, connected, loading, refreshAuth, activeConversationId, setActiveConversationId, refreshConversations, scopeChoice])
+  }, [api, connected, loading, refreshAuth, activeConversationId, setActiveConversationId, refreshConversations])
 
   const handleKey = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(input) }
@@ -581,19 +592,6 @@ export default function Chat({ active }) {
               <div className="view-subtitle">Conversation with your library</div>
             </div>
             <div className="header-actions">
-              {clients.length > 0 && (
-                <select
-                  className="scope-picker"
-                  value={scopeChoice}
-                  onChange={e => setScopeChoice(e.target.value)}
-                  title="Which client this chat is about"
-                >
-                  <option value="auto">Auto (ask if unsure)</option>
-                  {clients.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-                  <option value="__unassigned__">Personal / unfiled</option>
-                  <option value="__all__">All documents</option>
-                </select>
-              )}
               <button className="icon-btn" onClick={newConversation} title="New chat">
                 <PlusIcon />
               </button>

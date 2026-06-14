@@ -8,6 +8,7 @@ import UpdateBanner   from './components/UpdateBanner'
 import WelcomeModal   from './components/WelcomeModal'
 import SearchModal    from './components/SearchModal'
 import ClientSuggestionModal from './components/ClientSuggestionModal'
+import DeadlineReviewModal from './components/DeadlineReviewModal'
 import BackgroundFX   from './components/BackgroundFX'
 import Chat           from './views/Chat'
 import Library        from './views/Library'
@@ -100,7 +101,7 @@ function Shell() {
             <Library   active={view === 'lib'}  onGoSettings={() => setView('set')} />
             <Deadlines active={view === 'due'} />
             <Organize  active={view === 'org'} />
-            <Settings active={view === 'set'} />
+            <Settings active={view === 'set'} onGoLibrary={() => setView('lib')} />
           </div>
         </div>
       </div>
@@ -115,6 +116,7 @@ function Shell() {
       <ToastContainer />
       <WelcomeModal />
       <ClientSuggestionModal />
+      <DeadlineReviewModal onNavigate={() => setView('due')} />
     </>
   )
 }

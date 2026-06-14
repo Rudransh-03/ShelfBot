@@ -8,24 +8,40 @@ import { useApp } from '../context/AppContext'
  * document owners). Add → creates the client + tags its files; Dismiss → hides it.
  */
 export default function ClientSuggestionModal() {
-  const { api, connected, deadlineStats, toast } = useApp()
+  const { api, connected, deadlineStats, toast, autoModalOpen, setAutoModalOpen } = useApp()
   const [suggestions, setSuggestions] = useState([])
   const [open, setOpen] = useState(false)
+  const [pending, setPending] = useState(false)
   const [busy, setBusy] = useState(false)
   const shownKeys = useRef(new Set()) // keys already auto-shown this session
+
+  // Closing releases the shared auto-modal slot so a queued pop-up can show.
+  const close = () => { setOpen(false); setAutoModalOpen(false) }
 
   useEffect(() => {
     if (!api || !connected) return
     api.listClientSuggestions().then(d => {
       const s = d.suggestions ?? []
       setSuggestions(s)
-      // Only auto-open when there's a suggestion we haven't shown yet this session.
+      // Queue an auto-open when there's a suggestion we haven't shown this session.
       if (s.length > 0 && s.some(x => !shownKeys.current.has(x.key))) {
-        setOpen(true)
+        setPending(true)
         s.forEach(x => shownKeys.current.add(x.key))
       }
     }).catch(() => {})
   }, [api, connected, deadlineStats])
+
+  // Open only when the shared auto-modal slot is free (queue, don't overlap).
+  useEffect(() => {
+    if (pending && suggestions.length > 0 && !open && !autoModalOpen) {
+      setOpen(true); setAutoModalOpen(true); setPending(false)
+    }
+  }, [pending, suggestions, open, autoModalOpen])
+
+  // If the list empties while open (all added/dismissed), free the slot.
+  useEffect(() => {
+    if (open && suggestions.length === 0) { setOpen(false); setAutoModalOpen(false) }
+  }, [open, suggestions, setAutoModalOpen])
 
   if (!open || suggestions.length === 0) return null
 
@@ -52,16 +68,16 @@ export default function ClientSuggestionModal() {
         await api.acceptClientSuggestion({ name: s.name, gstin: s.gstin, pan: s.pan, recompute: false })
       }
       await api.recomputeClients()
-      setSuggestions([]); setOpen(false); toast('Clients added', 's')
+      setSuggestions([]); close(); toast('Clients added', 's')
     } catch (e) { toast(e.message, 'e') } finally { setBusy(false) }
   }
 
   return (
-    <div className="summary-overlay" onClick={() => setOpen(false)}>
+    <div className="summary-overlay" onClick={close}>
       <div className="dl-modal" onClick={e => e.stopPropagation()}>
         <div className="dl-modal-head">
           <div className="dl-modal-title">Set up your clients</div>
-          <button className="summary-close" onClick={() => setOpen(false)} aria-label="Close">✕</button>
+          <button className="summary-close" onClick={close} aria-label="Close">✕</button>
         </div>
         <div className="dl-modal-sub">
           Rudo found these clients in your documents. Confirm the ones you want — each becomes its own
@@ -86,7 +102,7 @@ export default function ClientSuggestionModal() {
         </ul>
 
         <div className="dl-modal-actions">
-          <button className="btn-ghost" onClick={() => setOpen(false)} disabled={busy}>Not now</button>
+          <button className="btn-ghost" onClick={close} disabled={busy}>Not now</button>
           <button className="btn-primary" onClick={addAll} disabled={busy || suggestions.length === 0}>Add all</button>
         </div>
       </div>

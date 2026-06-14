@@ -166,8 +166,8 @@ function ClientsCard({ api, connected, toast }) {
   )
 }
 
-export default function Settings({ active }) {
-  const { api, connected, apiBase, toast, stats, auth, refreshAuth } = useApp()
+export default function Settings({ active, onGoLibrary }) {
+  const { api, connected, apiBase, toast, stats, auth, refreshAuth, triggerIndex } = useApp()
 
   useEffect(() => {
     if (active) refreshAuth()
@@ -228,7 +228,12 @@ export default function Settings({ active }) {
     try {
       await api.saveConfig(rootPaths)
       setDirty(false)
-      toast('Folders saved — remember to re-index!', 's')
+      // Saving folders only matters once they're indexed, so kick off the
+      // re-index right here — no separate "remember to re-index" step.
+      // triggerIndex surfaces its own "Indexing started…" toast.
+      triggerIndex()
+      // Jump to Library so the user can watch indexing progress live.
+      onGoLibrary?.()
     } catch (e) {
       toast(e.message, 'e')
     }
@@ -247,8 +252,6 @@ export default function Settings({ active }) {
       <div className="view-divider" />
 
       <div className="settings-body">
-        <ClientsCard api={api} connected={connected} toast={toast} />
-
         {/* Indexed folders */}
         <div className="scard">
           <div className="scard-title">Indexed folders</div>
@@ -298,51 +301,54 @@ export default function Settings({ active }) {
             disabled={!connected || !dirty || rootPaths.length === 0}
           >
             <SaveIcon />
-            {dirty ? 'Save changes' : 'Saved'}
+            {dirty ? 'Save & re-index' : 'Saved'}
           </button>
         </div>
 
+        {/* Client workspaces — advanced/niche, so it sits below the basics */}
+        <ClientsCard api={api} connected={connected} toast={toast} />
+
         {/* Services */}
         <div className="scard">
-          <div className="scard-title">Services</div>
+          <div className="scard-title">Status</div>
           <div className="scard-sub">
-            Backend processes Rudo is connected to.
+            How Rudo is running on your device.
           </div>
           <div className="svc-list">
             <div className="svc-row">
               <span className="svc-name">
                 <ServerIcon />
-                API Server
+                Rudo engine
               </span>
-              <span className="svc-val">
+              <span className="svc-val" title={`localhost:${port}`}>
                 <span className={`dot ${connected ? 'g' : 'r'}`} />
-                localhost:{port}
+                {connected ? 'Connected' : 'Offline'}
               </span>
             </div>
             <div className="svc-row">
               <span className="svc-name">
                 <DatabaseIcon />
-                Vector index
+                Document storage
               </span>
               <span className="svc-val" title={vectorIndexPath}>
                 <span className="dot g" />
-                Embedded · {vectorIndexPath}
+                On your device
               </span>
             </div>
             <div className="svc-row">
               <span className="svc-name">
                 <ServerIcon />
-                Embedding model
+                Search model
               </span>
-              <span className="svc-val" title={embeddingModel}>
+              <span className="svc-val" title={embeddingLabel}>
                 <span className={`dot ${embeddingIsLocal ? 'g' : 'a'}`} />
-                {embeddingLabel}
+                {embeddingIsLocal ? 'Runs on your device' : 'Cloud (OpenAI)'}
               </span>
             </div>
             <div className="svc-row">
               <span className="svc-name">
                 <ServerIcon />
-                Image search (OCR)
+                Scanned-image search
               </span>
               <span
                 className="svc-val"

@@ -210,7 +210,7 @@ public final class QueryEngine {
      * Replaces the active conversation context with an empty one. Called
      * before rehydrating a specific chat thread's history via
      * {@link #addHistoryExchange}. Distinct from {@link #clearHistory()},
-     * which the legacy single-conversation endpoint uses to wipe state.
+     * which the CLI's {@code clear} command uses to wipe state.
      */
     public synchronized void resetHistory() {
         this.history = new ConversationHistory(HISTORY_SIZE);
@@ -281,10 +281,8 @@ public final class QueryEngine {
 
         java.util.Optional<String> scoped = detectFileScope(trimmed, allowedPaths);
         if (scoped.isPresent()) {
-            String scopedAnswer = answerFromFileScopeStream(trimmed, scoped.get(), onToken);
-            if (scopedAnswer != null) return scopedAnswer.isEmpty()
-                    ? notFound(trimmed)
-                    : scopedAnswerResult(trimmed, scoped.get(), scopedAnswer);
+            QueryResult scopedResult = answerFromFileScope(trimmed, scoped.get(), onToken);
+            if (scopedResult != null) return scopedResult; // null → file had no chunks; fall through
         }
 
         List<float[]> embeddings  = embeddingClient.embedBatch(List.of(trimmed));
@@ -364,10 +362,8 @@ public final class QueryEngine {
         // File-targeted path — see streaming variant for the rationale.
         java.util.Optional<String> scoped = detectFileScope(trimmed, allowedPaths);
         if (scoped.isPresent()) {
-            String scopedAnswer = answerFromFileScope(trimmed, scoped.get());
-            if (scopedAnswer != null) return scopedAnswer.isEmpty()
-                    ? notFound(trimmed)
-                    : scopedAnswerResult(trimmed, scoped.get(), scopedAnswer);
+            QueryResult scopedResult = answerFromFileScope(trimmed, scoped.get(), null);
+            if (scopedResult != null) return scopedResult; // null → file had no chunks; fall through
         }
 
         List<float[]> embeddings  = embeddingClient.embedBatch(List.of(trimmed));
@@ -439,78 +435,6 @@ public final class QueryEngine {
         return answerFound
                 ? QueryResult.found(answer, sources)
                 : QueryResult.notFound(answer);
-    }
-
-    /**
-     * Groups the retrieved chunks by source file so the UI can render one
-     * clickable chip per file, each carrying the file's absolute path (for
-     * "open in default app") and a short list of matched snippets (for the
-     * hover preview).
-     *
-     * Snippet text is truncated to keep the response payload small and to
-     * avoid leaking irrelevantly large amounts of file content into the UI.
-     */
-    /**
-     * Number of top-ranked source files to pull FULL chunk-by-chunk content
-     * from after the initial semantic search identifies them. Avoids the
-     * "best chunk wins, others ignored" failure where a label chunk outranks
-     * content chunks within the same file.
-     */
-    private static final int FULL_FILE_EXPANSION_TOP_N = 3;
-
-    /**
-     * After semantic search ranks files, fetch every chunk of the top N
-     * files in document order so the LLM sees their complete content,
-     * not just whichever chunks happened to embed closest to the query.
-     *
-     * Inputs:
-     *   diversified — the top chunks from semantic search (post-threshold,
-     *                 post-diversify, post-template-filter)
-     * Returns: an expanded list where the top FULL_FILE_EXPANSION_TOP_N files
-     *   contribute ALL their chunks (in chunk_index order), and any
-     *   remaining files keep only the chunks that scored above threshold.
-     *   Capped at MAX_CONTEXT_CHUNKS total.
-     */
-    private List<SearchResult> expandTopFilesToFullContent(List<SearchResult> diversified) {
-        if (diversified.isEmpty()) return diversified;
-
-        // Preserve the order in which files first appear (semantic-rank order
-        // because diversifyByFile maintains it).
-        LinkedHashMap<String, String> fileOrder = new LinkedHashMap<>(); // path → fileName
-        for (SearchResult m : diversified) {
-            fileOrder.putIfAbsent(m.sourceFilePath(), m.fileName());
-        }
-
-        List<String> filePaths = new ArrayList<>(fileOrder.keySet());
-        Set<String> expandPaths = filePaths.stream()
-                .limit(FULL_FILE_EXPANSION_TOP_N)
-                .collect(Collectors.toCollection(java.util.LinkedHashSet::new));
-
-        List<SearchResult> out = new ArrayList<>();
-
-        // For top-N files: fetch ALL chunks from the index in document order.
-        for (String path : expandPaths) {
-            List<SearchResult> full = vectorStore.getChunksForFile(path);
-            int taken = 0;
-            for (SearchResult c : full) {
-                if (out.size() >= MAX_CONTEXT_CHUNKS) break;
-                if (taken >= MAX_CHUNKS_PER_FILE) break;
-                out.add(c);
-                taken++;
-            }
-        }
-
-        // For other files (semantically related but not top-ranked): keep
-        // only the chunks that already passed the relevance threshold.
-        for (SearchResult m : diversified) {
-            if (out.size() >= MAX_CONTEXT_CHUNKS) break;
-            if (expandPaths.contains(m.sourceFilePath())) continue; // already added in full
-            out.add(m);
-        }
-
-        log.info("Expanded {} → {} chunks: full content for top {} file(s), diversified chunks for the rest",
-                diversified.size(), out.size(), expandPaths.size());
-        return out;
     }
 
     /**
@@ -645,6 +569,11 @@ public final class QueryEngine {
         return t.endsWith("?") && t.length() <= 320;
     }
 
+    /**
+     * Groups retrieved chunks into one {@link Source} per file (the clickable
+     * chips), narrowing each file's cited pages/snippets to the chunks whose
+     * text actually surfaces in the answer. Order follows the diversified rank.
+     */
     private List<Source> groupMatchesByFile(List<SearchResult> matches, String answer) {
         // LinkedHashMap preserves the diversified ordering produced earlier
         // — most relevant file first, then per-file the best chunks first.
@@ -821,39 +750,34 @@ public final class QueryEngine {
      * an empty string if the file had zero retrievable chunks, or null if
      * the caller should fall through to the normal semantic-search path.
      */
-    private String answerFromFileScope(String question, String path) {
+    /**
+     * Answers a file-scoped query (the user named a specific indexed file) from
+     * that file's own chunks. Reads the file from the index ONCE and reuses the
+     * same capped chunk list for both the LLM context and the source chips — so
+     * a citation can only ever name a page the model actually saw, and we don't
+     * pay a second full-file read just to build sources. {@code onToken} non-null
+     * streams the answer. Returns null when the file has no retrievable chunks,
+     * signalling the caller to fall through to normal semantic search.
+     */
+    private QueryResult answerFromFileScope(String question, String path,
+                                            java.util.function.Consumer<String> onToken) {
         List<SearchResult> chunks = vectorStore.getChunksForFile(path);
         if (chunks.isEmpty()) return null;
         if (chunks.size() > MAX_CONTEXT_CHUNKS) chunks = chunks.subList(0, MAX_CONTEXT_CHUNKS);
-        log.info("File-scoped retrieval: {} chunk(s) from {}", chunks.size(), path);
+        log.info("File-scoped retrieval{}: {} chunk(s) from {}",
+                onToken != null ? " (stream)" : "", chunks.size(), path);
         logChunksGoingToLlm(chunks);
-        return llmClient.answer(question, chunks, history);
-    }
-
-    /** Streaming variant of {@link #answerFromFileScope}. */
-    private String answerFromFileScopeStream(String question, String path,
-                                             java.util.function.Consumer<String> onToken) {
-        List<SearchResult> chunks = vectorStore.getChunksForFile(path);
-        if (chunks.isEmpty()) return null;
-        if (chunks.size() > MAX_CONTEXT_CHUNKS) chunks = chunks.subList(0, MAX_CONTEXT_CHUNKS);
-        log.info("File-scoped retrieval (stream): {} chunk(s) from {}", chunks.size(), path);
-        logChunksGoingToLlm(chunks);
-        return llmClient.answerStream(question, chunks, history, onToken);
-    }
-
-    /** Wraps a file-scoped answer in the same result shape as semantic search. */
-    private QueryResult scopedAnswerResult(String question, String path, String answer) {
-        List<SearchResult> chunks = vectorStore.getChunksForFile(path);
-        List<Source> sources = groupMatchesByFile(chunks, answer);
+        String answer = (onToken == null)
+                ? llmClient.answer(question, chunks, history)
+                : llmClient.answerStream(question, chunks, history, onToken);
         history.add(question, answer);
         return isFallbackAnswer(answer)
                 ? QueryResult.notFound(answer)
-                : QueryResult.found(answer, sources);
+                : QueryResult.found(answer, groupMatchesByFile(chunks, answer));
     }
 
     public void clearHistory() {
         history.clear();
-        System.out.println("Conversation history cleared.");
     }
 
     private QueryResult notFound(String question) {

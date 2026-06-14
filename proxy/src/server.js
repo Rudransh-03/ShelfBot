@@ -177,14 +177,31 @@ app.post('/proxy/chat/completions', auth.requireAuth, async (req, res) => {
       body: JSON.stringify(req.body),
     })
 
-    // Mirror useful response metadata
+    // Upstream rejected the call (OpenAI rate-limit, 5xx, malformed request…).
+    // The user got no answer, so refund the slot — same contract as the reorg
+    // path below — and report the corrected usage. Without this, an OpenAI-side
+    // hiccup silently burns one of the user's daily queries AND surfaces to the
+    // desktop app as a misleading "daily limit reached" 429.
+    if (!upstream.ok) {
+      const refunded = db.decrementTodayCount(req.device.id, todayKey())
+      const body = await upstream.text()
+      return res.status(upstream.status)
+         .set('X-Plan',            req.device.plan)
+         .set('X-Usage-Used',      String(refunded))
+         .set('X-Usage-Limit',     String(limit))
+         .set('X-Usage-Remaining', String(Math.max(0, limit - refunded)))
+         .type(upstream.headers.get('content-type') || 'application/json')
+         .send(body)
+    }
+
+    // Mirror useful response metadata (success path).
     res.status(upstream.status)
        .set('X-Plan',            req.device.plan)
        .set('X-Usage-Used',      String(after))
        .set('X-Usage-Limit',     String(limit))
        .set('X-Usage-Remaining', String(Math.max(0, limit - after)))
 
-    if (wantsStream && upstream.ok && upstream.body) {
+    if (wantsStream && upstream.body) {
       // Pipe SSE bytes straight through. We DO NOT buffer — that would
       // defeat the entire point of streaming. Set headers explicitly so
       // intermediaries (and Express) don't try to gzip / chunk-buffer.

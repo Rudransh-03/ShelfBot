@@ -71,12 +71,12 @@ function Shell() {
 
   useEffect(() => {
     const E = window.electron
-    if (E) {
-      E.onApiPort(port => initBackend(port))
-    } else {
+    if (!E) {
       // Dev fallback — open the HTML directly in a browser
       initBackend(9876)
+      return
     }
+    return E.onApiPort(port => initBackend(port)) // disposer removes the listener
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   return (

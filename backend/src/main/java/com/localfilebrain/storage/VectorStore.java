@@ -65,7 +65,8 @@ import java.util.List;
  *
  * Distance contract (unchanged from before, so QueryEngine's threshold logic
  * is unaffected): the {@link SearchResult#distance} is cosine distance,
- * i.e. {@code 1 - cosine_similarity}, in [0, 1]. 0 = identical, 1 = opposite.
+ * i.e. {@code 1 - cosine_similarity}, in [0, 2]. 0 = identical, 1 = orthogonal,
+ * 2 = opposite.
  */
 public final class VectorStore implements AutoCloseable {
 

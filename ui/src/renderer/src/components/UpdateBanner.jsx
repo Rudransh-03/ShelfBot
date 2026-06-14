@@ -35,7 +35,7 @@ export default function UpdateBanner() {
   useEffect(() => {
     const E = window.electron
     if (!E?.onUpdateStatus) return
-    E.onUpdateStatus(setState)
+    return E.onUpdateStatus(setState) // disposer removes the listener on unmount
   }, [])
 
   if (!state || state.state !== 'downloaded') return null

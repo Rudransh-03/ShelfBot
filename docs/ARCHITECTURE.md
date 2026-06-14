@@ -37,14 +37,14 @@ Three processes:
 - **auth/AuthTokenStore.java** — in-memory JWT (set at runtime by Electron's device bootstrap via `/api/auth`; absent when backend run standalone → proxy LLM calls 401).
 
 ### Ingestion (`ingestion/`)
-`FileScanner` (walk roots) → `TextExtractor` (Tika; OCR via Tesseract if installed) → `TextChunker` (~1800 chars, 200 overlap) → embed (local) → `ChunkWriter`/`VectorStore` (Lucene) + `IndexMetadataStore` (SQLite).
+`FileScanner` (walk roots) → `TextExtractor` (Tika; OCR via Tesseract if installed) → `TextChunker` (~1800 chars, 200 overlap) → embed (local) → `VectorStore` (Lucene, atomic `replaceBySourceFile`) + `IndexMetadataStore` (SQLite).
 - **IngestionPipeline.java** — orchestrates. **Parallel across files** (`threads = min(files, max(2, cores/2))`); embedding serialized via `embedLock`. Progress via `ProgressListener`: `onProgress(processed,total,failed,currentFile)` (fires per-file-completion; `currentFile` is always null), `onFileStart/onFileStage(stage,done,total)/onFileEnd`. Stages: `extracting|chunking|embedding|saving`. `recordFailed()` → `markFailed` (status FAILED + error_message).
 - **FileWatcher.java** — live re-index of changed files in roots.
 - **IndexMetadataStore.java** — SQLite DAO. `listIndexedFilesBySizeDesc()`, `listFailedFiles()`, `markFailed`, counts, clients, deadlines. `mapRow` → `FileRecord`.
 - **PdfPageLocator.java** — maps chunks → PDF page numbers (additive; chunk text unchanged, retrieval unaffected). Powers page citations.
 
 ### Retrieval / RAG (`query/`, `llm/`, `storage/`)
-- **query/QueryEngine.java** — the RAG pipeline. Flow: resolve client scope → KNN search (TOP_K=40) → relevance-threshold + relative-distance filter → diversify per file (`MAX_CHUNKS_PER_FILE=4`, `MAX_CONTEXT_CHUNKS`) → full-file expansion for top-N files → template filter → LLM answer (stream/non-stream) → `groupMatchesByFile` + **`trimSourcesToCited`** (chips = files named in answer; **empty for clarifying questions** via `isClarifyingQuestion`). `detectFileScope` honors a bare filename if it resolves to exactly one in-scope file.
+- **query/QueryEngine.java** — the RAG pipeline. Flow: resolve client scope → KNN search (TOP_K=40) → relevance-threshold + relative-distance filter → diversify per file (`MAX_CHUNKS_PER_FILE=4`, `MAX_CONTEXT_CHUNKS`) → template filter → LLM answer (stream/non-stream) → `groupMatchesByFile` + **`trimSourcesToCited`** (chips = files named in answer; **empty for clarifying questions** via `isClarifyingQuestion`). `detectFileScope` honors a bare filename (or pasted absolute path) that resolves to exactly one in-scope file — `answerFromFileScope` then reads that file's chunks **once** and answers from them directly (reusing the same capped list for the source chips), bypassing semantic search.
 - **llm/GPT4oMiniClient.java** — OpenAI calls (proxy or direct). **`SYSTEM_PROMPT`** (answer rules incl. "FIRST gauge intent → clarify vague one-word queries"; ABOUT vs LIST; FOCUSED; refusal last-resort) + `FOLLOW_UP_SYSTEM_PROMPT`. **`buildUserMessage`** labels excerpt blocks `=== <filename> ===` (NO "Source N" — that leaked into answers).
 - **query/ConversationHistory.java** — per-thread history fed to the LLM.
 - **storage/VectorStore.java** — Lucene KNN + per-file chunk fetch; client path-filter for isolation.

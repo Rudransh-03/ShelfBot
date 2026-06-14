@@ -382,6 +382,9 @@ export default function Chat({ active }) {
   // reload when we *adopt* a freshly-created thread after sending (the
   // messages are already on screen) vs. when the user *picks* a thread.
   const loadedIdRef = useRef(null)
+  // Monotonic id for the in-flight streamed answer; bumped on a thread switch so
+  // a stream still arriving for the previous thread stops writing to the screen.
+  const streamSeqRef = useRef(0)
 
   // In-chat find (⌘F)
   const [findOpen,    setFindOpen]    = useState(false)
@@ -415,6 +418,9 @@ export default function Chat({ active }) {
   // the case where activeConversationId already matches what's on screen.
   useEffect(() => {
     if (activeConversationId === loadedIdRef.current) return
+    // Switching threads invalidates any answer still streaming for the previous
+    // one — its stream callbacks check this counter and no-op.
+    streamSeqRef.current++
     let cancelled = false
     ;(async () => {
       if (!activeConversationId) {
@@ -429,7 +435,7 @@ export default function Chat({ active }) {
         setMessages((stored || []).map(m => {
           let sources
           if (m.sources) { try { sources = JSON.parse(m.sources) } catch { sources = undefined } }
-          return { role: m.role === 'assistant' ? 'ai' : 'user', text: m.content, sources }
+          return { id: crypto.randomUUID(), role: m.role === 'assistant' ? 'ai' : 'user', text: m.content, sources }
         }))
       } catch (e) {
         if (!cancelled) toast(e.message, 'e')
@@ -483,14 +489,21 @@ export default function Chat({ active }) {
   const sendMessage = useCallback(async (question, overrideClientId) => {
     if (!question?.trim() || !connected || loading) return
 
+    // Claim a stream sequence. If the user switches threads while this answer is
+    // still streaming, the thread-load effect bumps streamSeqRef and the stream
+    // callbacks below become no-ops — so a late token can't land in the wrong
+    // thread, and we won't yank the user back to this one when it finishes.
+    const mySeq = ++streamSeqRef.current
+
     setInput('')
-    setMessages(m => [...m, { role: 'user', text: question }])
+    setMessages(m => [...m, { id: crypto.randomUUID(), role: 'user', text: question }])
     setLoading(true)
     setTimeout(() => inputRef.current?.focus(), 0)
 
-    setMessages(m => [...m, { role: 'ai', text: '', streaming: true }])
+    setMessages(m => [...m, { id: crypto.randomUUID(), role: 'ai', text: '', streaming: true }])
 
     const appendToken = (chunk) => {
+      if (streamSeqRef.current !== mySeq) return
       setMessages(m => {
         const next = m.slice()
         const last = next[next.length - 1]
@@ -502,6 +515,7 @@ export default function Chat({ active }) {
     }
 
     const finalize = (patch) => {
+      if (streamSeqRef.current !== mySeq) return
       setMessages(m => {
         const next = m.slice()
         const last = next[next.length - 1]
@@ -529,7 +543,9 @@ export default function Chat({ active }) {
                      clarify, clarifyQuestion: question, scope })
           // Adopt the thread id without triggering a reload of the messages
           // we just streamed (loadedIdRef is set before the state update).
-          if (cid) { loadedIdRef.current = cid; setActiveConversationId(cid) }
+          // Only adopt the (possibly newly-created) thread id if the user is
+          // still on this conversation — otherwise we'd yank them back to it.
+          if (cid && streamSeqRef.current === mySeq) { loadedIdRef.current = cid; setActiveConversationId(cid) }
           resolve()
         },
         onError: (err) => {
@@ -630,10 +646,10 @@ export default function Chat({ active }) {
         <div className="messages" ref={msgsRef}>
           {messages.map((m, i) => (
             m.role === 'ai' && m.streaming && !m.text ? (
-              <TypingIndicator key={i} />
+              <TypingIndicator key={m.id} />
             ) : (
               <Message
-                key={i}
+                key={m.id}
                 role={m.role}
                 text={m.text}
                 sources={m.sources}

@@ -379,21 +379,28 @@ public final class IngestionPipeline {
         String absolutePath = PathNormalizer.canonical(file);
         synchronized (fileLock(absolutePath)) {
             // Re-check under the lock: a concurrent path may have just brought this
-            // exact file up-to-date — if so, do nothing.
+            // exact file up-to-date — if so, do nothing. We keep the attrs + hash
+            // computed here and hand them to recordSuccess, so a successful index
+            // doesn't read the whole file a SECOND time just to re-hash it.
+            BasicFileAttributes attrs = null;
+            String hash = null;
             try {
-                BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class);
+                attrs = Files.readAttributes(file, BasicFileAttributes.class);
                 long lastModified = attrs.lastModifiedTime().toMillis();
                 if (metadataStore.isUpToDateByTimestamp(absolutePath, lastModified)) {
                     return FileOutcome.SKIPPED;
                 }
-                String hash = FileHashUtil.sha256(file);
+                hash = FileHashUtil.sha256(file);
                 if (metadataStore.isUpToDateByHash(absolutePath, hash)) {
                     metadataStore.updateTimestamp(absolutePath, lastModified);
                     return FileOutcome.SKIPPED;
                 }
             } catch (IOException stat) {
-                // Couldn't stat/hash (e.g. file vanished) — let processFile surface
-                // the real error instead of masking it as "skipped".
+                // Couldn't stat/hash (e.g. file vanished) — drop what we have and
+                // let processFile surface the real error instead of masking it as
+                // "skipped"; recordSuccess recomputes attrs/hash if they're null.
+                attrs = null;
+                hash  = null;
             }
 
             ProcessResult result = processFile(file, fp);
@@ -402,7 +409,7 @@ public final class IngestionPipeline {
             }
             // Commit metadata INSIDE the lock so any thread waiting on this same
             // file then sees it up-to-date and skips.
-            recordSuccess(file, result.chunkCount, result.tokenCount);
+            recordSuccess(file, attrs, hash, result.chunkCount, result.tokenCount);
             return FileOutcome.indexed(result.chunkCount, result.tokenCount);
         }
     }
@@ -553,10 +560,18 @@ public final class IngestionPipeline {
         FileProgress NOOP = (s, d, t) -> {};
     }
 
-    private void recordSuccess(Path file, int chunkCount, long tokenCount) {
+    /**
+     * Persists the INDEXED metadata row. {@code attrs} and {@code hash} are the
+     * values {@link #indexFileGuarded} already computed for its up-to-date check —
+     * reused here so a successful index doesn't read the whole file a second time
+     * just to re-hash it. Either may be null (the earlier stat/hash failed); in
+     * that case we compute it now, preserving the previous behaviour.
+     */
+    private void recordSuccess(Path file, BasicFileAttributes attrs, String hash,
+                               int chunkCount, long tokenCount) {
         try {
-            BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class);
-            String hash = FileHashUtil.sha256(file);
+            if (attrs == null) attrs = Files.readAttributes(file, BasicFileAttributes.class);
+            if (hash  == null) hash  = FileHashUtil.sha256(file);
             metadataStore.upsert(FileRecord.builder()
                     .absolutePath(PathNormalizer.canonical(file))
                     .fileName(file.getFileName().toString())

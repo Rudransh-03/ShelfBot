@@ -333,23 +333,38 @@ function createWindow(port) {
 // App lifecycle
 // ─────────────────────────────────────────────────────────────────────────────
 
-app.whenReady().then(async () => {
-  console.log('[ShelfBot] app name:', app.getName())
-  console.log('[ShelfBot] userData:', app.getPath('userData'))
-  console.log('[ShelfBot] token file:', TOKEN_FILE())
-  console.log('[ShelfBot] device file:', DEVICE_FILE())
-  console.log('[ShelfBot] safeStorage available:', safeStorage.isEncryptionAvailable())
-  console.log('[ShelfBot] proxy url:', PROXY_URL)
-  const port = await startJavaBackend()
-  lastApiPort = port
-  createWindow(port)
-  // Defer the update check so the window paints first and the user isn't
-  // staring at a hanging window while we hit GitHub.
-  setTimeout(initAutoUpdater, 4_000)
-})
+// Single-instance guard: a second launch must NOT spawn a second backend —
+// killOrphanedJava() would then kill the FIRST instance's Java (and release its
+// Lucene write lock), breaking the already-running app. Focus the existing
+// window and quit the duplicate instead.
+if (!app.requestSingleInstanceLock()) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      mainWindow.focus()
+    }
+  })
 
-app.on('window-all-closed', () => { stopJava(); app.quit() })
-app.on('before-quit', stopJava)
+  app.whenReady().then(async () => {
+    console.log('[ShelfBot] app name:', app.getName())
+    console.log('[ShelfBot] userData:', app.getPath('userData'))
+    console.log('[ShelfBot] token file:', TOKEN_FILE())
+    console.log('[ShelfBot] device file:', DEVICE_FILE())
+    console.log('[ShelfBot] safeStorage available:', safeStorage.isEncryptionAvailable())
+    console.log('[ShelfBot] proxy url:', PROXY_URL)
+    const port = await startJavaBackend()
+    lastApiPort = port
+    createWindow(port)
+    // Defer the update check so the window paints first and the user isn't
+    // staring at a hanging window while we hit GitHub.
+    setTimeout(initAutoUpdater, 4_000)
+  })
+
+  app.on('window-all-closed', () => { stopJava(); app.quit() })
+  app.on('before-quit', stopJava)
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Auto-updater event wiring
@@ -487,7 +502,15 @@ ipcMain.on('window-maximize', () =>
   mainWindow?.isMaximized() ? mainWindow.unmaximize() : mainWindow?.maximize()
 )
 ipcMain.on('window-close',    () => mainWindow?.close())
-ipcMain.on('open-external',   (_, url) => shell.openExternal(url))
+ipcMain.on('open-external',   (_, url) => {
+  // Only open web + mail links (the only schemes the app ever sends). Guards
+  // against an unexpected value launching some other protocol handler.
+  if (typeof url === 'string' && /^(https?|mailto):/i.test(url)) {
+    shell.openExternal(url)
+  } else {
+    console.warn('[ShelfBot] refused to open external URL:', url)
+  }
+})
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Device-identity IPC

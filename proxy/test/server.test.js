@@ -26,10 +26,24 @@ test.before(async () => {
   // Start the OpenAI stub
   await new Promise((resolve) => {
     openaiStub = http.createServer((req, res) => {
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ id: 'stub', object: 'chat.completion', choices: [
-        { message: { role: 'assistant', content: 'stub' }, finish_reason: 'stop', index: 0 }
-      ]}))
+      // Read the request so a test can opt into an upstream failure: a first
+      // message of 'fail-upstream' makes the stub return a non-2xx, exercising
+      // the proxy's refund-on-upstream-error path. Everything else 200s.
+      let body = ''
+      req.on('data', (c) => { body += c })
+      req.on('end', () => {
+        let wantFail = false
+        try { wantFail = JSON.parse(body)?.messages?.[0]?.content === 'fail-upstream' } catch {}
+        if (wantFail) {
+          res.writeHead(500, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: { message: 'simulated upstream failure' } }))
+          return
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ id: 'stub', object: 'chat.completion', choices: [
+          { message: { role: 'assistant', content: 'stub' }, finish_reason: 'stop', index: 0 }
+        ]}))
+      })
     })
     openaiStub.listen(0, '127.0.0.1', () => {
       openaiUrl = `http://127.0.0.1:${openaiStub.address().port}`
@@ -97,13 +111,13 @@ async function me(token) {
   return { status: r.status, body: r.status < 400 ? await r.json() : await r.json().catch(() => ({})) }
 }
 
-async function chat(token) {
+async function chat(token, content = 'hi') {
   const r = await fetch(`${proxyUrl}/proxy/chat/completions`, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body:    JSON.stringify({ model: 'gpt-4o-mini', messages: [{role:'user',content:'hi'}] }),
+    body:    JSON.stringify({ model: 'gpt-4o-mini', messages: [{role:'user',content}] }),
   })
-  return { status: r.status, body: await r.json().catch(() => ({})) }
+  return { status: r.status, usedHeader: r.headers.get('x-usage-used'), body: await r.json().catch(() => ({})) }
 }
 
 // ── The tests ────────────────────────────────────────────────────────────
@@ -177,6 +191,25 @@ test('different deviceIds get independent quotas', async () => {
 
   const bCall = await chat(b.body.token)
   assert.equal(bCall.status, 200, 'B unaffected by A')
+})
+
+test('a failed upstream call is refunded — does not consume the daily cap', async () => {
+  const reg = await register('refund-on-failure-device-13579')
+  const t   = reg.body.token
+
+  // Upstream 500s → proxy passes the error through but must NOT charge a slot.
+  const failed = await chat(t, 'fail-upstream')
+  assert.equal(failed.status, 500, 'upstream error is passed through verbatim')
+  assert.equal(failed.usedHeader, '0', 'X-Usage-Used header reflects the refund')
+
+  const afterFail = await me(t)
+  assert.equal(afterFail.body.usage.used, 0, 'failed call refunded — counter still 0')
+
+  // A subsequent good call works and is the only one that counts.
+  const ok = await chat(t, 'hi')
+  assert.equal(ok.status, 200, 'good call after a failure still works')
+  const afterOk = await me(t)
+  assert.equal(afterOk.body.usage.used, 1, 'only the successful call counted')
 })
 
 test('health endpoint exposes per-plan caps', async () => {

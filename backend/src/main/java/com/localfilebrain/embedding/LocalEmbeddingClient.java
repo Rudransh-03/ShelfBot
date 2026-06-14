@@ -60,6 +60,14 @@ public final class LocalEmbeddingClient implements EmbeddingClient {
     private final HuggingFaceTokenizer  tokenizer;
 
     public LocalEmbeddingClient(Path modelDir) {
+        // Build into locals first; assign the final fields only once BOTH the
+        // session and tokenizer succeed. If the tokenizer build throws after the
+        // ONNX session is created, close the session here so a half-built client
+        // can't leak the native session. (OrtEnvironment is a JVM-wide singleton,
+        // not ours to close.)
+        OrtEnvironment       envLocal       = null;
+        OrtSession           sessionLocal   = null;
+        HuggingFaceTokenizer tokenizerLocal = null;
         try {
             Path modelFile     = modelDir.resolve("model.onnx");
             Path tokenizerFile = modelDir.resolve("tokenizer.json");
@@ -70,11 +78,11 @@ public final class LocalEmbeddingClient implements EmbeddingClient {
 
             log.info("Loading local embedding model from {}", modelDir.toAbsolutePath());
 
-            this.env       = OrtEnvironment.getEnvironment();
+            envLocal = OrtEnvironment.getEnvironment();
             OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
             // CPU is fine; we don't ship GPU runtimes.
-            this.session   = env.createSession(modelFile.toString(), opts);
-            this.tokenizer = HuggingFaceTokenizer.builder()
+            sessionLocal   = envLocal.createSession(modelFile.toString(), opts);
+            tokenizerLocal = HuggingFaceTokenizer.builder()
                     .optTokenizerPath(tokenizerFile)
                     .optAddSpecialTokens(true)
                     .optTruncation(true)
@@ -83,8 +91,13 @@ public final class LocalEmbeddingClient implements EmbeddingClient {
 
             log.info("Local embedding model ready ({} dims)", DIMS);
         } catch (Exception e) {
+            if (sessionLocal   != null) { try { sessionLocal.close();   } catch (Exception ignored) {} }
+            if (tokenizerLocal != null) { try { tokenizerLocal.close(); } catch (Exception ignored) {} }
             throw new LocalEmbeddingException("Failed to initialise local embedding model: " + e.getMessage(), e);
         }
+        this.env       = envLocal;
+        this.session   = sessionLocal;
+        this.tokenizer = tokenizerLocal;
     }
 
     @Override

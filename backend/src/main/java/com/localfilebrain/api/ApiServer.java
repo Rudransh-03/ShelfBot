@@ -176,7 +176,6 @@ public final class ApiServer {
         server.createContext("/api/index",        this::handleIndex);
         server.createContext("/api/query",        this::handleQuery);
         server.createContext("/api/query/stream", this::handleQueryStream);
-        server.createContext("/api/conversation", this::handleConversation);
         server.createContext("/api/conversations", this::handleConversations);
         server.createContext("/api/config",       this::handleConfig);
         server.createContext("/api/files/summary", this::handleFileSummary);
@@ -549,20 +548,6 @@ public final class ApiServer {
         sb.append('\n'); // blank line terminates the event
         out.write(sb.toString().getBytes(StandardCharsets.UTF_8));
         out.flush();
-    }
-
-    /** DELETE /api/conversation */
-    private void handleConversation(HttpExchange ex) throws IOException {
-        if (preflight(ex)) return;
-        if (!isMethod(ex, "DELETE")) { methodNotAllowed(ex); return; }
-
-        try {
-            QueryEngine engine = getOrInitQueryEngine();
-            engine.clearHistory();
-            sendJson(ex, 200, map("cleared", true));
-        } catch (Exception e) {
-            sendError(ex, 503, "QueryEngine not available: " + e.getMessage());
-        }
     }
 
     /**

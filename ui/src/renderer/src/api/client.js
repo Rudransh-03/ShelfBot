@@ -89,7 +89,6 @@ export class ApiClient {
     })()
     return () => ctrl.abort()
   }
-  clearConvo()      { return this._r('/api/conversation', { method: 'DELETE' }) }
 
   // ── Chat threads (local, on-device) ──────────────────────────────────────
   /** All saved chat threads, most-recently-updated first. */

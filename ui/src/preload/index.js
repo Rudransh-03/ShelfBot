@@ -7,7 +7,11 @@ contextBridge.exposeInMainWorld('electron', {
   maximizeWindow: ()     => ipcRenderer.send('window-maximize'),
   closeWindow:    ()     => ipcRenderer.send('window-close'),
   openExternal:   (url)  => ipcRenderer.send('open-external', url),
-  onApiPort:      (cb)   => ipcRenderer.on('api-port', (_e, p) => cb(p)),
+  onApiPort:      (cb)   => {
+    const handler = (_e, p) => cb(p)
+    ipcRenderer.on('api-port', handler)
+    return () => ipcRenderer.removeListener('api-port', handler)
+  },
   platform:       process.platform,
 
   // Calendar reminders (.ics — works on every OS with a calendar app)
@@ -17,7 +21,11 @@ contextBridge.exposeInMainWorld('electron', {
   exportFile: (payload) => ipcRenderer.invoke('export:file', payload),
 
   // Auto-updater
-  onUpdateStatus:    (cb) => ipcRenderer.on('update-status', (_e, s) => cb(s)),
+  onUpdateStatus:    (cb) => {
+    const handler = (_e, s) => cb(s)
+    ipcRenderer.on('update-status', handler)
+    return () => ipcRenderer.removeListener('update-status', handler)
+  },
   installUpdate:     ()   => ipcRenderer.invoke('updater:install'),
   checkForUpdates:   ()   => ipcRenderer.invoke('updater:check'),
 

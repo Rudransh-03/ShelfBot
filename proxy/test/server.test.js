@@ -66,6 +66,11 @@ test.before(async () => {
       PRO_DAILY:       '4',
       PORT:            String(proxyPort),
       DB_PATH:         join(tmpDir, 'test.db'),
+      // This shared instance isn't testing the IP throttle (a dedicated test
+      // below spins up its own proxy for that) — keep caps far above what the
+      // whole suite issues from 127.0.0.1 so they never trip here.
+      REGISTER_IP_DAILY: '100000',
+      PROXY_IP_DAILY:    '100000',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -219,4 +224,89 @@ test('health endpoint exposes per-plan caps', async () => {
   assert.equal(body.ok, true)
   assert.equal(body.plans.free, 2)
   assert.equal(body.plans.pro, 4)
+})
+
+// ── Cost guardrails (model pinning + token clamp) ──────────────────────────
+
+test('rejects a chat request for a non-allowlisted (expensive) model', async () => {
+  const reg = await register('device-bad-model-xyz')
+  const t   = reg.body.token
+
+  const r = await fetch(`${proxyUrl}/proxy/chat/completions`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}` },
+    body:    JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] }),
+  })
+  assert.equal(r.status, 400, 'off-allowlist model is rejected before reaching OpenAI')
+
+  // And the rejected call must not have consumed a daily slot.
+  const after = await me(t)
+  assert.equal(after.body.usage.used, 0, 'rejected model request did not burn quota')
+})
+
+test('rejects a chat request with no model field', async () => {
+  const reg = await register('device-no-model-xyz')
+  const t   = reg.body.token
+  const r = await fetch(`${proxyUrl}/proxy/chat/completions`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}` },
+    body:    JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+  })
+  assert.equal(r.status, 400)
+})
+
+test('rejects an embeddings request for a non-allowlisted model', async () => {
+  const reg = await register('device-bad-embed-xyz')
+  const t   = reg.body.token
+  const r = await fetch(`${proxyUrl}/proxy/embeddings`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}` },
+    body:    JSON.stringify({ model: 'text-embedding-ada-002', input: 'hi' }),
+  })
+  assert.equal(r.status, 400)
+})
+
+// ── Per-IP registration throttle (Layer 2) ─────────────────────────────────
+// Spins up an isolated proxy with a tiny REGISTER_IP_DAILY so we can prove the
+// (N+1)th registration from the same IP is refused with 429.
+
+test('throttles bulk device registration from one IP', async () => {
+  const dir  = mkdtempSync(join(tmpdir(), 'shelfbot-proxy-rl-'))
+  const port = 19000 + Math.floor(Math.random() * 900)
+  const url  = `http://127.0.0.1:${port}`
+  const proc = spawn(process.execPath, ['src/server.js'], {
+    env: {
+      ...process.env,
+      OPENAI_API_KEY: 'sk-stub',
+      JWT_SECRET:     'a'.repeat(32),
+      PORT:           String(port),
+      DB_PATH:        join(dir, 'rl.db'),
+      REGISTER_IP_DAILY: '3',   // tiny cap so the 4th call trips it
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+
+  try {
+    await new Promise((resolve, reject) => {
+      let buf = ''
+      const timer = setTimeout(() => reject(new Error('proxy did not start: ' + buf)), 8000)
+      proc.stdout.on('data', d => { buf += d; if (buf.includes('listening')) { clearTimeout(timer); resolve() } })
+      proc.stderr.on('data', d => { buf += '[err] ' + d })
+    })
+
+    const reg = (i) => fetch(`${url}/device/register`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ deviceId: `rl-device-${i}-aaaaaaaa` }),
+    }).then(r => r.status)
+
+    assert.equal(await reg(1), 200, '1st registration allowed')
+    assert.equal(await reg(2), 200, '2nd allowed')
+    assert.equal(await reg(3), 200, '3rd allowed (at the cap)')
+    assert.equal(await reg(4), 429, '4th from the same IP is throttled')
+  } finally {
+    proc.kill('SIGTERM')
+    await new Promise(r => proc.once('exit', r))
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

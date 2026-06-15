@@ -1,7 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, safeStorage, shell } from 'electron'
 import { join }   from 'path'
 import { spawn, execFile }  from 'child_process'
-import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, chmodSync } from 'fs'
 import { createServer } from 'net'
 import { machineIdSync } from 'node-machine-id'
 import { randomUUID }    from 'crypto'
@@ -142,6 +142,13 @@ const JAR_PROD     = join(process.resourcesPath ?? '', 'shelfbot.jar')
 const DEFAULT_PORT   = 9876
 const START_TIMEOUT  = 35_000 // ms
 
+// Per-launch secret shared only between this main process, the Java backend
+// (passed via env), and our own renderer (passed over IPC). The backend rejects
+// any /api/* request that doesn't echo it in X-Shelfbot-Token — so a malicious
+// web page in the user's browser can reach the localhost port but can't read
+// their private documents/chat, because it can't know this value.
+const LOCAL_API_TOKEN = randomUUID()
+
 let mainWindow  = null
 let javaProcess = null
 
@@ -153,6 +160,40 @@ function getJarPath() {
   if (app.isPackaged && existsSync(JAR_PROD)) return JAR_PROD
   if (existsSync(JAR_DEV))                    return JAR_DEV
   return null
+}
+
+/**
+ * Resolves the `java` executable to launch the backend with.
+ *
+ * Packaged builds ship a slim, self-contained Java runtime under
+ * resources/runtime/ (built by scripts/build-runtime.mjs via jlink), so the
+ * end user never needs Java installed. We use that bundled runtime whenever
+ * it's present; otherwise we fall back to a system `java` on PATH (covers
+ * `npm run dev`, and is a graceful last resort if the bundle is missing).
+ *
+ * In dev we'll also use a locally-built runtime if one exists, so the exact
+ * packaged code path can be exercised without making a full installer.
+ */
+function getJavaBin() {
+  const exe = process.platform === 'win32' ? 'java.exe' : 'java'
+  const candidate = app.isPackaged
+    ? join(process.resourcesPath, 'runtime', 'bin', exe)
+    : join(BACKEND_ROOT, 'target', 'runtime', 'bin', exe)
+
+  if (existsSync(candidate)) {
+    // extraResources should preserve the exec bit, but ensure it on *nix so a
+    // copy that dropped permissions can't break launch.
+    if (process.platform !== 'win32') {
+      try { chmodSync(candidate, 0o755) } catch { /* best effort */ }
+    }
+    return candidate
+  }
+
+  if (app.isPackaged) {
+    console.warn('[ShelfBot] bundled Java runtime not found at', candidate,
+      '— falling back to system java')
+  }
+  return 'java'
 }
 
 function findFreePort(from = DEFAULT_PORT) {
@@ -249,16 +290,21 @@ function startJavaBackend() {
     // Always sweep orphaned JVMs first — see killOrphanedJava() for why.
     await killOrphanedJava()
     const port = await findFreePort()
-    console.log(`[ShelfBot] Starting Java on port ${port}  (${jar})`)
+    const javaBin = getJavaBin()
+    console.log(`[ShelfBot] Starting Java on port ${port}  (${javaBin} -jar ${jar})`)
 
     // -Djava.awt.headless=true keeps the JVM from initializing AWT — which
     //   (a) prevents the Java dock/menu icon appearing on macOS, and
     //   (b) avoids loading the windowing system at all on headless Linux servers.
     // Tika's OCR + PDF image parsers pull AWT in transitively, so without this
     //   the user sees a Java icon pop into their dock alongside ShelfBot.
-    javaProcess = spawn('java', ['-Djava.awt.headless=true', '-Xmx512m', '-jar', jar, '--server', '--port', String(port)], {
+    javaProcess = spawn(javaBin, ['-Djava.awt.headless=true', '-Xmx512m', '-jar', jar, '--server', '--port', String(port)], {
       cwd:   BACKEND_ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
+      // Hand the backend the per-launch API secret. Spread process.env so the
+      // JVM still inherits PATH etc.; passing via env (not argv) keeps the
+      // secret out of `ps`/pgrep output.
+      env:   { ...process.env, SHELFBOT_LOCAL_TOKEN: LOCAL_API_TOKEN },
     })
 
     const timer = setTimeout(() => {
@@ -321,8 +367,23 @@ function createWindow(port) {
     mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
   }
 
+  // Hardening: the renderer should never navigate itself away from the app
+  // shell, and window.open should not spawn arbitrary Electron windows. A
+  // compromised/injected renderer is thus contained — external links still
+  // open, but in the user's real browser, and only for safe schemes.
+  mainWindow.webContents.on('will-navigate', (e, url) => {
+    const appUrl = process.env['ELECTRON_RENDERER_URL']
+    if (appUrl && url.startsWith(appUrl)) return // allow Vite HMR in dev
+    e.preventDefault()
+    if (/^https?:/i.test(url)) shell.openExternal(url)
+  })
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^(https?|mailto):/i.test(url)) shell.openExternal(url)
+    return { action: 'deny' }
+  })
+
   mainWindow.webContents.on('did-finish-load', () => {
-    mainWindow.webContents.send('api-port', port)
+    mainWindow.webContents.send('api-port', { port, token: LOCAL_API_TOKEN })
     mainWindow.show()
   })
 
@@ -535,7 +596,7 @@ async function pushTokenToBackend(token) {
   try {
     await fetch(`http://localhost:${lastApiPort}/api/auth`, {
       method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Shelfbot-Token': LOCAL_API_TOKEN },
       body:    JSON.stringify({ token }),
     })
   } catch (e) {
@@ -641,7 +702,7 @@ ipcMain.handle('device:logout', async () => {
   // after a "logout" / re-register. Clearing device.id would let a user
   // reset their free quota by clicking "logout" + reopening the app.
   if (lastApiPort) {
-    try { await fetch(`http://localhost:${lastApiPort}/api/auth`, { method: 'DELETE' }) } catch {}
+    try { await fetch(`http://localhost:${lastApiPort}/api/auth`, { method: 'DELETE', headers: { 'X-Shelfbot-Token': LOCAL_API_TOKEN } }) } catch {}
   }
   return { ok: true }
 })

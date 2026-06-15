@@ -24,6 +24,7 @@ const DEADLINE_SCAN_DEBOUNCE_MS = 8_000
 
 export function AppProvider({ children }) {
   const [apiBase,   setApiBase]   = useState(null)
+  const [apiToken,  setApiToken]  = useState(null)
   const [connected, setConnected] = useState(false)
   const [toasts,    setToasts]    = useState([])
 
@@ -104,8 +105,8 @@ export function AppProvider({ children }) {
     setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), ms)
   }, [])
 
-  // Fresh ApiClient any time the base URL changes
-  const api = useMemo(() => (apiBase ? new ApiClient(apiBase) : null), [apiBase])
+  // Fresh ApiClient any time the base URL or launch token changes
+  const api = useMemo(() => (apiBase ? new ApiClient(apiBase, apiToken) : null), [apiBase, apiToken])
 
   const loadStats = useCallback(async () => {
     if (!api) return null
@@ -325,7 +326,7 @@ export function AppProvider({ children }) {
 
   return (
     <AppCtx.Provider value={{
-      api, apiBase, setApiBase,
+      api, apiBase, setApiBase, setApiToken,
       connected, setConnected,
       toast, toasts,
       autoModalOpen, setAutoModalOpen,

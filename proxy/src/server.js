@@ -27,7 +27,7 @@ const JWT_SECRET            = process.env.JWT_SECRET
 const JWT_TTL_SECONDS       = parseInt(process.env.JWT_TTL_SECONDS || '2592000', 10)
 const FREE_DAILY            = parseInt(process.env.FREE_DAILY || '5', 10)
 const PRO_DAILY             = parseInt(process.env.PRO_DAILY  || '25', 10)
-// Bumped to 20 during testing — restore to 1 (free) / 5 (pro) before shipping.
+// TESTING: bumped to 20/20 for now. Restore to 1 (free) / 5 (pro) before shipping.
 const FREE_REORG_DAILY      = parseInt(process.env.FREE_REORG_DAILY || '20', 10)
 const PRO_REORG_DAILY       = parseInt(process.env.PRO_REORG_DAILY  || '20', 10)
 const REORG_LLM_BUDGET      = parseInt(process.env.REORG_LLM_BUDGET || '50', 10)
@@ -35,6 +35,57 @@ const REORG_SESSION_TTL_MIN = parseInt(process.env.REORG_SESSION_TTL_MIN || '30'
 const OPENAI_API_KEY        = process.env.OPENAI_API_KEY
 const OPENAI_BASE_URL       = (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '')
 const DB_PATH               = process.env.DB_PATH || './shelfbot-proxy.db'
+
+// Cost guardrails. The desktop app only ever needs these cheap models, but the
+// device JWT is easy to obtain (registration is open by design) and the body is
+// client-supplied — so a tampered/hostile client could otherwise ask us to bill
+// an expensive model (gpt-4o, o1, …) or an enormous completion against OUR key.
+// We pin the model to an allowlist and clamp max_tokens server-side. Override
+// via env if the app's model choice ever changes.
+const CHAT_MODELS_ALLOWED = new Set(
+  (process.env.CHAT_MODELS_ALLOWED || 'gpt-4o-mini').split(',').map(s => s.trim()).filter(Boolean)
+)
+const EMBED_MODELS_ALLOWED = new Set(
+  (process.env.EMBED_MODELS_ALLOWED || 'text-embedding-3-small,text-embedding-3-large').split(',').map(s => s.trim()).filter(Boolean)
+)
+const MAX_COMPLETION_TOKENS = parseInt(process.env.MAX_COMPLETION_TOKENS || '4096', 10)
+
+// ── Abuse throttle (Layer 2) ────────────────────────────────────────────────
+// Device registration is anonymous, so a script can mint unlimited devices —
+// each carrying a fresh free quota — and use us as a free OpenAI relay. Until
+// usage is license-gated, we blunt bulk farming with a generous per-IP, per-day
+// cap on the two anonymous-cost surfaces: registration and the OpenAI-forwarding
+// /proxy/* routes. Caps are deliberately high (whole offices / carrier-grade NAT
+// sit behind one IP) — high enough to never hit a real network, low enough that
+// a curl loop dies fast. 0 disables a limiter.
+const REGISTER_IP_DAILY = parseInt(process.env.REGISTER_IP_DAILY || '20', 10)
+const PROXY_IP_DAILY    = parseInt(process.env.PROXY_IP_DAILY    || '200', 10)
+// Number of reverse-proxy hops to trust for the client IP. MUST be 1 (or your
+// real hop count) in production behind nginx/Cloud Run, else every request looks
+// like it comes from the load balancer and all users share one bucket. 0 (the
+// dev default) uses the direct socket IP.
+const TRUST_PROXY = parseInt(process.env.TRUST_PROXY || '0', 10)
+
+/**
+ * Validates + clamps a chat-completions body before it goes upstream on our key.
+ * Returns { body } on success or { error } (a 400 message) on rejection.
+ */
+function sanitizeChatBody(raw) {
+  if (!raw || typeof raw !== 'object') return { error: 'Request body must be a JSON object.' }
+  const model = raw.model
+  if (typeof model !== 'string' || !CHAT_MODELS_ALLOWED.has(model)) {
+    return { error: 'Unsupported model.' }
+  }
+  const body = { ...raw }
+  // Clamp the caller's requested completion size to our ceiling (and only ever
+  // shrink it — never raise what the client asked for).
+  if (typeof body.max_tokens === 'number') {
+    body.max_tokens = Math.min(body.max_tokens, MAX_COMPLETION_TOKENS)
+  } else {
+    body.max_tokens = MAX_COMPLETION_TOKENS
+  }
+  return { body }
+}
 
 if (!JWT_SECRET || JWT_SECRET.length < 16) {
   console.error('[proxy] JWT_SECRET missing or too short. Refusing to start.')
@@ -61,8 +112,36 @@ function reorgPlanLimit(plan) {
 }
 
 const app = express()
+// Honor X-Forwarded-For only for the configured number of trusted hops, so
+// req.ip is the real client behind a reverse proxy without letting a caller
+// spoof their IP via a forged header to dodge the rate limiter.
+app.set('trust proxy', TRUST_PROXY)
 app.use(cors())
 app.use(express.json({ limit: '8mb' }))
+
+// In-memory per-IP daily counters. The proxy is single-instance, so this is
+// enough; the whole map is dropped when the UTC day rolls over (self-pruning,
+// no unbounded growth) and on restart (acceptable for a stopgap throttle).
+let rlDay = todayKey()
+const ipHits = new Map()
+function rateLimit(bucket, max) {
+  return (req, res, next) => {
+    if (max <= 0) return next()             // limiter disabled
+    const day = todayKey()
+    if (day !== rlDay) { ipHits.clear(); rlDay = day }
+    const key = `${bucket}:${req.ip || 'unknown'}`
+    const n = (ipHits.get(key) || 0) + 1
+    ipHits.set(key, n)
+    if (n > max) {
+      return res.status(429).json({
+        error: 'Too many requests from your network today. Please try again tomorrow.',
+      })
+    }
+    next()
+  }
+}
+const limitRegister = rateLimit('register', REGISTER_IP_DAILY)
+const limitProxy    = rateLimit('proxy',    PROXY_IP_DAILY)
 
 // ─── Health ───────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
@@ -86,7 +165,7 @@ app.get('/health', (req, res) => {
 // stops verifying). Idempotent — replays from the same device just refresh
 // last_seen and return a fresh JWT.
 
-app.post('/device/register', (req, res) => {
+app.post('/device/register', limitRegister, (req, res) => {
   const deviceId = (req.body?.deviceId || '').trim()
   // Validate shape — a real machine fingerprint or UUID, not a 1-char string
   // a curious user typed in to test the API.
@@ -124,7 +203,10 @@ app.get('/me', auth.requireAuth, (req, res) => {
 // can't fire them on demand.) Chat completions are the only billable
 // surface they control, so that's what counts against the daily cap.
 
-app.post('/proxy/embeddings', auth.requireAuth, async (req, res) => {
+app.post('/proxy/embeddings', limitProxy, auth.requireAuth, async (req, res) => {
+  if (typeof req.body?.model !== 'string' || !EMBED_MODELS_ALLOWED.has(req.body.model)) {
+    return res.status(400).json({ error: 'Unsupported embedding model.' })
+  }
   try {
     const upstream = await fetch(OPENAI_BASE_URL + '/embeddings', {
       method:  'POST',
@@ -143,7 +225,11 @@ app.post('/proxy/embeddings', auth.requireAuth, async (req, res) => {
   }
 })
 
-app.post('/proxy/chat/completions', auth.requireAuth, async (req, res) => {
+app.post('/proxy/chat/completions', limitProxy, auth.requireAuth, async (req, res) => {
+  const clean = sanitizeChatBody(req.body)
+  if (clean.error) return res.status(400).json({ error: clean.error })
+  req.body = clean.body
+
   const limit = planLimit(req.device.plan)
   const used  = db.getTodayCount(req.device.id, todayKey())
   if (used >= limit) {
@@ -252,7 +338,7 @@ app.post('/proxy/chat/completions', auth.requireAuth, async (req, res) => {
 // from the session's budget, refunding on upstream failure. The session ID
 // is opaque to the backend and bound to the device that opened it.
 
-app.post('/reorg/start', auth.requireAuth, (req, res) => {
+app.post('/reorg/start', limitProxy, auth.requireAuth, (req, res) => {
   const day   = todayKey()
   const limit = reorgPlanLimit(req.device.plan)
   const used  = db.getReorgStartsToday(req.device.id, day)
@@ -292,7 +378,7 @@ app.post('/reorg/start', auth.requireAuth, (req, res) => {
   })
 })
 
-app.post('/reorg/llm', auth.requireAuth, async (req, res) => {
+app.post('/reorg/llm', limitProxy, auth.requireAuth, async (req, res) => {
   const sessionId = (req.body?.sessionId || '').trim()
   if (!sessionId) {
     return res.status(400).json({ error: 'Missing sessionId in request body.' })
@@ -315,6 +401,11 @@ app.post('/reorg/llm', auth.requireAuth, async (req, res) => {
     })
   }
 
+  // Same model/size guardrails as the chat path — this also forwards to OpenAI
+  // on our key. Reject (before spending budget) anything off the allowlist.
+  const cleanReorg = sanitizeChatBody({ ...req.body, sessionId: undefined })
+  if (cleanReorg.error) return res.status(400).json({ error: cleanReorg.error })
+
   const remaining = db.decrementReorgSessionBudget(sessionId, now)
   if (remaining < 0) {
     return res.status(429).json({
@@ -324,10 +415,10 @@ app.post('/reorg/llm', auth.requireAuth, async (req, res) => {
     })
   }
 
-  // Extract OpenAI args from the request body. The backend sends them
-  // pre-formatted; we add nothing except the API key on the outgoing call.
-  const upstreamBody = { ...req.body }
-  delete upstreamBody.sessionId   // session id is for the proxy only
+  // Use the validated + clamped body (model pinned, max_tokens capped). The
+  // sessionId was stripped inside sanitizeChatBody's input already.
+  const upstreamBody = cleanReorg.body
+  delete upstreamBody.sessionId   // belt-and-suspenders: never leak it upstream
 
   try {
     const upstream = await fetch(OPENAI_BASE_URL + '/chat/completions', {

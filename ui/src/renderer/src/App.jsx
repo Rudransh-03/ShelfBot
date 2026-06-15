@@ -21,7 +21,7 @@ import Settings       from './views/Settings'
 // ─────────────────────────────────────────────────────────────────────────────
 
 function Shell() {
-  const { setApiBase, setConnected, connected } = useApp()
+  const { setApiBase, setApiToken, setConnected, connected } = useApp()
   const [loadMsg,   setLoadMsg]   = useState('Starting up…')
   const [loaded,    setLoaded]    = useState(false)
   const [view,      setView]      = useState('chat')
@@ -51,8 +51,9 @@ function Shell() {
     })
   }
 
-  async function initBackend(port) {
+  async function initBackend({ port, token }) {
     const base = `http://localhost:${port}`
+    setApiToken(token || null)
     setApiBase(base)
     setLoadMsg('Connecting to backend…')
 
@@ -72,11 +73,13 @@ function Shell() {
   useEffect(() => {
     const E = window.electron
     if (!E) {
-      // Dev fallback — open the HTML directly in a browser
-      initBackend(9876)
+      // Dev fallback — open the HTML directly in a browser (no token; the
+      // backend only enforces one when launched by the Electron main process).
+      initBackend({ port: 9876 })
       return
     }
-    return E.onApiPort(port => initBackend(port)) // disposer removes the listener
+    // Payload is { port, token } sent by the Electron main process.
+    return E.onApiPort(payload => initBackend(payload || {})) // disposer removes the listener
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   return (

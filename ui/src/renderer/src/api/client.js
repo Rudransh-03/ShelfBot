@@ -1,12 +1,25 @@
 export class ApiClient {
-  constructor(base) {
+  constructor(base, token = null) {
     this.base = base
+    // Per-launch secret the Electron main process handed us. The backend
+    // rejects any /api/* call without it — this is what keeps a random web
+    // page in the user's browser from reading their local documents/chat.
+    this.token = token
+  }
+
+  /** Headers for every request: JSON + the local-API token when we have one. */
+  _headers(extra = {}) {
+    return {
+      'Content-Type': 'application/json',
+      ...(this.token ? { 'X-Shelfbot-Token': this.token } : {}),
+      ...extra,
+    }
   }
 
   async _r(path, opts = {}) {
     const res  = await fetch(this.base + path, {
-      headers: { 'Content-Type': 'application/json' },
       ...opts,
+      headers: this._headers(opts.headers),
     })
     const data = await res.json()
     if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
@@ -34,7 +47,7 @@ export class ApiClient {
       try {
         const res = await fetch(this.base + '/api/query/stream', {
           method:  'POST',
-          headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+          headers: this._headers({ 'Accept': 'text/event-stream' }),
           body:    JSON.stringify({ question: q, conversationId, clientId }),
           signal:  ctrl.signal,
         })

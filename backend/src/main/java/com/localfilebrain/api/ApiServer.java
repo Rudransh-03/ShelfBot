@@ -80,6 +80,15 @@ public final class ApiServer {
     private final VectorStore        vectorStore;
     private final EmbeddingClient    embeddingClient;
     private final AuthTokenStore     tokenStore;
+    // Per-launch shared secret. The Electron main process generates it, hands it
+    // to this backend via the SHELFBOT_LOCAL_TOKEN env var, and to the renderer
+    // over IPC. Every /api/* request (except the liveness probe + CORS preflight)
+    // must echo it in the X-Shelfbot-Token header. This is what stops a malicious
+    // web page open in the user's ordinary browser from reaching this localhost
+    // API and reading their private documents/chat — the page can hit the port,
+    // but it cannot know this secret. Null/blank ⇒ enforcement disabled, which is
+    // the case for headless dev/test runs (no env var set) so they keep working.
+    private final String             localToken = System.getenv("SHELFBOT_LOCAL_TOKEN");
     // One-shot detector — instantiating TextExtractor probes Tesseract; we
     // keep the result to report in /api/status without re-checking per call.
     private final boolean            ocrAvailable = new TextExtractor().isOcrAvailable();
@@ -1848,12 +1857,33 @@ public final class ApiServer {
     private boolean preflight(HttpExchange ex) throws IOException {
         ex.getResponseHeaders().set("Access-Control-Allow-Origin",  "*");
         ex.getResponseHeaders().set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-        ex.getResponseHeaders().set("Access-Control-Allow-Headers", "Content-Type");
+        ex.getResponseHeaders().set("Access-Control-Allow-Headers", "Content-Type, X-Shelfbot-Token");
         if ("OPTIONS".equalsIgnoreCase(ex.getRequestMethod())) {
+            // CORS preflight carries no custom headers — answer it before the
+            // token gate so the browser is allowed to send the real request
+            // (which DOES carry the token).
             ex.sendResponseHeaders(204, -1);
             return true;
         }
+        // Local-origin auth. /api/health stays open: it returns only liveness
+        // (no user data) and the renderer + readiness probes hit it without a
+        // token. Everything else must present the per-launch secret.
+        if (localToken != null && !localToken.isBlank()
+                && !"/api/health".equals(ex.getRequestURI().getPath())
+                && !hasValidLocalToken(ex)) {
+            sendError(ex, 403, "Forbidden");
+            return true;
+        }
         return false;
+    }
+
+    /** Constant-time check of the X-Shelfbot-Token header against the launch secret. */
+    private boolean hasValidLocalToken(HttpExchange ex) {
+        String supplied = ex.getRequestHeaders().getFirst("X-Shelfbot-Token");
+        if (supplied == null) return false;
+        return java.security.MessageDigest.isEqual(
+                supplied.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                localToken.getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
 
     private boolean isMethod(HttpExchange ex, String method) {

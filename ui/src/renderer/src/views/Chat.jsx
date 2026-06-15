@@ -93,27 +93,46 @@ const SheetIcon = () => (
   </svg>
 )
 
+// Only these URL schemes may ever be opened from a rendered answer. The answer
+// is model output derived from (untrusted) document content, so a malicious
+// file could try to smuggle a javascript:/file:/data: link into it.
+const SAFE_LINK = /^(https?:|mailto:)/i
+
 // Renders an assistant answer as markdown (tables, lists, code, bold via GFM).
-// Links open in the user's browser, not inside the app window.
+//
+// Security: this is model output built from untrusted document content, so we
+// lock the renderer down:
+//   • raw HTML is NOT parsed (no rehype-raw) → embedded <script>/<img onerror>
+//     in the text is inert;
+//   • images are disallowed so a crafted document can't make the app auto-fetch
+//     a remote/tracking URL (an indirect-prompt-injection exfiltration channel),
+//     belt-and-suspenders with the renderer CSP (img-src 'self');
+//   • links open in the user's external browser, and only http(s)/mailto are
+//     ever opened.
 function MarkdownView({ text }) {
   return (
     <div className="md">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
+        skipHtml
+        disallowedElements={['img']}
         components={{
-          a: ({ href, children }) => (
-            <a
-              href={href}
-              onClick={(e) => {
-                e.preventDefault()
-                if (!href) return
-                if (window.electron?.openExternal) window.electron.openExternal(href)
-                else window.open(href, '_blank')
-              }}
-            >
-              {children}
-            </a>
-          ),
+          a: ({ href, children }) => {
+            const safe = typeof href === 'string' && SAFE_LINK.test(href)
+            if (!safe) return <span>{children}</span>
+            return (
+              <a
+                href={href}
+                onClick={(e) => {
+                  e.preventDefault()
+                  if (window.electron?.openExternal) window.electron.openExternal(href)
+                  else window.open(href, '_blank', 'noopener,noreferrer')
+                }}
+              >
+                {children}
+              </a>
+            )
+          },
         }}
       >
         {text || ''}

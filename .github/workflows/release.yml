@@ -1,0 +1,80 @@
+name: Release
+
+# Builds + publishes installers for macOS, Windows and Linux when you push a
+# version tag. Each runner: builds the backend JAR -> jlinks an OS-specific Java
+# runtime -> bundles the Electron app -> publishes to GitHub Releases as a DRAFT
+# (electron-builder's default), so nothing reaches users until you review and
+# click "Publish release". Tests are NOT re-run here — the CI gate (ci.yml) is
+# the safety net, and skipping them keeps the 10x macOS runner minutes down.
+#
+# ── How to cut a release ────────────────────────────────────────────────────
+#   1. Bump the version in ui/package.json   (e.g. 1.0.0 -> 1.0.1)
+#   2. git commit -am "Release v1.0.1"   &&   git push      # CI gate runs
+#   3. git tag v1.0.1   &&   git push origin v1.0.1         # this triggers Release
+#   4. When all 3 jobs finish, open the draft Release on GitHub, verify the
+#      assets, then click "Publish release". Auto-update only sees PUBLISHED
+#      releases, so drafts are safe to discard.
+#
+# NOTE: publishing currently targets the repo named in ui/package.json's
+# build.publish (the code repo). To ship to users while keeping code private,
+# later point build.publish at a PUBLIC "releases-only" repo and set a GH_TOKEN
+# secret (a PAT) that can write to it — the rest of this workflow is unchanged.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # lets GITHUB_TOKEN create the release + upload assets
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false           # one OS failing shouldn't abandon the others
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches ui/package.json version
+        shell: bash
+        run: |
+          PKG=$(node -p "require('./ui/package.json').version")
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "package.json=$PKG  tag=$TAG"
+          if [ "$PKG" != "$TAG" ]; then
+            echo "::error::Tag v$TAG does not match ui/package.json version $PKG — bump the version first."
+            exit 1
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Build backend JAR
+        working-directory: backend
+        run: mvn -B -ntp -DskipTests package
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install UI deps
+        working-directory: ui
+        run: npm ci
+
+      - name: Build runtime + app and publish to GitHub Releases
+        working-directory: ui
+        run: npm run publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No Apple Developer cert yet -> build an UNSIGNED macOS app instead of
+          # failing on a missing signing identity. Add signing/notarization later.
+          CSC_IDENTITY_AUTO_DISCOVERY: false

@@ -17,8 +17,9 @@ import express    from 'express'
 import cors       from 'cors'
 import { randomUUID } from 'node:crypto'
 
-import { openDb, todayKey } from './db.js'
-import { makeAuth }         from './auth.js'
+import { openDb, todayKey }          from './db.js'
+import { makeAuth }                  from './auth.js'
+import { verifyGoogleCode, isStubMode } from './google.js'
 
 dotenv.config()
 
@@ -35,6 +36,16 @@ const REORG_SESSION_TTL_MIN = parseInt(process.env.REORG_SESSION_TTL_MIN || '30'
 const OPENAI_API_KEY        = process.env.OPENAI_API_KEY
 const OPENAI_BASE_URL       = (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '')
 const DB_PATH               = process.env.DB_PATH || './shelfbot-proxy.db'
+
+// ── Accounts / trial (Google sign-in) ───────────────────────────────────────
+// A signed-in account on the free TRIAL gets TRIAL_DAILY chats/day for
+// TRIAL_WINDOW_HOURS after first sign-in, chat only (no reorg/deadlines). After
+// that they must upgrade to 'pro'. Google credentials are only needed for the
+// real sign-in exchange (tests use the GOOGLE_AUTH_STUB seam in google.js).
+const TRIAL_DAILY          = parseInt(process.env.TRIAL_DAILY || '6', 10)
+const TRIAL_WINDOW_HOURS   = parseInt(process.env.TRIAL_WINDOW_HOURS || '24', 10)
+const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID || ''
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || ''
 
 // Cost guardrails. The desktop app only ever needs these cheap models, but the
 // device JWT is easy to obtain (registration is open by design) and the body is
@@ -109,6 +120,52 @@ function planLimit(plan) {
 function reorgPlanLimit(plan) {
   if (plan === 'pro') return PRO_REORG_DAILY
   return FREE_REORG_DAILY
+}
+
+// ── Principal dispatch (account vs legacy device) ───────────────────────────
+// req.principal.kind is 'account' (Google sign-in) or 'device' (legacy
+// anonymous). These helpers route the daily chat counter + limit to the right
+// table/plan so the chat route logic stays single-path.
+
+/** Daily chat limit for a principal. */
+function chatLimitFor(p) {
+  if (p.kind === 'account') return p.plan === 'pro' ? PRO_DAILY : TRIAL_DAILY
+  return planLimit(p.plan)
+}
+/** Today's chat count for a principal. */
+function chatUsedFor(p, day) {
+  return p.kind === 'account' ? db.getAccountChatToday(p.id, day) : db.getTodayCount(p.id, day)
+}
+/** Atomically increments + returns the principal's chat count. */
+function chatIncFor(p, day) {
+  return p.kind === 'account' ? db.incrementAccountChatToday(p.id, day) : db.incrementTodayCount(p.id, day)
+}
+/** Refunds a chat increment for a principal (upstream failure). */
+function chatDecFor(p, day) {
+  return p.kind === 'account' ? db.decrementAccountChatToday(p.id, day) : db.decrementTodayCount(p.id, day)
+}
+
+/**
+ * Trial/access state for an account. Pro accounts are always active. A trial
+ * account is active only within TRIAL_WINDOW_HOURS of first sign-in; after that
+ * it's expired and must upgrade.
+ */
+function trialState(account) {
+  if (account.plan === 'pro') return { active: true, expired: false }
+  const start   = Date.parse(account.trial_started_at)
+  const expired = Number.isFinite(start) && Date.now() > start + TRIAL_WINDOW_HOURS * 3600 * 1000
+  return { active: !expired, expired }
+}
+
+/** The account fields safe to return to the client. */
+function publicAccount(a) {
+  return { id: a.id, email: a.email, plan: a.plan }
+}
+
+/** Upgrade nudge for a quota-exhausted principal (null when already pro). */
+function upgradeHintFor(p) {
+  if (p.plan === 'pro') return null
+  return 'Upgrade to Pro for ' + PRO_DAILY + ' queries/day.'
 }
 
 const app = express()
@@ -186,13 +243,70 @@ app.post('/device/register', limitRegister, (req, res) => {
   })
 })
 
-// ─── Current device info + usage ──────────────────────────────────────────
-app.get('/me', auth.requireAuth, (req, res) => {
-  const limit = planLimit(req.device.plan)
-  const used  = db.getTodayCount(req.device.id, todayKey())
+// ─── Google sign-in ─────────────────────────────────────────────────────────
+//
+// The desktop app runs the PKCE browser flow, captures the authorization `code`
+// on its 127.0.0.1 loopback redirect, and POSTs {code, codeVerifier,
+// redirectUri} here. We verify it with Google (secret stays server-side),
+// find-or-create the account (first sign-in starts the 24h trial), and return a
+// JWT bound to the account. Reuses the registration IP throttle.
+app.post('/auth/google', limitRegister, async (req, res) => {
+  const code         = (req.body?.code || '').trim()
+  const codeVerifier = (req.body?.codeVerifier || '').trim()
+  const redirectUri  = (req.body?.redirectUri || '').trim()
+  if (!code || !codeVerifier || !redirectUri) {
+    return res.status(400).json({ error: 'code, codeVerifier and redirectUri are required' })
+  }
+
+  let profile
+  try {
+    profile = await verifyGoogleCode({
+      code, codeVerifier, redirectUri,
+      clientId: GOOGLE_CLIENT_ID, clientSecret: GOOGLE_CLIENT_SECRET,
+    })
+  } catch (e) {
+    return res.status(401).json({ error: 'Google sign-in failed: ' + e.message })
+  }
+  if (!profile?.email || !profile.emailVerified) {
+    return res.status(403).json({ error: 'A verified Google email is required to sign in.' })
+  }
+
+  const account = db.upsertAccountByGoogle({ sub: profile.sub, email: profile.email.toLowerCase() })
+  const { token, expiresIn } = auth.issueAccountToken(account)
+
+  const day   = todayKey()
+  const limit = chatLimitFor({ kind: 'account', plan: account.plan })
+  const used  = db.getAccountChatToday(account.id, day)
+  const ts    = trialState(account)
   res.json({
-    device: { id: req.device.id, deviceId: req.device.device_id, plan: req.device.plan },
-    usage:  { used, limit, remaining: Math.max(0, limit - used) },
+    token, expiresIn,
+    account: publicAccount(account),
+    trial:   { active: ts.active, expired: ts.expired, windowHours: TRIAL_WINDOW_HOURS },
+    usage:   { used, limit, remaining: Math.max(0, limit - used) },
+  })
+})
+
+// ─── Current identity info + usage ──────────────────────────────────────────
+app.get('/me', auth.requireAuth, (req, res) => {
+  const p     = req.principal
+  const limit = chatLimitFor(p)
+  const used  = chatUsedFor(p, todayKey())
+  const usage = { used, limit, remaining: Math.max(0, limit - used) }
+
+  if (p.kind === 'account') {
+    const ts = trialState(p.account)
+    return res.json({
+      account: publicAccount(p.account),
+      plan:    p.plan,
+      trial:   { active: ts.active, expired: ts.expired, windowHours: TRIAL_WINDOW_HOURS,
+                 startedAt: p.account.trial_started_at },
+      usage,
+    })
+  }
+  // Legacy device identity (unchanged shape).
+  res.json({
+    device: { id: p.device.id, deviceId: p.device.device_id, plan: p.device.plan },
+    usage,
   })
 })
 
@@ -230,22 +344,37 @@ app.post('/proxy/chat/completions', limitProxy, auth.requireAuth, async (req, re
   if (clean.error) return res.status(400).json({ error: clean.error })
   req.body = clean.body
 
-  const limit = planLimit(req.device.plan)
-  const used  = db.getTodayCount(req.device.id, todayKey())
+  const p   = req.principal
+  const day = todayKey()
+
+  // Account trial gating: once the trial window lapses, chat is blocked until
+  // upgrade (pro accounts are always active; device tokens skip this entirely).
+  if (p.kind === 'account') {
+    const ts = trialState(p.account)
+    if (!ts.active) {
+      return res.status(402).json({
+        error:       'Your free trial has ended.',
+        reason:      'trial_ended',
+        plan:        p.plan,
+        upgradeHint: 'Upgrade to keep chatting with your documents.',
+      })
+    }
+  }
+
+  const limit = chatLimitFor(p)
+  const used  = chatUsedFor(p, day)
   if (used >= limit) {
     return res.status(429).json({
       error:     'Daily query limit reached.',
-      plan:      req.device.plan,
+      plan:      p.plan,
       used,
       limit,
       remaining: 0,
-      upgradeHint: req.device.plan === 'free'
-        ? 'Upgrade to Pro for ' + PRO_DAILY + ' queries/day.'
-        : null,
+      upgradeHint: upgradeHintFor(p),
     })
   }
 
-  const after = db.incrementTodayCount(req.device.id, todayKey())
+  const after = chatIncFor(p, day)
 
   // Streaming branch: when the client sets {"stream": true}, OpenAI returns
   // an SSE response. We pipe its bytes straight through to the client so
@@ -269,10 +398,10 @@ app.post('/proxy/chat/completions', limitProxy, auth.requireAuth, async (req, re
     // hiccup silently burns one of the user's daily queries AND surfaces to the
     // desktop app as a misleading "daily limit reached" 429.
     if (!upstream.ok) {
-      const refunded = db.decrementTodayCount(req.device.id, todayKey())
+      const refunded = chatDecFor(p, day)
       const body = await upstream.text()
       return res.status(upstream.status)
-         .set('X-Plan',            req.device.plan)
+         .set('X-Plan',            p.plan)
          .set('X-Usage-Used',      String(refunded))
          .set('X-Usage-Limit',     String(limit))
          .set('X-Usage-Remaining', String(Math.max(0, limit - refunded)))
@@ -282,7 +411,7 @@ app.post('/proxy/chat/completions', limitProxy, auth.requireAuth, async (req, re
 
     // Mirror useful response metadata (success path).
     res.status(upstream.status)
-       .set('X-Plan',            req.device.plan)
+       .set('X-Plan',            p.plan)
        .set('X-Usage-Used',      String(after))
        .set('X-Usage-Limit',     String(limit))
        .set('X-Usage-Remaining', String(Math.max(0, limit - after)))
@@ -319,7 +448,7 @@ app.post('/proxy/chat/completions', limitProxy, auth.requireAuth, async (req, re
     res.type(upstream.headers.get('content-type') || 'application/json').send(body)
   } catch (e) {
     // Refund the slot — the user shouldn't pay for our outage.
-    db.decrementTodayCount(req.device.id, todayKey())
+    chatDecFor(p, day)
     res.status(502).json({ error: 'Upstream chat completion failed: ' + e.message })
   }
 })
@@ -339,6 +468,16 @@ app.post('/proxy/chat/completions', limitProxy, auth.requireAuth, async (req, re
 // is opaque to the backend and bound to the device that opened it.
 
 app.post('/reorg/start', limitProxy, auth.requireAuth, (req, res) => {
+  // Reorg is not part of the chat-only trial. (Per-account reorg quota lands
+  // with the paid plan / billing webhook; legacy device tokens still work.)
+  if (req.principal.kind === 'account') {
+    return res.status(403).json({
+      error:  'Reorganize isn’t part of the trial.',
+      reason: 'reorg_not_in_trial',
+      detail: 'Folder organization will be available on a paid plan.',
+    })
+  }
+
   const day   = todayKey()
   const limit = reorgPlanLimit(req.device.plan)
   const used  = db.getReorgStartsToday(req.device.id, day)
@@ -379,6 +518,13 @@ app.post('/reorg/start', limitProxy, auth.requireAuth, (req, res) => {
 })
 
 app.post('/reorg/llm', limitProxy, auth.requireAuth, async (req, res) => {
+  if (req.principal.kind === 'account') {
+    return res.status(403).json({
+      error:  'Reorganize isn’t part of the trial.',
+      reason: 'reorg_not_in_trial',
+    })
+  }
+
   const sessionId = (req.body?.sessionId || '').trim()
   if (!sessionId) {
     return res.status(400).json({ error: 'Missing sessionId in request body.' })
@@ -453,7 +599,12 @@ app.post('/reorg/llm', limitProxy, auth.requireAuth, async (req, res) => {
 app.listen(PORT, () => {
   console.log(`[proxy] listening on http://localhost:${PORT}`)
   console.log(`[proxy] plans:  free=${FREE_DAILY}/day  pro=${PRO_DAILY}/day`)
+  console.log(`[proxy] trial:  ${TRIAL_DAILY} chats/day for ${TRIAL_WINDOW_HOURS}h (Google sign-in)`)
   console.log(`[proxy] reorg:  free=${FREE_REORG_DAILY}/day  pro=${PRO_REORG_DAILY}/day  budget=${REORG_LLM_BUDGET}/session`)
+  console.log(`[proxy] google: ${GOOGLE_CLIENT_ID ? 'configured' : 'NOT configured (sign-in will fail until GOOGLE_CLIENT_ID/SECRET are set)'}`)
+  if (isStubMode()) {
+    console.warn('[proxy] ⚠️  GOOGLE_AUTH_STUB=1 — Google verification is STUBBED. For tests only. NEVER set this in production.')
+  }
   console.log(`[proxy] db:     ${DB_PATH}`)
 })
 

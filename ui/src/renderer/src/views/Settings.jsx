@@ -42,13 +42,20 @@ const CloseIcon = () => (
   </svg>
 )
 
-// ── Per-client workspaces management ─────────────────────────────────────────
+// ── Clients (per-client document separation) ─────────────────────────────────
+// Niche feature for people whose files span MULTIPLE clients (accountants,
+// freelancers, bookkeepers). Auto-detection (free, local GSTIN/PAN scan) is the
+// hero; manual add is the fallback for name-only clients. Stays dormant/quiet
+// when there's nothing to show, so a single-person user isn't nagged.
 function ClientsCard({ api, connected, toast }) {
   const [clients, setClients] = useState([])
   const [suggestions, setSuggestions] = useState([])
+  const [names, setNames]     = useState({})   // per-suggestion typed name (key → name)
   const [newName, setNewName] = useState('')
   const [newIds, setNewIds]   = useState('')
   const [busy, setBusy]       = useState(false)
+  const [scanning, setScanning] = useState(false)
+  const [showManual, setShowManual] = useState(false)
 
   const load = () => {
     if (!api || !connected) return
@@ -57,8 +64,26 @@ function ClientsCard({ api, connected, toast }) {
   }
   useEffect(load, [api, connected]) // eslint-disable-line react-hooks/exhaustive-deps
 
+  // A suggestion has no friendly name when the local scan only found an
+  // identifier (EntitySuggester then falls back name→GSTIN/PAN). In that case
+  // we ask the user to name it before adding.
+  const isIdLike = (s) => s.name && (s.name === s.gstin || s.name === s.pan)
+  const nameFor  = (s) => (names[s.key] !== undefined ? names[s.key] : (isIdLike(s) ? '' : s.name))
+
+  const scan = async () => {
+    setScanning(true)
+    try {
+      const r = await api.scanClients()
+      load()
+      toast(r.found > 0 ? `Found client identifiers in ${r.found} file${r.found === 1 ? '' : 's'}`
+                        : 'No client identifiers (GSTIN/PAN) found in your files', r.found > 0 ? 's' : 'i')
+    } catch (e) { toast(e.message, 'e') } finally { setScanning(false) }
+  }
+
   const accept = async (s) => {
-    try { await api.acceptClientSuggestion({ name: s.name, gstin: s.gstin, pan: s.pan }); load(); toast('Client added', 's') }
+    const name = (nameFor(s) || '').trim()
+    if (!name) { toast('Give this client a name first', 'i'); return }
+    try { await api.acceptClientSuggestion({ name, gstin: s.gstin, pan: s.pan }); load(); toast('Client added', 's') }
     catch (e) { toast(e.message, 'e') }
   }
   const dismiss = async (key) => {
@@ -69,11 +94,10 @@ function ClientsCard({ api, connected, toast }) {
     if (!newName.trim()) return
     setBusy(true)
     try {
-      // Identifiers: comma/newline separated GSTIN / PAN / names / aliases.
       const ids = newIds.split(/[,\n]/).map(s => s.trim()).filter(Boolean)
       await api.createClient(newName.trim(), ids)
-      setNewName(''); setNewIds(''); load()
-      toast('Client added — re-tagged your files', 's')
+      setNewName(''); setNewIds(''); setShowManual(false); load()
+      toast('Client added — tagged your files', 's')
     } catch (e) { toast(e.message, 'e') } finally { setBusy(false) }
   }
 
@@ -87,31 +111,36 @@ function ClientsCard({ api, connected, toast }) {
   const removeId = async (id, value) => {
     try { await api.editClient(id, { removeIdentifier: value }); load() } catch (e) { toast(e.message, 'e') }
   }
-  const recompute = async () => {
-    setBusy(true)
-    try { const r = await api.recomputeClients(); load(); toast(`Re-tagged: ${r.assigned} assigned, ${r.conflicted} shared, ${r.unmatched} unmatched`, 's') }
-    catch (e) { toast(e.message, 'e') } finally { setBusy(false) }
-  }
+
+  const hasAny = clients.length > 0 || suggestions.length > 0
 
   return (
     <div className="scard">
-      <div className="scard-title">Client workspaces</div>
+      <div className="scard-title">Clients</div>
       <div className="scard-sub">
-        Keep each client's documents isolated. Register a client with a unique
-        identifier — their GSTIN, PAN, or exact name — and Rudo tags matching files
-        to them. In chat, answers about one client never pull from another's files.
+        If your files cover multiple people or businesses, Rudo can keep each one's
+        documents separate — so a question about one client never pulls another's
+        files. It finds them automatically from your documents; you can also add one
+        yourself.
       </div>
 
+      {/* Hero: auto-detected clients */}
       {suggestions.length > 0 && (
         <div className="client-suggest">
-          <div className="client-suggest-head">Suggested from your documents</div>
+          <div className="client-suggest-head">Rudo found these in your files</div>
           <ul className="clients-list">
             {suggestions.map(s => (
               <li className="client-row suggest" key={s.key}>
                 <div className="client-head">
-                  <span className="client-name">{s.name}</span>
+                  <input
+                    className="form-input"
+                    style={{ maxWidth: 220 }}
+                    placeholder="Name this client"
+                    value={nameFor(s)}
+                    onChange={e => setNames(n => ({ ...n, [s.key]: e.target.value }))}
+                  />
                   {s.gstin && <span className="client-id-chip">{s.gstin}</span>}
-                  {s.pan && <span className="client-id-chip">{s.pan}</span>}
+                  {s.pan && !s.gstin && <span className="client-id-chip">{s.pan}</span>}
                   <span className="client-count">{s.fileCount} file{s.fileCount === 1 ? '' : 's'}</span>
                   <div className="client-add-actions" style={{ marginLeft: 'auto' }}>
                     <button className="btn-primary" onClick={() => accept(s)} disabled={busy}>Add</button>
@@ -124,9 +153,8 @@ function ClientsCard({ api, connected, toast }) {
         </div>
       )}
 
-      {clients.length === 0 ? (
-        <div className="paths-empty">No clients yet. Add one below{suggestions.length ? ', or accept a suggestion above' : ''}.</div>
-      ) : (
+      {/* Existing clients */}
+      {clients.length > 0 && (
         <ul className="clients-list">
           {clients.map(c => (
             <li className="client-row" key={c.id}>
@@ -152,22 +180,53 @@ function ClientsCard({ api, connected, toast }) {
         </ul>
       )}
 
-      <div className="client-add">
-        <input className="form-input" placeholder="Client name (e.g. Sharma Bakery)"
-               value={newName} onChange={e => setNewName(e.target.value)} />
-        <input className="form-input" placeholder="Identifiers — GSTIN, PAN, aliases (comma-separated)"
-               value={newIds} onChange={e => setNewIds(e.target.value)} />
-        <div className="client-add-actions">
-          <button className="btn-primary" onClick={create} disabled={busy || !connected || !newName.trim()}>Add client</button>
-          <button className="btn-ghost" onClick={recompute} disabled={busy || !connected} title="Re-scan all files against the client list">Re-tag files</button>
+      {!hasAny && (
+        <div className="paths-empty">
+          No clients yet. Scan your files to detect them, or add one manually.
         </div>
+      )}
+
+      {/* Actions */}
+      <div className="client-add-actions" style={{ marginTop: 12 }}>
+        <button className="btn-primary" onClick={scan} disabled={scanning || !connected}>
+          {scanning ? 'Scanning…' : 'Scan for clients'}
+        </button>
+        <button className="btn-ghost" onClick={() => setShowManual(v => !v)} disabled={!connected}>
+          {showManual ? 'Cancel' : 'Add manually'}
+        </button>
       </div>
+
+      {/* Manual add (fallback) */}
+      {showManual && (
+        <div className="client-add" style={{ marginTop: 12 }}>
+          <input className="form-input" placeholder="Client name (e.g. Sharma Bakery)"
+                 value={newName} onChange={e => setNewName(e.target.value)} />
+          <input className="form-input" placeholder="Match by (optional): GSTIN, PAN, or other names"
+                 value={newIds} onChange={e => setNewIds(e.target.value)} />
+          <div className="client-add-actions">
+            <button className="btn-primary" onClick={create} disabled={busy || !connected || !newName.trim()}>Add client</button>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
 
 export default function Settings({ active, onGoLibrary }) {
-  const { api, connected, apiBase, toast, stats, auth, refreshAuth, triggerIndex } = useApp()
+  const { api, connected, apiBase, toast, stats, auth, refreshAuth, triggerIndex, signInWithGoogle } = useApp()
+  const [signingIn, setSigningIn] = useState(false)
+
+  const handleGoogleSignIn = async () => {
+    if (signingIn) return
+    setSigningIn(true)
+    try {
+      const r = await signInWithGoogle()
+      if (r?.ok) toast('Signed in' + (r.account?.email ? ` as ${r.account.email}` : ''), 's')
+      else if (r?.error) toast(r.error, 'e')
+    } finally {
+      setSigningIn(false)
+    }
+  }
 
   useEffect(() => {
     if (active) refreshAuth()
@@ -367,14 +426,22 @@ export default function Settings({ active, onGoLibrary }) {
         <div className="scard">
           <div className="scard-title">Plan</div>
           <div className="scard-sub">
-            Your subscription is bound to this device. Upgrade to lift the daily query cap.
+            {auth?.email
+              ? 'Signed in with Google. Your plan is bound to your account.'
+              : 'Sign in with Google to start your free trial.'}
           </div>
           <div className="svc-list">
+            {auth?.email && (
+              <div className="svc-row">
+                <span className="svc-name">Account</span>
+                <span className="svc-val">{auth.email}</span>
+              </div>
+            )}
             <div className="svc-row">
               <span className="svc-name">Tier</span>
               <span className="svc-val">
                 <span className={`dot ${auth?.plan === 'pro' ? 'g' : 'a'}`} />
-                {auth?.plan === 'pro' ? 'Pro' : 'Free'}
+                {auth?.plan === 'pro' ? 'Pro' : auth?.plan === 'trial' ? 'Free trial' : 'Free'}
               </span>
             </div>
             {auth?.usage && (
@@ -383,6 +450,12 @@ export default function Settings({ active, onGoLibrary }) {
                 <span className="svc-val">
                   {auth.usage.used} / {auth.usage.limit}
                 </span>
+              </div>
+            )}
+            {auth?.trial && !auth.trial.active && (
+              <div className="svc-row">
+                <span className="svc-name">Trial</span>
+                <span className="svc-val"><span className="dot a" />Ended — upgrade to continue</span>
               </div>
             )}
             {auth?.offline && (
@@ -395,7 +468,16 @@ export default function Settings({ active, onGoLibrary }) {
               </div>
             )}
           </div>
-          {auth?.plan !== 'pro' && (
+          {!auth?.email ? (
+            <button
+              className="btn-primary"
+              style={{ marginTop: 14 }}
+              onClick={handleGoogleSignIn}
+              disabled={signingIn}
+            >
+              {signingIn ? 'Opening browser…' : 'Sign in with Google'}
+            </button>
+          ) : auth?.plan !== 'pro' && (
             <button
               className="btn-primary"
               style={{ marginTop: 14 }}

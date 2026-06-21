@@ -29,8 +29,12 @@ contextBridge.exposeInMainWorld('electron', {
   installUpdate:     ()   => ipcRenderer.invoke('updater:install'),
   checkForUpdates:   ()   => ipcRenderer.invoke('updater:check'),
 
-  // Device identity (no per-user login — the install IS the identity)
+  // Device identity (legacy anonymous fallback — the install IS the identity)
   deviceBootstrap: () => ipcRenderer.invoke('device:bootstrap'),
   deviceMe:        () => ipcRenderer.invoke('device:me'),
   deviceLogout:    () => ipcRenderer.invoke('device:logout'),
+
+  // Google sign-in (account identity). Opens the system browser; resolves to
+  // { ok, plan, usage, account, trial } or { ok:false, error }.
+  googleSignIn:    () => ipcRenderer.invoke('auth:google-signin'),
 })

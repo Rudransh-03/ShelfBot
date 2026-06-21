@@ -6,14 +6,15 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev":   "node --watch src/server.js",
-    "test":  "node --test test/"
+    "dev": "node --watch src/server.js",
+    "test": "node --test --test-concurrency=1 test/"
   },
   "dependencies": {
     "better-sqlite3": "^11.5.0",
-    "cors":           "^2.8.5",
-    "dotenv":         "^16.4.5",
-    "express":        "^4.21.1",
-    "jsonwebtoken":   "^9.0.2"
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "google-auth-library": "^10.7.0",
+    "jsonwebtoken": "^9.0.2"
   }
 }

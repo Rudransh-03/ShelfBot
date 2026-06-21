@@ -58,6 +58,7 @@ export function AppProvider({ children }) {
   //   offline        — couldn't reach the proxy; cached token in use
   const [auth, setAuth] = useState({
     checked: false, registered: false, plan: 'free', usage: null, offline: false,
+    email: null, trial: null,
   })
 
   // Is the Deadlines feature available to this device? (see DEADLINES_DEV_UNLOCK)
@@ -81,6 +82,29 @@ export function AppProvider({ children }) {
   }, [])
 
   /**
+   * Sign in with Google. Opens the system browser (handled in main), and on
+   * success the proxy returns an account-scoped JWT that's already been
+   * persisted + pushed to the backend. We just fold the result into auth state.
+   * Returns { ok, error? } so the caller can toast a failure.
+   */
+  const signInWithGoogle = useCallback(async () => {
+    const E = window.electron
+    if (!E?.googleSignIn) return { ok: false, error: 'Sign-in is only available in the desktop app.' }
+    const r = await E.googleSignIn()
+    if (r?.ok) {
+      setAuth({
+        checked: true, registered: true,
+        plan: r.plan ?? 'trial',
+        usage: r.usage ?? null,
+        offline: false,
+        email: r.account?.email ?? null,
+        trial: r.trial ?? null,
+      })
+    }
+    return r ?? { ok: false, error: 'Sign-in failed.' }
+  }, [])
+
+  /**
    * "Sign out" — destructive only locally. Clears the JWT so the next
    * bootstrap re-registers (same device, same identity). Exposed mainly
    * for support / testing; ordinary users never need this.
@@ -88,7 +112,7 @@ export function AppProvider({ children }) {
   const logout = useCallback(async () => {
     const E = window.electron
     if (E?.deviceLogout) await E.deviceLogout()
-    setAuth({ checked: true, registered: false, plan: 'free', usage: null, offline: false })
+    setAuth({ checked: true, registered: false, plan: 'free', usage: null, offline: false, email: null, trial: null })
   }, [])
 
   const busyTimer        = useRef(null)
@@ -334,7 +358,7 @@ export function AppProvider({ children }) {
       loadStats, triggerIndex,
       deadlineStats, scanningDeadlines, deadlineScanProgress, deadlinesEnabled,
       scanDeadlines, loadDeadlineStats,
-      auth, logout, refreshAuth,
+      auth, logout, refreshAuth, signInWithGoogle,
       conversations, activeConversationId, setActiveConversationId,
       refreshConversations, newConversation, openConversation,
       renameConversation, deleteConversation,

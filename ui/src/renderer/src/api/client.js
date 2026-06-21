@@ -190,6 +190,8 @@ export class ApiClient {
   }
   /** Auto-detected clients (from the scan) the user can accept: [{ key, name, gstin, pan, fileCount }]. */
   listClientSuggestions()        { return this._r('/api/clients/suggestions') }
+  /** Free local scan of indexed files for client identities (GSTIN/PAN). → { found, suggestions }. */
+  scanClients()                  { return this._r('/api/clients/scan', { method: 'POST' }) }
   /** Accept a suggestion → creates the client + tags its files. */
   acceptClientSuggestion(s)      { return this._r('/api/clients/accept', { method: 'POST', body: JSON.stringify(s) }) }
   /** Hide a suggestion so it won't reappear. */

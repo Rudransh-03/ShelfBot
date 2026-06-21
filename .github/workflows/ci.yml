@@ -1,0 +1,54 @@
+name: CI
+
+# Fast test gate. Runs on every push to main and on PRs so a broken change is
+# caught BEFORE it can be tagged for release. Linux-only (cheapest runner = 1x
+# minutes). The release workflow trusts this gate and skips re-running tests.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A newer push to the same ref cancels an in-flight run — saves minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Backend tests
+        working-directory: backend
+        run: mvn -B -ntp test
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: |
+            ui/package-lock.json
+            proxy/package-lock.json
+
+      - name: Proxy install + tests
+        working-directory: proxy
+        run: |
+          npm ci
+          npm test
+
+      - name: UI install + build (compile check)
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build

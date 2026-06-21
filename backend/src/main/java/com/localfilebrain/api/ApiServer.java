@@ -8,6 +8,7 @@ import com.localfilebrain.embedding.EmbeddingClient;
 import com.localfilebrain.chat.ChatStore;
 import com.localfilebrain.client.ClientResolver;
 import com.localfilebrain.client.EntitySuggester;
+import com.localfilebrain.client.LocalEntityScanner;
 import com.localfilebrain.client.MembershipEngine;
 import com.localfilebrain.ingestion.IndexMetadataStore;
 import com.localfilebrain.ingestion.IngestionPipeline;
@@ -377,6 +378,11 @@ public final class ApiServer {
                     }
                 });
                 indexingStatus.set(new IndexingStatus(false, result, null));
+                // Free, local client-identity detection (GSTIN/PAN) over the
+                // freshly-indexed text, so "found in your files" suggestions
+                // appear for everyone without needing the Pro deadline scan.
+                try { new LocalEntityScanner(metadataStore, vectorStore).scanAll(); }
+                catch (Exception e) { log.warn("post-index local entity scan failed: {}", e.getMessage()); }
                 // Refresh client membership after indexing so newly-added files
                 // get auto-filed to their client and changed files lose any stale
                 // tag (manual pins are preserved). No-op when no clients exist.
@@ -1259,6 +1265,18 @@ public final class ApiServer {
                         "key", s.key(), "name", s.name(), "gstin", s.gstin(),
                         "pan", s.pan(), "fileCount", s.fileCount()));
                 sendJson(ex, 200, map("suggestions", items));
+                return;
+            }
+
+            // On-demand free/local detection of client identities (GSTIN/PAN)
+            // across already-indexed files. Lets the user populate suggestions
+            // without re-indexing or running the Pro deadline scan.
+            if ("scan".equals(sub) && isMethod(ex, "POST")) {
+                int found = new LocalEntityScanner(metadataStore, vectorStore).scanAll();
+                List<EntitySuggester.Suggestion> sugg = EntitySuggester.suggest(
+                        metadataStore.listAllEntities(), metadataStore.listClients(),
+                        metadataStore.dismissedSuggestionKeys());
+                sendJson(ex, 200, map("found", found, "suggestions", sugg.size()));
                 return;
             }
 

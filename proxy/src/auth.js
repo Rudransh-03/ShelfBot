@@ -30,7 +30,28 @@ export function makeAuth({ db, jwtSecret, jwtTtlSeconds }) {
     return { token, device, expiresIn: jwtTtlSeconds }
   }
 
-  /** Express middleware. On success, attaches req.device with the live row. */
+  /**
+   * Issues a JWT bound to a Google-backed account. The `typ:'acct'` claim is
+   * what requireAuth uses to tell account tokens apart from the (typeless)
+   * legacy device tokens, so the two identity models can coexist during the
+   * migration to accounts-only.
+   */
+  function issueAccountToken(account) {
+    const token = jwt.sign(
+      { sub: account.id, typ: 'acct', email: account.email, plan: account.plan },
+      jwtSecret,
+      { expiresIn: jwtTtlSeconds }
+    )
+    return { token, account, expiresIn: jwtTtlSeconds }
+  }
+
+  /**
+   * Express middleware. Accepts BOTH token shapes and always re-reads the live
+   * row (so a plan upgrade applies immediately, not at token rotation):
+   *   - account token (typ:'acct') → req.account + req.principal{kind:'account'}
+   *   - device token  (legacy)     → req.device  + req.principal{kind:'device'}
+   * req.principal is the unified handle the routes use for id + plan.
+   */
   function requireAuth(req, res, next) {
     const header = req.headers.authorization || ''
     if (!header.startsWith('Bearer ')) {
@@ -39,16 +60,23 @@ export function makeAuth({ db, jwtSecret, jwtTtlSeconds }) {
     const token = header.slice('Bearer '.length).trim()
     try {
       const payload = jwt.verify(token, jwtSecret)
-      // Always re-read the device row so the live plan (post-upgrade)
-      // is used for rate limiting, not the value frozen in the token.
+      if (payload.typ === 'acct') {
+        const account = db.findAccountById(payload.sub)
+        if (!account) return res.status(401).json({ error: 'Account no longer exists' })
+        req.account   = account
+        req.principal = { kind: 'account', id: account.id, plan: account.plan, account }
+        return next()
+      }
+      // Legacy anonymous device token.
       const device = db.findDeviceById(payload.sub)
       if (!device) return res.status(401).json({ error: 'Device no longer registered' })
-      req.device = device
+      req.device    = device
+      req.principal = { kind: 'device', id: device.id, plan: device.plan, device }
       next()
     } catch (e) {
       return res.status(401).json({ error: 'Invalid or expired token: ' + e.message })
     }
   }
 
-  return { registerDevice, requireAuth }
+  return { registerDevice, issueAccountToken, requireAuth }
 }

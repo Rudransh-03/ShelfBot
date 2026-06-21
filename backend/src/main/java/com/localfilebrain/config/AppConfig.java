@@ -220,9 +220,20 @@ public final class AppConfig {
         return v.equals("direct") ? "direct" : "proxy";
     }
 
-    /** Base URL of the auth proxy ({@code http://localhost:8787} in dev). */
+    /**
+     * Base URL of the auth proxy. Resolution order:
+     *   1. {@code SHELFBOT_PROXY_URL} env var — how the Electron app hands this
+     *      backend the chosen URL (production = the deployed proxy, dev =
+     *      localhost). Packaged builds ship no config.properties, so this is the
+     *      production source of truth.
+     *   2. {@code api.proxy.url} in config.properties — standalone / dev runs.
+     *   3. {@code http://localhost:8787} default.
+     */
     public String getProxyUrl() {
-        String url = getOrDefault("api.proxy.url", "http://localhost:8787");
+        String env = System.getenv("SHELFBOT_PROXY_URL");
+        String url = (env != null && !env.isBlank())
+                ? env.trim()
+                : getOrDefault("api.proxy.url", "http://localhost:8787");
         return url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
     }
 

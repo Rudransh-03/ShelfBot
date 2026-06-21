@@ -3,8 +3,9 @@ import { join }   from 'path'
 import { spawn, execFile }  from 'child_process'
 import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, chmodSync } from 'fs'
 import { createServer } from 'net'
+import { createServer as createHttpServer } from 'http'
 import { machineIdSync } from 'node-machine-id'
-import { randomUUID }    from 'crypto'
+import { randomUUID, randomBytes, createHash } from 'crypto'
 import { promisify }     from 'util'
 import { buildCalendar } from './ics.js'
 
@@ -18,7 +19,25 @@ const execFileP = promisify(execFile)
 // Windows DPAPI, Linux Secret Service). So even if someone reads the file off
 // disk, they get ciphertext — only this app, on this user account, can decrypt.
 
-const PROXY_URL    = process.env.SHELFBOT_PROXY_URL || 'http://localhost:8787'
+// ── Proxy URL: dev vs production ─────────────────────────────────────────────
+// The auth/licensing proxy (and the OpenAI key) lives on a server you host. To
+// GO LIVE, set PROD_PROXY_URL to your deployed proxy (HTTPS) — that's the only
+// change needed. Packaged builds use it automatically; dev uses localhost; an
+// explicit SHELFBOT_PROXY_URL env var overrides either (handy for staging).
+// This single resolved value is also handed to the Java backend on spawn, so
+// the desktop app and the backend always talk to the same proxy.
+const PROD_PROXY_URL = 'https://CHANGE-ME-to-your-deployed-proxy.example.com' // TODO: set on deploy
+const PROXY_URL = process.env.SHELFBOT_PROXY_URL
+  || (app.isPackaged ? PROD_PROXY_URL : 'http://localhost:8787')
+
+// Google OAuth client id for the "Sign in with Google" flow. This is a PUBLIC
+// value (safe to ship in the app) — the matching client SECRET lives only on
+// the proxy, which is what actually exchanges the auth code. Create a
+// "Desktop app" OAuth client in Google Cloud and put its id here (or pass
+// SHELFBOT_GOOGLE_CLIENT_ID in dev). Loopback (127.0.0.1) redirects with any
+// port are auto-allowed for Desktop clients, so no redirect URIs to pre-register.
+const GOOGLE_CLIENT_ID = process.env.SHELFBOT_GOOGLE_CLIENT_ID
+  || '828216281643-8cavncibl3t9jmjonv41ln8nol6uvh9p.apps.googleusercontent.com'
 const TOKEN_FILE   = () => join(app.getPath('userData'), 'auth.token')
 const DEVICE_FILE  = () => join(app.getPath('userData'), 'device.id')
 
@@ -301,10 +320,13 @@ function startJavaBackend() {
     javaProcess = spawn(javaBin, ['-Djava.awt.headless=true', '-Xmx512m', '-jar', jar, '--server', '--port', String(port)], {
       cwd:   BACKEND_ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
-      // Hand the backend the per-launch API secret. Spread process.env so the
-      // JVM still inherits PATH etc.; passing via env (not argv) keeps the
-      // secret out of `ps`/pgrep output.
-      env:   { ...process.env, SHELFBOT_LOCAL_TOKEN: LOCAL_API_TOKEN },
+      // Hand the backend the per-launch API secret + the resolved proxy URL.
+      // Spread process.env so the JVM still inherits PATH etc.; passing via env
+      // (not argv) keeps the secret out of `ps`/pgrep output. SHELFBOT_PROXY_URL
+      // is set explicitly (after the spread) so the backend points at the SAME
+      // proxy this app resolved — including the production URL, which no shipped
+      // config.properties would otherwise provide.
+      env:   { ...process.env, SHELFBOT_LOCAL_TOKEN: LOCAL_API_TOKEN, SHELFBOT_PROXY_URL: PROXY_URL },
     })
 
     const timer = setTimeout(() => {
@@ -629,6 +651,88 @@ async function registerWithProxy() {
     return { ok: false, error: e.message, offline: true }
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Google sign-in (PKCE loopback flow)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Standard installed-app OAuth, the same pattern Claude Code / gcloud use:
+//   1. Generate a PKCE verifier+challenge and a random state.
+//   2. Start a one-shot 127.0.0.1 HTTP server on an ephemeral port.
+//   3. Open the system browser to Google's consent page (Google forbids
+//      embedded webviews) with redirect_uri = our loopback address.
+//   4. Google redirects back to the loopback with ?code=…; we capture it.
+//   5. Hand {code, codeVerifier, redirectUri} to the proxy, which exchanges it
+//      with Google (client secret stays server-side), verifies the id_token,
+//      and returns an account-scoped JWT. We persist + push it like any token.
+
+function makePkce() {
+  const verifier  = randomBytes(32).toString('base64url')
+  const challenge = createHash('sha256').update(verifier).digest('base64url')
+  return { verifier, challenge }
+}
+
+function googleSignInFlow() {
+  return new Promise((resolve) => {
+    const { verifier, challenge } = makePkce()
+    const state = randomUUID()
+    let settled = false
+    const done = (result) => { if (!settled) { settled = true; try { server.close() } catch {} resolve(result) } }
+
+    const server = createHttpServer(async (req, res) => {
+      const url = new URL(req.url, 'http://127.0.0.1')
+      const code = url.searchParams.get('code')
+      const err  = url.searchParams.get('error')
+      const st   = url.searchParams.get('state')
+      if (!code && !err) { res.writeHead(404); res.end(); return }
+
+      res.writeHead(200, { 'Content-Type': 'text/html' })
+      res.end('<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;padding:48px;text-align:center">'
+        + '<h2>You\'re signed in to Rudo</h2><p>You can close this tab and return to the app.</p></body>')
+
+      if (err)              return done({ ok: false, error: err })
+      if (st !== state)     return done({ ok: false, error: 'State mismatch — please try signing in again.' })
+
+      try {
+        const redirectUri = `http://127.0.0.1:${server.address().port}`
+        const r = await fetch(`${PROXY_URL}/auth/google`, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ code, codeVerifier: verifier, redirectUri }),
+        })
+        const body = await r.json().catch(() => ({}))
+        if (!r.ok) return done({ ok: false, error: body.error || `Sign-in failed (HTTP ${r.status})` })
+
+        persistToken(JSON.stringify({ token: body.token }))
+        await pushTokenToBackend(body.token)
+        done({ ok: true, plan: body.account?.plan, usage: body.usage, account: body.account, trial: body.trial })
+      } catch (e) {
+        done({ ok: false, error: e.message })
+      }
+    })
+
+    server.on('error', (e) => done({ ok: false, error: 'Could not start local sign-in listener: ' + e.message }))
+    server.listen(0, '127.0.0.1', () => {
+      const redirectUri = `http://127.0.0.1:${server.address().port}`
+      const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
+        client_id:             GOOGLE_CLIENT_ID,
+        redirect_uri:          redirectUri,
+        response_type:         'code',
+        scope:                 'openid email profile',
+        code_challenge:        challenge,
+        code_challenge_method: 'S256',
+        state,
+        prompt:                'select_account',
+      }).toString()
+      shell.openExternal(authUrl)
+    })
+
+    // Abandon the attempt if the user never finishes in the browser.
+    setTimeout(() => done({ ok: false, error: 'Sign-in timed out. Please try again.' }), 300_000)
+  })
+}
+
+ipcMain.handle('auth:google-signin', () => googleSignInFlow())
 
 ipcMain.handle('device:bootstrap', async () => {
   console.log('[device:bootstrap] token path:', TOKEN_FILE())

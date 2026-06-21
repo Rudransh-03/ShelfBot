@@ -82,6 +82,36 @@ export function openDb(path) {
 
     CREATE INDEX IF NOT EXISTS idx_reorg_sessions_device ON reorg_sessions(device_id);
     CREATE INDEX IF NOT EXISTS idx_reorg_sessions_expiry ON reorg_sessions(expires_at);
+
+    -- Account identity (Google sign-in). Replaces anonymous device identity as
+    -- the unit a plan/trial is bound to, so reinstalling can't mint a fresh
+    -- trial: the trial sticks to the Google account, not the install. One row
+    -- per verified Google user.
+    --   plan='trial' starts a 24h, chat-only trial (cap = TRIAL_DAILY).
+    --   plan='pro'   is a paid subscriber (set later by the billing webhook).
+    -- ls_* columns hold the LemonSqueezy customer/subscription ids once billing
+    -- lands; null until then.
+    CREATE TABLE IF NOT EXISTS accounts (
+      id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+      email              TEXT    UNIQUE NOT NULL,
+      google_sub         TEXT    UNIQUE NOT NULL,
+      plan               TEXT    NOT NULL DEFAULT 'trial' CHECK (plan IN ('trial','pro')),
+      trial_started_at   TEXT    NOT NULL,
+      ls_customer_id     TEXT,
+      ls_subscription_id TEXT,
+      created_at         TEXT    NOT NULL,
+      last_seen          TEXT    NOT NULL
+    );
+
+    -- Per-day chat counter for accounts. Same daily-reset semantics as the
+    -- device usage table (no cron — the row just doesn't exist until the
+    -- next day's first chat).
+    CREATE TABLE IF NOT EXISTS account_usage (
+      account_id   INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+      date         TEXT    NOT NULL,
+      chat_count   INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (account_id, date)
+    );
   `)
 
   // Drop pre-#11.5 tables if present so leftover dev rows from the old
@@ -240,6 +270,74 @@ export function openDb(path) {
         SET budget_remaining = MIN(budget_initial, budget_remaining + 1)
         WHERE id = ?
       `).run(sessionId)
+    },
+
+    // ── Accounts (Google sign-in) ───────────────────────────────────────────
+
+    /**
+     * Finds the account for a Google subject id, or creates a fresh trial
+     * account if it's the first time we've seen them. Idempotent on google_sub:
+     * the SAME person signing in from a new install resolves to the SAME row
+     * (and the SAME, already-consumed trial). Email is refreshed in case it
+     * changed upstream. Returns the canonical row.
+     */
+    upsertAccountByGoogle({ sub, email }) {
+      const now = new Date().toISOString()
+      const existing = db.prepare('SELECT * FROM accounts WHERE google_sub = ?').get(sub)
+      if (existing) {
+        db.prepare('UPDATE accounts SET last_seen = ?, email = ? WHERE id = ?').run(now, email, existing.id)
+        return { ...existing, email, last_seen: now }
+      }
+      const ins = db.prepare(`
+        INSERT INTO accounts (email, google_sub, plan, trial_started_at, created_at, last_seen)
+        VALUES (?, ?, 'trial', ?, ?, ?)
+      `).run(email, sub, now, now, now)
+      return db.prepare('SELECT * FROM accounts WHERE id = ?').get(ins.lastInsertRowid)
+    },
+
+    /** Lookup by primary key. Used by JWT validation for account tokens. */
+    findAccountById(id) {
+      return db.prepare('SELECT * FROM accounts WHERE id = ?').get(id)
+    },
+
+    /** Today's chat count for an account (0 if no row yet). */
+    getAccountChatToday(accountId, todayKey) {
+      const row = db.prepare(
+        'SELECT chat_count FROM account_usage WHERE account_id = ? AND date = ?'
+      ).get(accountId, todayKey)
+      return row?.chat_count ?? 0
+    },
+
+    /** Atomically increments today's account chat count; returns the new value. */
+    incrementAccountChatToday(accountId, todayKey) {
+      db.prepare(`
+        INSERT INTO account_usage (account_id, date, chat_count) VALUES (?, ?, 1)
+        ON CONFLICT(account_id, date) DO UPDATE SET chat_count = chat_count + 1
+      `).run(accountId, todayKey)
+      return this.getAccountChatToday(accountId, todayKey)
+    },
+
+    /** Refunds a prior account-chat increment (upstream failure). Floors at 0. */
+    decrementAccountChatToday(accountId, todayKey) {
+      db.prepare(
+        'UPDATE account_usage SET chat_count = MAX(0, chat_count - 1) WHERE account_id = ? AND date = ?'
+      ).run(accountId, todayKey)
+      return this.getAccountChatToday(accountId, todayKey)
+    },
+
+    /**
+     * Sets an account's plan (and optional LemonSqueezy ids). Used later by the
+     * billing webhook to flip 'trial' → 'pro' (or back on cancellation).
+     */
+    setAccountPlan(accountId, plan, { lsCustomerId = null, lsSubscriptionId = null } = {}) {
+      db.prepare(`
+        UPDATE accounts
+        SET plan = ?,
+            ls_customer_id     = COALESCE(?, ls_customer_id),
+            ls_subscription_id = COALESCE(?, ls_subscription_id)
+        WHERE id = ?
+      `).run(plan, lsCustomerId, lsSubscriptionId, accountId)
+      return this.findAccountById(accountId)
     },
 
     close() { db.close() },

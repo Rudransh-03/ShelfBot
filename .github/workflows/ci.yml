@@ -47,8 +47,17 @@ jobs:
           npm ci
           npm test
 
-      - name: UI install + build (compile check)
+      # Compile-check only — this job never launches Electron, so skip the
+      # ~100 MB Electron binary download (a flaky, rate-limited GitHub-release
+      # fetch that's the usual cause of "works locally, fails in CI"). The
+      # renderer/main bundle builds fine without it. Split install/build so a
+      # future failure points at the exact command.
+      - name: UI install
         working-directory: ui
-        run: |
-          npm ci
-          npm run build
+        run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+
+      - name: UI build (compile check)
+        working-directory: ui
+        run: npm run build

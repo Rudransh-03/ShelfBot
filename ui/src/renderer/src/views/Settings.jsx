@@ -213,7 +213,7 @@ function ClientsCard({ api, connected, toast }) {
 }
 
 export default function Settings({ active, onGoLibrary }) {
-  const { api, connected, apiBase, toast, stats, auth, refreshAuth, triggerIndex, signInWithGoogle } = useApp()
+  const { api, connected, apiBase, toast, stats, auth, refreshAuth, triggerIndex, signInWithGoogle, logout } = useApp()
   const [signingIn, setSigningIn] = useState(false)
 
   const handleGoogleSignIn = async () => {
@@ -477,15 +477,17 @@ export default function Settings({ active, onGoLibrary }) {
             >
               {signingIn ? 'Opening browser…' : 'Sign in with Google'}
             </button>
-          ) : auth?.plan !== 'pro' && (
-            <button
-              className="btn-primary"
-              style={{ marginTop: 14 }}
-              disabled
-              title="Coming soon"
-            >
-              Upgrade to Pro
-            </button>
+          ) : (
+            <div className="client-add-actions" style={{ marginTop: 14 }}>
+              {auth?.plan !== 'pro' && (
+                <button className="btn-primary" disabled title="Coming soon">
+                  Upgrade to Pro
+                </button>
+              )}
+              <button className="btn-ghost" onClick={logout} title="Sign out of your account">
+                Sign out
+              </button>
+            </div>
           )}
         </div>
 

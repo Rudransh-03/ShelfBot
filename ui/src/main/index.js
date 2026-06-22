@@ -613,6 +613,25 @@ ipcMain.on('open-external',   (_, url) => {
 
 let lastApiPort = null
 
+/**
+ * Normalizes a /me response. Google accounts return { account, plan, trial,
+ * usage }; legacy device tokens return { device:{plan}, usage }. Returns a flat
+ * shape the renderer's auth state consumes, so plan / trial / email survive an
+ * app restart (this is what surfaces an expired trial after relaunch).
+ */
+function readMe(me) {
+  if (me && me.account) {
+    return {
+      plan:    me.plan ?? 'trial',
+      usage:   me.usage ?? null,
+      email:   me.account.email ?? null,
+      trial:   me.trial ?? null,
+      offline: false,
+    }
+  }
+  return { plan: me?.device?.plan ?? 'free', usage: me?.usage ?? null, email: null, trial: null, offline: false }
+}
+
 async function pushTokenToBackend(token) {
   if (!lastApiPort) return
   try {
@@ -630,6 +649,9 @@ async function pushTokenToBackend(token) {
  * Hits /device/register on the proxy, persists the returned JWT, pushes it
  * to the Java backend. Returns {ok, plan, usage} on success.
  */
+// NOTE: legacy anonymous device registration — no longer called now that
+// Google sign-in is mandatory (see device:bootstrap). Kept for reference /
+// possible future "continue without account" path; safe to remove later.
 async function registerWithProxy() {
   const deviceId = getDeviceId()
   console.log('[device:register] using deviceId', deviceId.slice(0, 8) + '...(truncated)')
@@ -738,19 +760,12 @@ ipcMain.handle('device:bootstrap', async () => {
   console.log('[device:bootstrap] token path:', TOKEN_FILE())
   const saved = loadToken()
 
-  // No token yet → auto-register. This is the *only* time we hit
-  // /device/register; subsequent launches reuse the saved JWT.
+  // No token → the user must sign in with Google. We deliberately do NOT
+  // auto-register an anonymous device: that handed out free access and bypassed
+  // the account + trial model entirely.
   if (!saved?.token) {
-    console.log('[device:bootstrap] no saved token, registering fresh device')
-    const reg = await registerWithProxy()
-    if (!reg.ok) {
-      console.warn('[device:bootstrap] register failed:', reg.error)
-      // Offline-tolerant: no token means we can't query yet, but the UI
-      // can still show settings and the app isn't bricked. We'll retry
-      // on the next /me call or app restart.
-      return { authenticated: false, error: reg.error, offline: !!reg.offline }
-    }
-    return { authenticated: true, plan: reg.plan, usage: reg.usage }
+    console.log('[device:bootstrap] no saved token — sign-in required')
+    return { authenticated: false }
   }
 
   // Have a token → verify it still works.
@@ -759,12 +774,9 @@ ipcMain.handle('device:bootstrap', async () => {
       headers: { Authorization: `Bearer ${saved.token}` },
     })
     if (r.status === 401 || r.status === 403) {
-      console.log('[device:bootstrap] saved token rejected, re-registering')
+      console.log('[device:bootstrap] saved token rejected — sign-in required')
       clearToken()
-      const reg = await registerWithProxy()
-      return reg.ok
-        ? { authenticated: true, plan: reg.plan, usage: reg.usage }
-        : { authenticated: false, error: reg.error }
+      return { authenticated: false }
     }
     if (!r.ok) {
       // Proxy reachable but errored on /me. Keep the user functional —
@@ -775,8 +787,9 @@ ipcMain.handle('device:bootstrap', async () => {
     }
     const me = await r.json()
     await pushTokenToBackend(saved.token)
-    console.log('[device:bootstrap] OK, plan=' + me.device.plan, 'usage', me.usage)
-    return { authenticated: true, plan: me.device.plan, usage: me.usage }
+    const info = readMe(me)
+    console.log('[device:bootstrap] OK, plan=' + info.plan)
+    return { authenticated: true, ...info }
   } catch (e) {
     // Proxy unreachable. Stay signed in optimistically with the cached token.
     console.log('[device:bootstrap] proxy unreachable, trusting saved token:', e.message)
@@ -794,7 +807,7 @@ ipcMain.handle('device:me', async () => {
     })
     if (!r.ok) return { authenticated: false, reason: 'expired' }
     const me = await r.json()
-    return { authenticated: true, plan: me.device.plan, usage: me.usage }
+    return { authenticated: true, ...readMe(me) }
   } catch {
     return { authenticated: false, reason: 'unreachable' }
   }

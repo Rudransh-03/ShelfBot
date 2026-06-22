@@ -47,6 +47,14 @@ const TRIAL_WINDOW_HOURS   = parseInt(process.env.TRIAL_WINDOW_HOURS || '24', 10
 const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID || ''
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || ''
 
+// Accounts that always get the 'pro' plan (founder / team / comped testers),
+// regardless of trial state — no payment needed. The founder is hardcoded so it
+// works out of the box; add more via PRO_EMAILS (comma-separated) on the proxy.
+const PRO_EMAILS = new Set(
+  ['rudranshtyagi2002@gmail.com', ...(process.env.PRO_EMAILS || '').split(',')]
+    .map(s => s.trim().toLowerCase()).filter(Boolean)
+)
+
 // Cost guardrails. The desktop app only ever needs these cheap models, but the
 // device JWT is easy to obtain (registration is open by design) and the body is
 // client-supplied — so a tampered/hostile client could otherwise ask us to bill
@@ -108,7 +116,7 @@ if (!OPENAI_API_KEY) {
 }
 
 const db   = openDb(DB_PATH)
-const auth = makeAuth({ db, jwtSecret: JWT_SECRET, jwtTtlSeconds: JWT_TTL_SECONDS })
+const auth = makeAuth({ db, jwtSecret: JWT_SECRET, jwtTtlSeconds: JWT_TTL_SECONDS, proEmails: PRO_EMAILS })
 
 /** Returns the daily quota for a given plan. Adding tiers later = adding one line. */
 function planLimit(plan) {
@@ -272,6 +280,12 @@ app.post('/auth/google', limitRegister, async (req, res) => {
   }
 
   const account = db.upsertAccountByGoogle({ sub: profile.sub, email: profile.email.toLowerCase() })
+  // Founder/team allowlist → persist 'pro' so it sticks across sessions (the
+  // requireAuth override also applies it live on every request).
+  if (PRO_EMAILS.has(account.email) && account.plan !== 'pro') {
+    db.setAccountPlan(account.id, 'pro')
+    account.plan = 'pro'
+  }
   const { token, expiresIn } = auth.issueAccountToken(account)
 
   const day   = todayKey()

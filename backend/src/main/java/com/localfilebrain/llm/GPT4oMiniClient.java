@@ -249,6 +249,9 @@ public final class GPT4oMiniClient {
                 String body = readBody(conn.getErrorStream());
                 throw rateLimitException(body);
             }
+            if (status == 402) {
+                throw new LLMException("Your free trial has ended. Upgrade to keep chatting with your documents.");
+            }
             if (status == 401 || status == 403) {
                 throw new LLMException("Your session has expired. Please sign out and sign back in.");
             }
@@ -346,6 +349,20 @@ public final class GPT4oMiniClient {
      * deadline extraction emitting JSON for several documents at once.
      */
     public String oneShot(String systemPrompt, String userPrompt, int maxTokens) {
+        return doRequest(buildOneShotBody(systemPrompt, userPrompt, maxTokens));
+    }
+
+    /**
+     * Streaming one-shot — same self-contained prompt as {@link #oneShot}, but
+     * pushes each token to {@code onToken}. Used by the corpus-overview path so
+     * the synthesized overview renders live like a normal chat answer.
+     */
+    public String oneShotStream(String systemPrompt, String userPrompt, int maxTokens,
+                                java.util.function.Consumer<String> onToken) {
+        return doStream(buildOneShotBody(systemPrompt, userPrompt, maxTokens), onToken);
+    }
+
+    private ObjectNode buildOneShotBody(String systemPrompt, String userPrompt, int maxTokens) {
         ObjectNode body = mapper.createObjectNode();
         body.put("model", MODEL);
         body.put("max_tokens", maxTokens);
@@ -353,7 +370,7 @@ public final class GPT4oMiniClient {
         ArrayNode messages = body.putArray("messages");
         addMessage(messages, "system", systemPrompt);
         addMessage(messages, "user",   userPrompt);
-        return doRequest(body);
+        return body;
     }
 
     /**
@@ -401,6 +418,9 @@ public final class GPT4oMiniClient {
                     }
                 } catch (Exception ignored) { /* keep default friendly message */ }
                 throw new LLMException(friendly);
+            }
+            if (status == 402) {
+                throw new LLMException("Your free trial has ended. Upgrade to keep chatting with your documents.");
             }
             if (status == 401 || status == 403) {
                 throw new LLMException("Your session has expired. Please sign out and sign back in.");

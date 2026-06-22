@@ -17,7 +17,12 @@
 
 import jwt from 'jsonwebtoken'
 
-export function makeAuth({ db, jwtSecret, jwtTtlSeconds }) {
+export function makeAuth({ db, jwtSecret, jwtTtlSeconds, proEmails = new Set() }) {
+
+  /** True when an account's email is on the always-pro allowlist (founder/team). */
+  function isProEmail(email) {
+    return !!email && proEmails.has(email.toLowerCase())
+  }
 
   /** Registers a device (idempotent) and returns a fresh JWT bound to it. */
   function registerDevice(deviceId) {
@@ -63,6 +68,9 @@ export function makeAuth({ db, jwtSecret, jwtTtlSeconds }) {
       if (payload.typ === 'acct') {
         const account = db.findAccountById(payload.sub)
         if (!account) return res.status(401).json({ error: 'Account no longer exists' })
+        // Founder/team allowlist → always pro (no trial, no payment). Applied
+        // live per-request so it takes effect instantly, without re-signing-in.
+        if (isProEmail(account.email)) account.plan = 'pro'
         req.account   = account
         req.principal = { kind: 'account', id: account.id, plan: account.plan, account }
         return next()

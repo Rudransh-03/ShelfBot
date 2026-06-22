@@ -205,6 +205,13 @@ export default function WelcomeModal() {
                   Rudo watches your folders and stays in sync automatically as files change.
                 </span>
               </div>
+              <div className="welcome-bullet">
+                <CheckIcon />
+                <span>
+                  You're on a <strong>free trial</strong> — ask away. Your files
+                  are read locally and never leave your device.
+                </span>
+              </div>
             </div>
 
             <div className="welcome-actions">

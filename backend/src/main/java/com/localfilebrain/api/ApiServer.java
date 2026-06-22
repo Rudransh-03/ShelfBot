@@ -1093,7 +1093,7 @@ public final class ApiServer {
         synchronized (this) {
             if (queryEngine == null) {
                 AppConfig fresh = AppConfig.load();
-                queryEngine = new QueryEngine(fresh, vectorStore, embeddingClient, tokenStore);
+                queryEngine = new QueryEngine(fresh, vectorStore, embeddingClient, tokenStore, metadataStore);
             }
         }
         return queryEngine;

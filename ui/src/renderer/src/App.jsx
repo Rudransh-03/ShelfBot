@@ -6,6 +6,7 @@ import LoadingOverlay from './components/LoadingOverlay'
 import ToastContainer from './components/Toast'
 import UpdateBanner   from './components/UpdateBanner'
 import WelcomeModal   from './components/WelcomeModal'
+import SignInScreen   from './components/SignInScreen'
 import SearchModal    from './components/SearchModal'
 import ClientSuggestionModal from './components/ClientSuggestionModal'
 import DeadlineReviewModal from './components/DeadlineReviewModal'
@@ -21,7 +22,7 @@ import Settings       from './views/Settings'
 // ─────────────────────────────────────────────────────────────────────────────
 
 function Shell() {
-  const { setApiBase, setApiToken, setConnected, connected } = useApp()
+  const { setApiBase, setApiToken, setConnected, connected, auth } = useApp()
   const [loadMsg,   setLoadMsg]   = useState('Starting up…')
   const [loaded,    setLoaded]    = useState(false)
   const [view,      setView]      = useState('chat')
@@ -82,34 +83,45 @@ function Shell() {
     return E.onApiPort(payload => initBackend(payload || {})) // disposer removes the listener
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Gate: until auth is checked AND the user is signed in, don't show the app.
+  // (auth bootstrap runs in AppContext; auth.checked flips once it resolves.)
+  const showSignIn = auth.checked && !auth.registered
+
   return (
     <>
       <BackgroundFX />
-      <LoadingOverlay visible={!loaded} msg={loadMsg} />
+      <LoadingOverlay visible={!loaded || !auth.checked} msg={loadMsg} />
 
-      <div className="app">
-        <TitleBar connected={connected} />
-        <UpdateBanner />
-        <div className={`main-area${collapsed ? ' sidebar-collapsed' : ''}`}>
-          <Sidebar
-            active={view}
-            onNav={setView}
-            connected={connected}
-            collapsed={collapsed}
-            onToggle={toggleCollapsed}
-            onOpenSearch={() => setSearchOpen(true)}
-          />
-          <div className="content">
-            <Chat      active={view === 'chat'} />
-            <Library   active={view === 'lib'}  onGoSettings={() => setView('set')} />
-            <Deadlines active={view === 'due'} />
-            <Organize  active={view === 'org'} />
-            <Settings active={view === 'set'} onGoLibrary={() => setView('lib')} />
+      {showSignIn ? (
+        <div className="app">
+          <TitleBar connected={connected} />
+          <SignInScreen />
+        </div>
+      ) : (
+        <div className="app">
+          <TitleBar connected={connected} />
+          <UpdateBanner />
+          <div className={`main-area${collapsed ? ' sidebar-collapsed' : ''}`}>
+            <Sidebar
+              active={view}
+              onNav={setView}
+              connected={connected}
+              collapsed={collapsed}
+              onToggle={toggleCollapsed}
+              onOpenSearch={() => setSearchOpen(true)}
+            />
+            <div className="content">
+              <Chat      active={view === 'chat'} />
+              <Library   active={view === 'lib'}  onGoSettings={() => setView('set')} />
+              <Deadlines active={view === 'due'} />
+              <Organize  active={view === 'org'} />
+              <Settings active={view === 'set'} onGoLibrary={() => setView('lib')} />
+            </div>
           </div>
         </div>
-      </div>
+      )}
 
-      {searchOpen && (
+      {!showSignIn && searchOpen && (
         <SearchModal
           onClose={() => setSearchOpen(false)}
           onNavigate={() => setView('chat')}
@@ -117,9 +129,9 @@ function Shell() {
       )}
 
       <ToastContainer />
-      <WelcomeModal />
-      <ClientSuggestionModal />
-      <DeadlineReviewModal onNavigate={() => setView('due')} />
+      {!showSignIn && <WelcomeModal />}
+      {!showSignIn && <ClientSuggestionModal />}
+      {!showSignIn && <DeadlineReviewModal onNavigate={() => setView('due')} />}
     </>
   )
 }

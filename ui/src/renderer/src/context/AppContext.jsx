@@ -11,12 +11,6 @@ const IDLE_POLL_MS  = 30_000
 // progress UI in Library and the "Indexing…" label in the Sidebar stay live.
 const BUSY_POLL_MS  = 1_200
 
-// TODO(pro-gate): Deadlines is meant to be a Pro feature. Until payments/Pro
-// exist, unlock it for every device so it can be used and tested. Flip to
-// `false` to gate it — free devices then get an upgrade prompt instead of the
-// scan, and the auto-scan only fires for Pro.
-const DEADLINES_DEV_UNLOCK = true
-
 // After indexing changes the corpus, wait this long with no further index
 // activity before auto-scanning — so a bulk drop of files settles into ONE
 // batched scan instead of several small ones.
@@ -61,8 +55,9 @@ export function AppProvider({ children }) {
     email: null, trial: null,
   })
 
-  // Is the Deadlines feature available to this device? (see DEADLINES_DEV_UNLOCK)
-  const deadlinesEnabled = DEADLINES_DEV_UNLOCK || auth.plan === 'pro'
+  // Deadlines is a Pro feature (it makes LLM calls). Trial/free accounts see an
+  // upgrade prompt instead; only Pro runs scans + the post-index auto-scan.
+  const deadlinesEnabled = auth.plan === 'pro'
 
   const refreshAuth = useCallback(async () => {
     const E = window.electron
@@ -74,6 +69,8 @@ export function AppProvider({ children }) {
         plan: r.plan ?? 'free',
         usage: r.usage ?? null,
         offline: false,
+        email: r.email ?? null,
+        trial: r.trial ?? null,
       })
     } else {
       setAuth(s => ({ ...s, checked: true, registered: false }))
@@ -337,6 +334,8 @@ export function AppProvider({ children }) {
         plan: r?.plan ?? 'free',
         usage: r?.usage ?? null,
         offline: !!r?.offline,
+        email: r?.email ?? null,
+        trial: r?.trial ?? null,
       })
     })
   }, [])

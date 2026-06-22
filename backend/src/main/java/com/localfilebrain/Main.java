@@ -188,7 +188,7 @@ public final class Main {
         // initialises it lazily on the first query request.
         QueryEngine queryEngine = null;
         try {
-            queryEngine = new QueryEngine(config, vectorStore, finalEmbedding, tokenStore);
+            queryEngine = new QueryEngine(config, vectorStore, finalEmbedding, tokenStore, metadataStore);
         } catch (Exception e) {
             log.warn("QueryEngine not ready ({}). It will be initialised on first query.", e.getMessage());
         }

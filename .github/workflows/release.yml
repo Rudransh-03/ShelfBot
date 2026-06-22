@@ -66,9 +66,15 @@ jobs:
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
+      # `npm install` (not `npm ci`): electron-builder's per-OS optional deps
+      # can't all live in one committed lockfile, so `npm ci` fails on a runner
+      # whose OS differs from where the lock was generated. `npm install` also
+      # ensures THIS runner's packaging targets (e.g. squirrel-windows on
+      # Windows) are present. Full install here — packaging needs the Electron
+      # binary, so we do NOT skip its download.
       - name: Install UI deps
         working-directory: ui
-        run: npm ci
+        run: npm install --no-audit --no-fund
 
       - name: Build runtime + app and publish to GitHub Releases
         working-directory: ui

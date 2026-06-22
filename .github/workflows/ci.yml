@@ -47,14 +47,15 @@ jobs:
           npm ci
           npm test
 
-      # Compile-check only — this job never launches Electron, so skip the
-      # ~100 MB Electron binary download (a flaky, rate-limited GitHub-release
-      # fetch that's the usual cause of "works locally, fails in CI"). The
-      # renderer/main bundle builds fine without it. Split install/build so a
-      # future failure points at the exact command.
+      # Use `npm install`, not `npm ci`: electron-builder pulls per-OS OPTIONAL
+      # dependencies (e.g. electron-builder-squirrel-windows on Windows, dmg
+      # tooling on macOS) that a single committed lockfile generated on one OS
+      # can't contain — so `npm ci` (strict) fails on a different runner OS with
+      # "Missing … from lock file". `npm install` reconciles those per platform.
+      # Compile-check only → skip the ~100 MB Electron binary download too.
       - name: UI install
         working-directory: ui
-        run: npm ci
+        run: npm install --no-audit --no-fund
         env:
           ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
 

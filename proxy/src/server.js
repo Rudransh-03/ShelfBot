@@ -609,6 +609,19 @@ app.post('/reorg/llm', limitProxy, auth.requireAuth, async (req, res) => {
   }
 })
 
+// ─── Crash safety ───────────────────────────────────────────────────────────
+// A long-running service must not be taken down for every user by one stray
+// async error. We log unhandled rejections and keep serving; an uncaught
+// exception leaves the process in an undefined state, so we log and exit so the
+// process manager (systemd / pm2 / Cloud Run) restarts a clean instance.
+process.on('unhandledRejection', (reason) => {
+  console.error('[proxy] unhandledRejection:', reason)
+})
+process.on('uncaughtException', (err) => {
+  console.error('[proxy] uncaughtException — exiting for a clean restart:', err)
+  process.exit(1)
+})
+
 // ─── Start ────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`[proxy] listening on http://localhost:${PORT}`)

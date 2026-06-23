@@ -181,24 +181,48 @@ public final class ApiServer {
     // ─────────────────────────────────────────────────────────────────────────
 
     private void registerRoutes() {
-        server.createContext("/api/health",       this::handleHealth);
-        server.createContext("/api/status",       this::handleStatus);
-        server.createContext("/api/index",        this::handleIndex);
-        server.createContext("/api/query",        this::handleQuery);
-        server.createContext("/api/query/stream", this::handleQueryStream);
-        server.createContext("/api/conversations", this::handleConversations);
-        server.createContext("/api/config",       this::handleConfig);
-        server.createContext("/api/files/summary", this::handleFileSummary);
-        server.createContext("/api/files",        this::handleFiles);
-        server.createContext("/api/deadlines/scan", this::handleDeadlineScan);
-        server.createContext("/api/deadlines",      this::handleDeadlines);
-        server.createContext("/api/missing",        this::handleMissing);
-        server.createContext("/api/clients",         this::handleClients);
-        server.createContext("/api/auth",         this::handleAuth);
-        server.createContext("/api/reorg/preview", this::handleReorgPreview);
-        server.createContext("/api/reorg/execute", this::handleReorgExecute);
-        server.createContext("/api/reorg/undo",    this::handleReorgUndo);
-        server.createContext("/api/reorg/history", this::handleReorgHistory);
+        register("/api/health",       this::handleHealth);
+        register("/api/status",       this::handleStatus);
+        register("/api/index",        this::handleIndex);
+        register("/api/query",        this::handleQuery);
+        register("/api/query/stream", this::handleQueryStream);
+        register("/api/conversations", this::handleConversations);
+        register("/api/config",       this::handleConfig);
+        register("/api/files/summary", this::handleFileSummary);
+        register("/api/files",        this::handleFiles);
+        register("/api/deadlines/scan", this::handleDeadlineScan);
+        register("/api/deadlines",      this::handleDeadlines);
+        register("/api/missing",        this::handleMissing);
+        register("/api/clients",         this::handleClients);
+        register("/api/auth",         this::handleAuth);
+        register("/api/reorg/preview", this::handleReorgPreview);
+        register("/api/reorg/execute", this::handleReorgExecute);
+        register("/api/reorg/undo",    this::handleReorgUndo);
+        register("/api/reorg/history", this::handleReorgHistory);
+    }
+
+    /**
+     * Registers a route with a last-resort safety net. Each handler already does
+     * its own try/catch, but if anything slips through, the bare
+     * {@code com.sun.net.httpserver} closes the socket with NO response — the UI
+     * fetch then hangs/errors opaquely. This wrapper guarantees a 500 JSON reply
+     * (best-effort — a no-op if the handler already started the response, e.g. a
+     * mid-stream SSE failure) and logs the cause server-side.
+     */
+    private void register(String path, com.sun.net.httpserver.HttpHandler handler) {
+        server.createContext(path, ex -> {
+            try {
+                handler.handle(ex);
+            } catch (BadRequestException bre) {
+                try { sendError(ex, 400, bre.getMessage()); }
+                catch (Exception ignored) { /* response already begun */ }
+            } catch (Throwable t) {
+                log.error("Unhandled error in {} {}", ex.getRequestMethod(),
+                        ex.getRequestURI().getPath(), t);
+                try { sendError(ex, 500, "Internal server error"); }
+                catch (Exception ignored) { /* response already begun — can't help it */ }
+            }
+        });
     }
 
     /**
@@ -1912,9 +1936,26 @@ public final class ApiServer {
         sendError(ex, 405, "Method not allowed");
     }
 
+    // Every legitimate request body here (a question, settings, a target dir) is
+    // tiny. Cap the read so a malformed or hostile body can't OOM the backend.
+    private static final int MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024;
+
+    /** Thrown for client-side input errors so the route wrapper replies 400, not 500. */
+    static final class BadRequestException extends RuntimeException {
+        BadRequestException(String message) { super(message); }
+    }
+
     private Map<?, ?> readJson(HttpExchange ex) throws IOException {
-        byte[] body = ex.getRequestBody().readAllBytes();
-        return mapper.readValue(body, Map.class);
+        byte[] body = ex.getRequestBody().readNBytes(MAX_REQUEST_BODY_BYTES + 1);
+        if (body.length > MAX_REQUEST_BODY_BYTES) {
+            throw new BadRequestException("Request body too large (max "
+                    + MAX_REQUEST_BODY_BYTES + " bytes)");
+        }
+        try {
+            return mapper.readValue(body, Map.class);
+        } catch (Exception e) {
+            throw new BadRequestException("Invalid JSON body");
+        }
     }
 
     /** Reads a single decoded query-string parameter, or null if absent. */

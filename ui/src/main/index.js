@@ -30,6 +30,14 @@ const PROD_PROXY_URL = 'https://CHANGE-ME-to-your-deployed-proxy.example.com' //
 const PROXY_URL = process.env.SHELFBOT_PROXY_URL
   || (app.isPackaged ? PROD_PROXY_URL : 'http://localhost:8787')
 
+// Guard: a packaged build must not ship the placeholder proxy URL — nothing
+// (chat, sign-in, deadlines) would work. Surface it loudly instead of failing
+// silently at runtime. (No-op in dev, which uses localhost.)
+if (app.isPackaged && PROXY_URL.includes('CHANGE-ME')) {
+  console.error('[ShelfBot] FATAL: PROD_PROXY_URL is still the placeholder. '
+    + 'Set it (or SHELFBOT_PROXY_URL) to your deployed proxy before building for release.')
+}
+
 // Google OAuth client id for the "Sign in with Google" flow. This is a PUBLIC
 // value (safe to ship in the app) — the matching client SECRET lives only on
 // the proxy, which is what actually exchanges the auth code. Create a

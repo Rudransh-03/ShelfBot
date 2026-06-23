@@ -178,6 +178,31 @@ deadline.daily.call.budget=25
 · `/api/reorg/{preview,execute,undo,history}`
 · `/api/deadlines` (list / `{id}` patch / `{id}` delete), `/api/deadlines/scan` (start / poll)
 
+## 9. Going to production — flip-before-ship checklist
+
+Several values are intentionally set for local testing. Before a public release:
+
+**Proxy (`proxy/.env` on your host):**
+- [ ] `JWT_SECRET` — a real 32+ char random value (not the placeholder).
+- [ ] `OPENAI_API_KEY` — production key, with a **hard monthly spend cap set in the
+      OpenAI dashboard** (the ultimate backstop against abuse).
+- [ ] `FREE_DAILY` / `PRO_DAILY` — restore to real limits (testing may bump `FREE_DAILY`
+      high; ensure free ≤ pro).
+- [ ] `FREE_REORG_DAILY` / `PRO_REORG_DAILY` — `1` / `5` for production.
+- [ ] `REGISTER_IP_DAILY` / `PROXY_IP_DAILY` — remove any testing overrides (e.g. `100000`)
+      so the real `20` / `200` throttle applies.
+- [ ] `TRUST_PROXY=1` (or your real hop count) — **required** behind nginx/Cloud Run, or
+      every user shares one rate-limit bucket.
+- [ ] `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` — real OAuth "Desktop app" credentials.
+- [ ] `GOOGLE_AUTH_STUB` — **must be unset** (the proxy logs a loud warning if it's on).
+- [ ] Run the proxy under a process manager (systemd / pm2 / Cloud Run) so the
+      crash-restart guard works, on a host with persistent disk for `DB_PATH`.
+
+**Desktop app (`ui/src/main/index.js`):**
+- [ ] `PROD_PROXY_URL` — set to your deployed HTTPS proxy (a packaged build logs a FATAL
+      if it's still the placeholder).
+- [ ] `GOOGLE_CLIENT_ID` — matches the OAuth client whose secret is on the proxy.
+
 ---
 
 Questions or something not working? Open an issue with your OS, Java/Node

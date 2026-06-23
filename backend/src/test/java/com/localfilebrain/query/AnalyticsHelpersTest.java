@@ -28,15 +28,4 @@ class AnalyticsHelpersTest {
         assertEquals("0",         QueryEngine.indianGroup(0));
     }
 
-    @Test
-    void detectsAnalyticsIntent() {
-        assertEquals(QueryEngine.AnalyticsOp.SUM, QueryEngine.analyticsOp("what is the total amount of all my invoices"));
-        assertEquals(QueryEngine.AnalyticsOp.MAX, QueryEngine.analyticsOp("which is my largest invoice by amount"));
-        assertEquals(QueryEngine.AnalyticsOp.MIN, QueryEngine.analyticsOp("what is my smallest invoice"));
-        assertEquals(QueryEngine.AnalyticsOp.LIST, QueryEngine.analyticsOp("list all my invoices with their amounts"));
-        // Not analytics:
-        assertNull(QueryEngine.analyticsOp("what is the total amount on this invoice")); // single doc, no scope
-        assertNull(QueryEngine.analyticsOp("how many invoices do I have"));
-        assertNull(QueryEngine.analyticsOp("summarize my documents"));
-    }
 }

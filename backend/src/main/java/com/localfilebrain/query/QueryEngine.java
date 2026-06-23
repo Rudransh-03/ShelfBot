@@ -1045,8 +1045,40 @@ public final class QueryEngine {
      * should come from normal semantic search (LOOKUP/COMPARE, or a collection path
      * that found nothing in scope), so the caller falls through to top-k.
      */
+    // Unmistakable "give me an overview of my whole collection" asks. Deterministic
+    // so the model's classification can never flip them to a 2-file lookup. HIGH
+    // precision on purpose: needs BOTH a whole-collection reference AND a
+    // summary/important/overview intent, so focused lookups never match.
+    private static final String[] OVERVIEW_FORCE_COLLECTION = {
+            "my files", "my documents", "my docs", "my collection", "my paperwork",
+            "all my files", "all my documents", "all my docs", "across my files",
+            "in my files", "from my files", "of my files", "in my documents",
+            "everything i have", "all of my files", "all of my documents"
+    };
+    private static final String[] OVERVIEW_FORCE_INTENT = {
+            "important", "overview", "summar", "highlight", "key thing", "key point",
+            "main thing", "what's in", "whats in", "what is in", "rundown", "gist",
+            "big picture", "tldr", "tl;dr", "at a glance", "what do i have",
+            "what should i know", "what's there", "whats there"
+    };
+
+    static boolean isClearOverviewAsk(String question) {
+        if (question == null) return false;
+        String lq = " " + question.toLowerCase().replaceAll("\\s+", " ").trim() + " ";
+        boolean collection = false, intent = false;
+        for (String t : OVERVIEW_FORCE_COLLECTION) if (lq.contains(t)) { collection = true; break; }
+        for (String t : OVERVIEW_FORCE_INTENT)     if (lq.contains(t)) { intent = true; break; }
+        return collection && intent;
+    }
+
     private QueryResult routeByIntent(String question, java.util.Set<String> allowedPaths,
                                       java.util.function.Consumer<String> onToken) {
+        // Hard guarantee for clear whole-collection overview asks — no classifier
+        // variance. Falls through (null) only if nothing is indexed.
+        if (isClearOverviewAsk(question)) {
+            QueryResult ov = answerCorpusOverview(question, allowedPaths, onToken);
+            if (ov != null) { log.info("Intent: OVERVIEW (deterministic)"); return ov; }
+        }
         ClassifiedIntent ci = classifyIntent(question);
         log.info("Intent: {}", ci.intent());
         switch (ci.intent()) {

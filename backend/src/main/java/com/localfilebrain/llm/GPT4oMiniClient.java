@@ -349,7 +349,13 @@ public final class GPT4oMiniClient {
      * deadline extraction emitting JSON for several documents at once.
      */
     public String oneShot(String systemPrompt, String userPrompt, int maxTokens) {
-        return doRequest(buildOneShotBody(systemPrompt, userPrompt, maxTokens));
+        return oneShot(systemPrompt, userPrompt, maxTokens, 0.2);
+    }
+
+    /** One-shot with an explicit temperature — enumeration/extraction passes use
+     *  0.0 so the model doesn't pad counts/lists with hallucinated duplicates. */
+    public String oneShot(String systemPrompt, String userPrompt, int maxTokens, double temperature) {
+        return doRequest(buildOneShotBody(systemPrompt, userPrompt, maxTokens, temperature));
     }
 
     /**
@@ -359,14 +365,19 @@ public final class GPT4oMiniClient {
      */
     public String oneShotStream(String systemPrompt, String userPrompt, int maxTokens,
                                 java.util.function.Consumer<String> onToken) {
-        return doStream(buildOneShotBody(systemPrompt, userPrompt, maxTokens), onToken);
+        return oneShotStream(systemPrompt, userPrompt, maxTokens, 0.2, onToken);
     }
 
-    private ObjectNode buildOneShotBody(String systemPrompt, String userPrompt, int maxTokens) {
+    public String oneShotStream(String systemPrompt, String userPrompt, int maxTokens,
+                                double temperature, java.util.function.Consumer<String> onToken) {
+        return doStream(buildOneShotBody(systemPrompt, userPrompt, maxTokens, temperature), onToken);
+    }
+
+    private ObjectNode buildOneShotBody(String systemPrompt, String userPrompt, int maxTokens, double temperature) {
         ObjectNode body = mapper.createObjectNode();
         body.put("model", MODEL);
         body.put("max_tokens", maxTokens);
-        body.put("temperature", 0.2);
+        body.put("temperature", temperature);
         ArrayNode messages = body.putArray("messages");
         addMessage(messages, "system", systemPrompt);
         addMessage(messages, "user",   userPrompt);

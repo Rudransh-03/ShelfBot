@@ -10,6 +10,7 @@ import SignInScreen   from './components/SignInScreen'
 import SearchModal    from './components/SearchModal'
 import ClientSuggestionModal from './components/ClientSuggestionModal'
 import DeadlineReviewModal from './components/DeadlineReviewModal'
+import AttentionModal  from './components/AttentionModal'
 import BackgroundFX   from './components/BackgroundFX'
 import Chat           from './views/Chat'
 import Library        from './views/Library'
@@ -27,6 +28,7 @@ function Shell() {
   const [loaded,    setLoaded]    = useState(false)
   const [view,      setView]      = useState('chat')
   const [searchOpen, setSearchOpen] = useState(false)
+  const [attnOpen,  setAttnOpen]  = useState(false)
   const [collapsed, setCollapsed] = useState(
     // Remember the user's preference between sessions
     () => localStorage.getItem('rudo.sidebar.collapsed') === 'true'
@@ -109,6 +111,7 @@ function Shell() {
               collapsed={collapsed}
               onToggle={toggleCollapsed}
               onOpenSearch={() => setSearchOpen(true)}
+              onOpenAttention={() => setAttnOpen(true)}
             />
             <div className="content">
               <Chat      active={view === 'chat'} />
@@ -125,6 +128,14 @@ function Shell() {
         <SearchModal
           onClose={() => setSearchOpen(false)}
           onNavigate={() => setView('chat')}
+        />
+      )}
+
+      {!showSignIn && (
+        <AttentionModal
+          open={attnOpen}
+          onClose={() => setAttnOpen(false)}
+          onGoDeadlines={() => setView('due')}
         />
       )}
 

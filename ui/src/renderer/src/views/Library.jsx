@@ -181,6 +181,12 @@ function FileRow({ file, onDelete, onSummarise }) {
       <div className="file-row-main">
         <div className="file-row-name">{file.name}</div>
         <div className="file-row-meta">
+          {file.docType && file.docType !== 'Other' && (
+            <>
+              <span className="file-type-pill">{file.docType}</span>
+              <span className="dot-sep">·</span>
+            </>
+          )}
           <span>{fmtBytes(file.sizeBytes)}</span>
           <span className="dot-sep">·</span>
           <span>Indexed {fmtAge(file.lastIndexedAt)}</span>
@@ -478,6 +484,7 @@ function IndexedFilesPanel({ api, connected, refreshKey, onDeleted, toast }) {
   const [files, setFiles] = useState(null)
   const [loading, setLoading] = useState(false)
   const [query, setQuery] = useState('')
+  const [typeFilter, setTypeFilter] = useState('All') // active doc-type chip
 
   // Active summary modal state: { file, data, error, loading }.
   // Only one modal at a time — clicking Summarise on a different row replaces.
@@ -523,15 +530,38 @@ function IndexedFilesPanel({ api, connected, refreshKey, onDeleted, toast }) {
   const handleSummarise = useCallback((file) => { runSummary(file) }, [runSummary])
   const closeSummary   = useCallback(() => setSummaryState(null), [])
 
-  // Instant client-side filter on file name or path. Filtering an in-memory
-  // array on each keystroke is sub-millisecond, so no debounce is needed —
-  // the list updates the moment a key is pressed.
+  // Self-sorting "folders": group counts by auto document type, ordered by
+  // count desc, with "All" first. Computed from the in-memory list, so it
+  // updates instantly as files are added/removed.
+  const typeGroups = (() => {
+    const counts = new Map()
+    for (const f of files ?? []) {
+      const t = f.docType || 'Other'
+      counts.set(t, (counts.get(t) || 0) + 1)
+    }
+    const ordered = [...counts.entries()].sort((a, b) =>
+      a[0] === 'Other' ? 1 : b[0] === 'Other' ? -1 : b[1] - a[1])
+    return [['All', (files ?? []).length], ...ordered]
+  })()
+
+  // Reset the type chip if the active one no longer exists (e.g. last file of a
+  // type was deleted) so the list never silently shows nothing.
+  useEffect(() => {
+    if (typeFilter !== 'All' && !(files ?? []).some(f => (f.docType || 'Other') === typeFilter)) {
+      setTypeFilter('All')
+    }
+  }, [files, typeFilter])
+
+  // Instant client-side filter on file name/path AND the active type chip.
+  // Filtering an in-memory array on each keystroke is sub-millisecond, so no
+  // debounce is needed — the list updates the moment a key is pressed.
   const q = query.trim().toLowerCase()
-  const visible = q
-    ? (files ?? []).filter(f =>
-        (f.name ?? '').toLowerCase().includes(q) ||
-        (f.path ?? '').toLowerCase().includes(q))
-    : (files ?? [])
+  const visible = (files ?? []).filter(f => {
+    if (typeFilter !== 'All' && (f.docType || 'Other') !== typeFilter) return false
+    if (!q) return true
+    return (f.name ?? '').toLowerCase().includes(q) ||
+           (f.path ?? '').toLowerCase().includes(q)
+  })
 
   return (
     <div className="files-panel">
@@ -551,6 +581,26 @@ function IndexedFilesPanel({ api, connected, refreshKey, onDeleted, toast }) {
           <RefreshIcon />
         </button>
       </div>
+
+      {/* Self-sorting folders — tap a type to filter. Hidden until there's
+          more than one type, so a tiny library isn't cluttered with one chip. */}
+      {files != null && typeGroups.length > 2 && (
+        <div className="type-chips" role="tablist" aria-label="Filter by document type">
+          {typeGroups.map(([type, count]) => (
+            <button
+              key={type}
+              className={`type-chip${typeFilter === type ? ' active' : ''}`}
+              onClick={() => setTypeFilter(type)}
+              role="tab"
+              aria-selected={typeFilter === type}
+              title={`${count} ${type === 'All' ? 'file' : type}${count === 1 ? '' : 's'}`}
+            >
+              {type}
+              <span className="type-chip-count">{count}</span>
+            </button>
+          ))}
+        </div>
+      )}
 
       {files != null && files.length > 0 && (
         <div className="files-search">
@@ -586,9 +636,10 @@ function IndexedFilesPanel({ api, connected, refreshKey, onDeleted, toast }) {
         <div className="files-panel-empty">No files match “{query}”.</div>
       ) : (
         <>
-          {q && (
+          {(q || typeFilter !== 'All') && (
             <div className="files-search-count">
               Showing {visible.length} of {files.length} files
+              {typeFilter !== 'All' && <> · {typeFilter}</>}
             </div>
           )}
           <ul className="file-list">

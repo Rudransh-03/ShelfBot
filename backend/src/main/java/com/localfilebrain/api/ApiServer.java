@@ -1,6 +1,7 @@
 package com.localfilebrain.api;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.localfilebrain.attention.AttentionBuilder;
 import com.localfilebrain.auth.AuthTokenStore;
 import com.localfilebrain.config.AppConfig;
 import com.localfilebrain.deadline.DeadlineScanService;
@@ -32,7 +33,6 @@ import com.localfilebrain.storage.VectorStore;
 import com.localfilebrain.summarize.SummarizationEngine;
 import com.localfilebrain.llm.GPT4oMiniClient;
 import com.localfilebrain.util.PathNormalizer;
-import com.localfilebrain.model.FileRecord;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import org.slf4j.Logger;
@@ -193,6 +193,9 @@ public final class ApiServer {
         register("/api/deadlines/scan", this::handleDeadlineScan);
         register("/api/deadlines",      this::handleDeadlines);
         register("/api/missing",        this::handleMissing);
+        register("/api/timeline",       this::handleTimeline);
+        register("/api/attention",      this::handleAttention);
+        register("/api/attention/dismiss", this::handleAttentionDismiss);
         register("/api/clients",         this::handleClients);
         register("/api/auth",         this::handleAuth);
         register("/api/reorg/preview", this::handleReorgPreview);
@@ -407,6 +410,13 @@ public final class ApiServer {
                 // appear for everyone without needing the Pro deadline scan.
                 try { new LocalEntityScanner(metadataStore, vectorStore).scanAll(); }
                 catch (Exception e) { log.warn("post-index local entity scan failed: {}", e.getMessage()); }
+                // Free, local document-type classification (Library filter chips)
+                // and obligation-date extraction (Timeline). Both reuse the
+                // already-indexed text — no LLM call, no added run-cost.
+                try { com.localfilebrain.ingestion.DocumentTypeClassifier.classifyAll(metadataStore, vectorStore); }
+                catch (Exception e) { log.warn("post-index doc-type classification failed: {}", e.getMessage()); }
+                try { new com.localfilebrain.timeline.LocalDateScanner(metadataStore, vectorStore).scanAll(); }
+                catch (Exception e) { log.warn("post-index local date scan failed: {}", e.getMessage()); }
                 // Refresh client membership after indexing so newly-added files
                 // get auto-filed to their client and changed files lose any stale
                 // tag (manual pins are preserved). No-op when no clients exist.
@@ -555,8 +565,12 @@ public final class ApiServer {
 
             // Final summary event with sources + found flag + the thread id
             // (lets the UI adopt a freshly-created conversation), encoded as JSON.
+            // The full answer text rides along as a safety net: if any path ever
+            // resolves without streaming tokens, the UI can still render the
+            // reply instead of leaving a blank bubble.
             Map<String, Object> summary = new LinkedHashMap<>();
             summary.put("found",          result.found());
+            summary.put("answer",         result.answer());
             summary.put("sources",        result.sourceFiles());
             summary.put("conversationId", convId);
             summary.put("scope",          sd.label);
@@ -734,6 +748,7 @@ public final class ApiServer {
                     } else {
                         row.put("chunkCount", r.getChunkCount());
                         row.put("tokenCount", r.getTokenCount());
+                        row.put("docType", r.getDocType() != null ? r.getDocType() : "Other");
                     }
                     rows.add(row);
                 }
@@ -988,6 +1003,129 @@ public final class ApiServer {
             com.localfilebrain.deadline.MissingDocumentDetector.MissingDoc d) {
         String who = (d.issuer() == null || d.issuer().isBlank()) ? "" : " from " + d.issuer();
         return "Looks like your " + d.series() + who + " for " + d.periodLabel() + " may be missing.";
+    }
+
+    /**
+     * GET /api/timeline — every obligation date Rudo found across the user's
+     * documents (due dates, expiries, renewals), in chronological order, each
+     * with a computed bucket (OVERDUE | DUE_SOON | UPCOMING) and the file's auto
+     * type. Free + local: reads the {@code document_dates} table the local date
+     * scan fills at index time — no LLM call.
+     */
+    private void handleTimeline(HttpExchange ex) throws IOException {
+        if (preflight(ex)) return;
+        if (!isMethod(ex, "GET")) { methodNotAllowed(ex); return; }
+        try {
+            List<IndexMetadataStore.DateRow> rows = metadataStore.listTimeline();
+            java.time.LocalDate today = java.time.LocalDate.now();
+            List<Map<String, Object>> items = new ArrayList<>(rows.size());
+            int overdue = 0, dueSoon = 0, upcoming = 0;
+            for (IndexMetadataStore.DateRow r : rows) {
+                Long daysUntil = null;
+                String bucket = "UPCOMING";
+                try {
+                    java.time.LocalDate d = java.time.LocalDate.parse(r.eventDate());
+                    long days = java.time.temporal.ChronoUnit.DAYS.between(today, d);
+                    daysUntil = days;
+                    bucket = days < 0 ? "OVERDUE" : days <= 7 ? "DUE_SOON" : "UPCOMING";
+                } catch (Exception ignored) { /* keep UPCOMING */ }
+                switch (bucket) {
+                    case "OVERDUE"  -> overdue++;
+                    case "DUE_SOON" -> dueSoon++;
+                    default         -> upcoming++;
+                }
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("id",        r.id());
+                m.put("path",      r.absolutePath());
+                m.put("fileName",  r.fileName());
+                m.put("date",      r.eventDate());
+                m.put("title",     r.title());
+                m.put("excerpt",   r.sourceExcerpt());
+                m.put("docType",   r.docType() != null ? r.docType() : "Other");
+                m.put("daysUntil", daysUntil);
+                m.put("bucket",    bucket);
+                items.add(m);
+            }
+            sendJson(ex, 200, map("items", items, "counts", map(
+                    "total", rows.size(), "overdue", overdue, "dueSoon", dueSoon, "upcoming", upcoming)));
+        } catch (Exception e) {
+            log.warn("/api/timeline failed", e);
+            sendError(ex, 500, "Failed to load timeline");
+        }
+    }
+
+    /**
+     * GET /api/attention — strictly TODAY's action items behind the sidebar
+     * button: obligations due today, overdue obligations, and likely-missing
+     * recurring documents (anything due later lives only in Deadlines). Merged
+     * deterministically by {@link AttentionBuilder} from data the extraction
+     * layers already wrote — local, free, and incapable of hallucinating.
+     */
+    private void handleAttention(HttpExchange ex) throws IOException {
+        if (preflight(ex)) return;
+        if (!isMethod(ex, "GET")) { methodNotAllowed(ex); return; }
+        try {
+            List<com.localfilebrain.deadline.MissingDocumentDetector.MissingDoc> missing =
+                    com.localfilebrain.deadline.MissingDocumentDetector.detect(metadataStore.listAllSeries());
+            AttentionBuilder.Result r = AttentionBuilder.build(
+                    metadataStore.listTimeline(),
+                    metadataStore.listDeadlines("PENDING"),
+                    missing,
+                    metadataStore.dismissedAttentionKeys(),
+                    java.time.LocalDate.now());
+
+            List<Map<String, Object>> items = new ArrayList<>(r.items().size());
+            for (AttentionBuilder.Item it : r.items()) {
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("id",        it.id());
+                m.put("kind",      it.kind());
+                m.put("bucket",    it.bucket());
+                m.put("title",     it.title());
+                m.put("detail",    it.detail());
+                m.put("date",      it.date());
+                m.put("daysUntil", it.daysUntil());
+                m.put("fileName",  it.fileName());
+                m.put("path",      it.path());
+                m.put("docType",   it.docType());
+                items.add(m);
+            }
+            sendJson(ex, 200, map("items", items, "counts", map(
+                    "total", r.total(), "overdue", r.overdue(),
+                    "dueToday", r.dueToday(), "missing", r.missing())));
+        } catch (Exception e) {
+            log.warn("/api/attention failed", e);
+            sendError(ex, 500, "Failed to load attention items");
+        }
+    }
+
+    /**
+     * POST /api/attention/dismiss {id} — permanently clears one attention item
+     * so the panel can't grow forever. Deadline-backed items ("deadline:&lt;n&gt;")
+     * are dismissed on their own row (also clearing them from the Deadlines
+     * tab); date/missing items are keyed into {@code attention_dismissed}.
+     */
+    private void handleAttentionDismiss(HttpExchange ex) throws IOException {
+        if (preflight(ex)) return;
+        if (!isMethod(ex, "POST")) { methodNotAllowed(ex); return; }
+        try {
+            Map<?, ?> body = readJson(ex);
+            String id = strOrNull(body.get("id"));
+            if (id == null || id.isBlank()) { sendError(ex, 400, "id is required"); return; }
+            if (id.startsWith("deadline:")) {
+                long deadlineId;
+                try { deadlineId = Long.parseLong(id.substring("deadline:".length())); }
+                catch (NumberFormatException e) { sendError(ex, 400, "bad deadline id"); return; }
+                boolean ok = metadataStore.updateDeadline(
+                        deadlineId, "DISMISSED", null, null, null, null, null);
+                if (!ok) { sendError(ex, 404, "deadline not found"); return; }
+            } else {
+                metadataStore.dismissAttentionItem(id);
+            }
+            sendJson(ex, 200, map("dismissed", true));
+        } catch (Exception e) {
+            log.warn("/api/attention/dismiss failed", e);
+            sendError(ex, 500, "Failed to dismiss attention item");
+        }
     }
 
     private void handleDeadlines(HttpExchange ex) throws IOException {
@@ -1681,6 +1819,17 @@ public final class ApiServer {
 
             MoveExecutor executor = new MoveExecutor(metadataStore);
             ReorgExecutionResult result = executor.execute(targetDir, moves);
+            // The index must FOLLOW the moved files: re-point metadata (incl.
+            // cached summaries and LLM-extracted deadlines — never re-paid) and
+            // the Lucene chunks, so source chips / Timeline / attention still
+            // open the file at its new home. Best-effort per file; a healing
+            // failure never undoes a successful move.
+            for (var o : result.outcomes()) {
+                if (o.status() == ReorgExecutionResult.Status.SUCCESS
+                        && o.resolvedTo() != null) {
+                    healMovedFile(o.from().toString(), o.resolvedTo().toString());
+                }
+            }
             sendJson(ex, 200, serializeExecution(result));
         } catch (Exception e) {
             log.warn("/api/reorg/execute failed", e);
@@ -1702,6 +1851,13 @@ public final class ApiServer {
             }
             UndoExecutor undoer = new UndoExecutor(metadataStore);
             UndoExecutor.UndoResult r = undoer.undo(batchId);
+            // Mirror of the execute-side healing: an undone file moved from its
+            // reorg destination (toPath) back to its original home (fromPath).
+            for (var o : r.outcomes()) {
+                if (o.status() == ReorgExecutionResult.Status.SUCCESS) {
+                    healMovedFile(o.toPath(), o.fromPath());
+                }
+            }
             sendJson(ex, 200, serializeUndo(r));
         } catch (Exception e) {
             log.warn("/api/reorg/undo failed", e);
@@ -1853,6 +2009,60 @@ public final class ApiServer {
         }
         if (newlyIndexed > 0) {
             log.info("JIT-indexed {} new file(s) under {}", newlyIndexed, targetDir);
+        }
+    }
+
+    /**
+     * Re-points every index record of a moved file at its new location: all
+     * SQLite tables via {@link IndexMetadataStore#renamePath} (preserving the
+     * cached summary, LLM-extracted deadlines, doc type, dates, client tag —
+     * nothing is re-paid), and the Lucene chunks by re-adding them under the
+     * new path (text is stored, so re-embedding is local and free). Best-effort:
+     * a healing failure is logged, never surfaced as a move failure — the
+     * startup rescan / watcher will reconcile eventually.
+     */
+    private void healMovedFile(String oldAbs, String newAbs) {
+        try {
+            String oldC = PathNormalizer.canonical(oldAbs);
+            String newC = PathNormalizer.canonical(newAbs);
+            if (oldC.equals(newC)) return;
+
+            List<VectorStore.SearchResult> chunks = vectorStore.getChunksForFile(oldC);
+            if (!chunks.isEmpty() && embeddingClient != null) {
+                String newName = Paths.get(newC).getFileName().toString();
+                int dot = newName.lastIndexOf('.');
+                String ext = dot > 0 ? newName.substring(dot + 1).toLowerCase() : "";
+                long mtime = 0L;
+                try { mtime = Files.getLastModifiedTime(Paths.get(newC)).toMillis(); }
+                catch (Exception ignored) { /* file may still be settling */ }
+
+                List<String> texts = new ArrayList<>(chunks.size());
+                for (var c : chunks) texts.add(c.text() == null ? "" : c.text());
+                List<float[]> embeddings = embeddingClient.embedBatch(texts);
+
+                List<com.localfilebrain.model.DocumentChunk> moved = new ArrayList<>(chunks.size());
+                for (var c : chunks) {
+                    moved.add(com.localfilebrain.model.DocumentChunk.builder()
+                            .chunkId(java.util.UUID.randomUUID().toString())
+                            .sourceFilePath(newC)
+                            .fileName(newName)
+                            .fileExtension(ext)
+                            .chunkIndex(c.chunkIndex())
+                            .totalChunks(chunks.size())
+                            .text(c.text() == null ? "" : c.text())
+                            .fileLastModifiedMs(mtime)
+                            .pageStart(c.pageStart())
+                            .pageEnd(c.pageEnd())
+                            .build());
+                }
+                vectorStore.replaceBySourceFile(newC, moved, embeddings);
+                vectorStore.deleteBySourceFile(oldC);
+            }
+
+            metadataStore.renamePath(oldC, newC);
+            log.info("Reorg healing: index re-pointed {} -> {}", oldC, newC);
+        } catch (Exception e) {
+            log.warn("Reorg healing failed for {} -> {}: {}", oldAbs, newAbs, e.getMessage());
         }
     }
 

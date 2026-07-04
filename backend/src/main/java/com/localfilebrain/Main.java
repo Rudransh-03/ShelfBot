@@ -283,6 +283,14 @@ public final class Main {
                     log.info("[startup-rescan] no changes detected ({} files scanned, all up to date)",
                             result.getTotalFilesScanned());
                 }
+                // Free, local backfill so existing libraries get the new
+                // document-type chips (Library) and obligation-date Timeline
+                // WITHOUT a re-index. Both skip files already done, so this is a
+                // no-op once everything's classified/scanned. No LLM, no cost.
+                try { com.localfilebrain.ingestion.DocumentTypeClassifier.classifyAll(meta, vec); }
+                catch (Exception e) { log.warn("[startup] doc-type backfill failed: {}", e.getMessage()); }
+                try { new com.localfilebrain.timeline.LocalDateScanner(meta, vec).scanAll(); }
+                catch (Exception e) { log.warn("[startup] date backfill failed: {}", e.getMessage()); }
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
             } catch (Exception e) {
@@ -299,12 +307,23 @@ public final class Main {
                                                EmbeddingClient embeddingClient) {
         try {
             IngestionPipeline pipeline = new IngestionPipeline(config, store, vectorStore, embeddingClient);
-            // Live edits re-tag the touched file to the right client immediately
-            // (cheap single-file recompute), so a freshly-dropped client doc shows
-            // up under its client without waiting for a manual re-index.
+            // Live-dropped/edited files get the SAME free local enrichment as a
+            // full index run — doc type (Library chips), obligation + primary
+            // dates (Timeline / attention / period questions), entity identity
+            // (client suggestions), and client re-tagging. Each pass is
+            // incremental (skips already-done files), so a single watcher event
+            // only ever processes the file that just changed.
             com.localfilebrain.client.MembershipEngine membership =
                     new com.localfilebrain.client.MembershipEngine(store, vectorStore);
-            pipeline.setPostIndexHook(path -> { if (store.countClients() > 0) membership.recomputeFile(path); });
+            pipeline.setPostIndexHook(path -> {
+                try { com.localfilebrain.ingestion.DocumentTypeClassifier.classifyAll(store, vectorStore); }
+                catch (Exception e) { log.debug("[watcher] doc-type pass failed: {}", e.getMessage()); }
+                try { new com.localfilebrain.timeline.LocalDateScanner(store, vectorStore).scanAll(); }
+                catch (Exception e) { log.debug("[watcher] date pass failed: {}", e.getMessage()); }
+                try { new com.localfilebrain.client.LocalEntityScanner(store, vectorStore).scanAll(); }
+                catch (Exception e) { log.debug("[watcher] entity pass failed: {}", e.getMessage()); }
+                if (store.countClients() > 0) membership.recomputeFile(path);
+            });
             FileWatcher watcher = new FileWatcher(config, pipeline);
             watcher.start();
             return watcher;

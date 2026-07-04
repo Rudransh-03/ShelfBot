@@ -64,7 +64,10 @@ export function makeAuth({ db, jwtSecret, jwtTtlSeconds, proEmails = new Set() }
     }
     const token = header.slice('Bearer '.length).trim()
     try {
-      const payload = jwt.verify(token, jwtSecret)
+      // Pin the algorithm: we only ever sign HS256, so nothing else — however
+      // a future key setup might change — can verify. Belt against downgrade/
+      // confusion classes of JWT attacks.
+      const payload = jwt.verify(token, jwtSecret, { algorithms: ['HS256'] })
       if (payload.typ === 'acct') {
         const account = db.findAccountById(payload.sub)
         if (!account) return res.status(401).json({ error: 'Account no longer exists' })

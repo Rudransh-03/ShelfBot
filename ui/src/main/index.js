@@ -516,6 +516,21 @@ ipcMain.handle('select-folder', async () => {
   return r.canceled ? null : r.filePaths[0]
 })
 
+// First-run convenience: the common folders where personal documents actually
+// live, returned only if they exist on this machine. The onboarding pre-selects
+// these so a new user goes from sign-in → indexing in one click instead of
+// hunting through a file picker (the single biggest time-to-first-value win).
+ipcMain.handle('suggest-folders', () => {
+  const out = []
+  for (const name of ['downloads', 'documents', 'desktop']) {
+    try {
+      const p = app.getPath(name)
+      if (p && existsSync(p)) out.push(p)
+    } catch { /* path not available on this OS — skip */ }
+  }
+  return out
+})
+
 // Opens a source file in the user's default app (Preview, Word, …).
 // shell.openPath returns an empty string on success and an error message on failure.
 ipcMain.handle('open-path', async (_event, filePath) => {

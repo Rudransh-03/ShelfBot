@@ -59,8 +59,11 @@ export function openDb(path) {
     -- as the usage table so the daily-reset semantics are identical (no
     -- explicit cron — the row just doesn't exist until the next day's
     -- first start).
+    -- device_id is a PRINCIPAL key, deliberately un-FK'd TEXT: a legacy device
+    -- row id ('3') or a pro account ('acct:7') — accounts got reorg access when
+    -- paid plans landed, so the column outgrew its devices(id) reference.
     CREATE TABLE IF NOT EXISTS reorg_usage (
-      device_id    INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+      device_id    TEXT    NOT NULL,
       date         TEXT    NOT NULL,
       start_count  INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (device_id, date)
@@ -73,7 +76,7 @@ export function openDb(path) {
     -- expired rows are just ignored by the decrement query.
     CREATE TABLE IF NOT EXISTS reorg_sessions (
       id                TEXT    PRIMARY KEY,
-      device_id         INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+      device_id         TEXT    NOT NULL,   -- principal key: '3' or 'acct:7'
       budget_remaining  INTEGER NOT NULL,
       budget_initial    INTEGER NOT NULL,
       created_at        TEXT    NOT NULL,
@@ -118,6 +121,48 @@ export function openDb(path) {
   // email-based schema don't sit around confusing anyone. The proxy is
   // pre-production; no real customer data ever lived in those tables.
   try { db.exec(`DROP TABLE IF EXISTS users;`) } catch {}
+
+  // One-time migration: reorg tables created before account-reorg access have
+  // an INTEGER device_id with a FOREIGN KEY to devices(id), which rejects the
+  // 'acct:<id>' principal keys pro accounts now use. Rebuild them as free
+  // TEXT-keyed tables (data preserved; SQLite can't drop an FK in place).
+  const legacyReorg = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='reorg_usage'"
+  ).get()?.sql || ''
+  if (legacyReorg.includes('REFERENCES devices')) {
+    db.pragma('foreign_keys = OFF')
+    db.exec(`
+      BEGIN;
+      CREATE TABLE reorg_usage_new (
+        device_id    TEXT    NOT NULL,
+        date         TEXT    NOT NULL,
+        start_count  INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (device_id, date)
+      );
+      INSERT INTO reorg_usage_new SELECT CAST(device_id AS TEXT), date, start_count FROM reorg_usage;
+      DROP TABLE reorg_usage;
+      ALTER TABLE reorg_usage_new RENAME TO reorg_usage;
+
+      CREATE TABLE reorg_sessions_new (
+        id                TEXT    PRIMARY KEY,
+        device_id         TEXT    NOT NULL,
+        budget_remaining  INTEGER NOT NULL,
+        budget_initial    INTEGER NOT NULL,
+        created_at        TEXT    NOT NULL,
+        expires_at        TEXT    NOT NULL
+      );
+      INSERT INTO reorg_sessions_new
+        SELECT id, CAST(device_id AS TEXT), budget_remaining, budget_initial, created_at, expires_at
+        FROM reorg_sessions;
+      DROP TABLE reorg_sessions;
+      ALTER TABLE reorg_sessions_new RENAME TO reorg_sessions;
+      CREATE INDEX IF NOT EXISTS idx_reorg_sessions_device ON reorg_sessions(device_id);
+      CREATE INDEX IF NOT EXISTS idx_reorg_sessions_expiry ON reorg_sessions(expires_at);
+      COMMIT;
+    `)
+    db.pragma('foreign_keys = ON')
+    console.log('[proxy] migrated reorg tables to principal-keyed (accounts + devices)')
+  }
 
   return {
     /**

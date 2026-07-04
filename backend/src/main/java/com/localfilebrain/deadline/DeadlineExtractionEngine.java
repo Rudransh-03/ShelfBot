@@ -49,7 +49,7 @@ public final class DeadlineExtractionEngine {
                 {
                   "doc":         <integer document id, copied from the excerpt header>,
                   "title":       "<= 8 words, specific: who + what (e.g. 'HDFC car insurance renewal')",
-                  "description": "one short sentence of context for the reminder body",
+                  "description": "1-2 short sentences for the reminder body: what exactly is due, for whom / which period, and — whenever the excerpts state an amount tied to this obligation — that amount with its currency exactly as written (e.g. 'Professional fee of Rs. 15,000 to M. Agarwal & Associates for ITR preparation, AY 2026-27.'). Never invent an amount the excerpts don't state.",
                   "date":        "YYYY-MM-DD"  (the actual due/renewal/action date),
                   "kind":        "deadline" | "renewal" | "action",
                   "confidence":  "high" | "medium" | "low",
@@ -122,8 +122,14 @@ public final class DeadlineExtractionEngine {
         public boolean hasEntity()  { return entity != null || gstin != null || pan != null; }
     }
 
-    /** Both products of the single extraction call. */
-    public record BatchResult(List<ExtractedDeadline> deadlines, List<DocClassification> documents) {}
+    /**
+     * Both products of the single extraction call. {@code unreadable} is true
+     * when the model replied but the reply carried no parseable JSON (truncated
+     * output, a refusal, prose) — the caller must NOT treat that as "zero
+     * deadlines found" and must not persist anything for the batch.
+     */
+    public record BatchResult(List<ExtractedDeadline> deadlines, List<DocClassification> documents,
+                              boolean unreadable) {}
 
     /**
      * Extracts deadlines for one batch of documents in a single LLM call.
@@ -143,7 +149,7 @@ public final class DeadlineExtractionEngine {
     public static BatchResult extractBatchFull(List<DocPayload> docs,
                                                LocalDate today,
                                                LlmCall llm) {
-        if (docs == null || docs.isEmpty()) return new BatchResult(List.of(), List.of());
+        if (docs == null || docs.isEmpty()) return new BatchResult(List.of(), List.of(), false);
         String userPrompt = buildPrompt(docs, today);
         String raw = llm.call(SYSTEM_PROMPT, userPrompt);
 
@@ -151,6 +157,14 @@ public final class DeadlineExtractionEngine {
         for (DocPayload d : docs) validIds.add(d.docId());
 
         com.fasterxml.jackson.databind.JsonNode root = rootJson(raw);
+        if (root == null) {
+            // No readable JSON at all — the batch must be retried, not stored
+            // as "no deadlines" (storing would stamp every file scanned-with-
+            // zero and wipe whatever was previously extracted for them).
+            log.warn("Extraction reply had no readable JSON; raw head: {}",
+                    raw == null ? "" : raw.substring(0, Math.min(raw.length(), 160)));
+            return new BatchResult(List.of(), List.of(), true);
+        }
 
         List<ExtractedDeadline> deadlines = parseDeadlines(root, raw);
         List<ExtractedDeadline> keptDeadlines = new ArrayList<>(deadlines.size());
@@ -167,7 +181,7 @@ public final class DeadlineExtractionEngine {
 
         log.info("Extraction batch: {} doc(s) -> {} deadline(s), {} classified (1 LLM call)",
                 docs.size(), keptDeadlines.size(), keptDocs.size());
-        return new BatchResult(keptDeadlines, keptDocs);
+        return new BatchResult(keptDeadlines, keptDocs, false);
     }
 
     static String buildPrompt(List<DocPayload> docs, LocalDate today) {

@@ -49,21 +49,27 @@ export default function WelcomeModal() {
     if (localStorage.getItem(STORAGE_KEY) === 'true') return
 
     let cancelled = false
-    api.getConfig()
-      .then(cfg => {
-        if (cancelled) return
-        // If the user already has rootPaths set explicitly in config, they're
-        // not a fresh install — silently mark welcomed and move on.
-        const existing = Array.isArray(cfg.rootPaths) ? cfg.rootPaths : []
-        if (existing.length > 0) {
-          // We can't easily tell "user chose these" from "defaults resolved", but
-          // if /api/status reports indexedFiles > 0 elsewhere, we trust that. For
-          // safety, only auto-pre-fill — still show the modal so they can review.
-          setFolders(existing)
-        }
-        setOpen(true)
-      })
-      .catch(() => { setOpen(true); setFolders([]) })
+    ;(async () => {
+      let existing = []
+      try {
+        const cfg = await api.getConfig()
+        existing = Array.isArray(cfg.rootPaths) ? cfg.rootPaths : []
+      } catch { /* fall through to suggestions */ }
+      if (cancelled) return
+
+      if (existing.length > 0) {
+        setFolders(existing)
+      } else {
+        // Fresh install → pre-select the user's usual document folders (the ones
+        // that actually exist) so they can index in one click. They can remove
+        // any before starting.
+        try {
+          const suggested = (await window.electron?.suggestFolders?.()) || []
+          if (!cancelled) setFolders(suggested)
+        } catch { /* leave empty; user can add manually */ }
+      }
+      if (!cancelled) setOpen(true)
+    })()
 
     return () => { cancelled = true }
   }, [connected, api])
@@ -140,10 +146,11 @@ export default function WelcomeModal() {
 
         {step === 1 && (
           <div className="welcome-step">
-            <h2 className="welcome-title">Pick folders to index</h2>
+            <h2 className="welcome-title">Folders to index</h2>
             <p className="welcome-sub">
-              Rudo reads files inside these folders (and their subfolders) so it can answer your questions.
-              You can change this anytime from Settings.
+              {folders.length > 0
+                ? 'We’ve added your usual document folders. Remove any you don’t want, or add more — you can change this anytime in Settings.'
+                : 'Add the folders whose files you want Rudo to read (and their subfolders). You can change this anytime in Settings.'}
             </p>
 
             {folders.length === 0 ? (

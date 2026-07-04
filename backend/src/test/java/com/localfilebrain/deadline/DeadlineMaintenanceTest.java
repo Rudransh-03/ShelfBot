@@ -59,19 +59,30 @@ class DeadlineMaintenanceTest {
     }
 
     @Test
-    void purgeAndRoll_deletesOneTimePast_rollsRecurring_keepsFuture() {
+    void purgeAndRoll_keepsRecentMissed_purgesHandledAndAncient_rollsRecurring() {
         LocalDate today = LocalDate.of(2026, 6, 7);
-        insert("/one-time-past", "2024-03-14", "NONE");    // → deleted
+        insert("/missed-recent", "2026-05-20", "NONE");    // PENDING, 18d overdue → KEPT (needs attention)
+        insert("/missed-ancient", "2024-03-14", "NONE");   // PENDING, years past → deleted (archive history)
+        insert("/handled-recent", "2026-05-25", "NONE");   // DONE past → deleted even inside grace
         insert("/recurring-past", "2024-03-14", "YEARLY"); // → rolled to 2027-03-14
         insert("/future", "2026-12-01", "NONE");           // → untouched
         insert("/today", today.toString(), "NONE");        // → kept (not strictly past)
+
+        // Mark the handled one the way the user would in the Deadlines view.
+        Map<String, DeadlineRow> pre = store.listDeadlines("all").stream()
+                .collect(Collectors.toMap(DeadlineRow::absolutePath, Function.identity()));
+        store.updateDeadline(pre.get("/handled-recent").id(), "DONE", null, null, null, null, null);
 
         DeadlineMaintenance.purgeAndRoll(store, today);
 
         Map<String, DeadlineRow> byPath = store.listDeadlines("all").stream()
                 .collect(Collectors.toMap(DeadlineRow::absolutePath, Function.identity()));
 
-        assertFalse(byPath.containsKey("/one-time-past"), "past one-time must be deleted");
+        assertTrue(byPath.containsKey("/missed-recent"),
+                "a recently missed PENDING deadline must survive for the attention panel");
+        assertFalse(byPath.containsKey("/missed-ancient"),
+                "a pending deadline months past the grace window is archive history — deleted");
+        assertFalse(byPath.containsKey("/handled-recent"), "DONE past one-time is clutter — deleted");
         assertTrue(byPath.containsKey("/recurring-past"), "recurring must survive");
         assertEquals("2027-03-14", byPath.get("/recurring-past").dueDate(), "recurring rolled to next occurrence");
         assertEquals("2026-12-01", byPath.get("/future").dueDate(), "future untouched");

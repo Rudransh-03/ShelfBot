@@ -52,7 +52,7 @@ public final class PromptSanitizer {
      */
     public static String safeLabel(String s) {
         if (s == null || s.isBlank()) return "unknown";
-        String cleaned = s.replaceAll("\\p{Cntrl}", " ") // no newlines / control chars
+        String cleaned = s.replaceAll("[\\p{Cntrl}\\u2028\\u2029]", " ") // no newlines / control chars (incl. Unicode line separators)
                           .replaceAll("[=`]{2,}", "=")    // no forged === / ``` fences
                           .replaceAll("[<>]", " ")        // no forged <tags>
                           .trim();
@@ -70,7 +70,7 @@ public final class PromptSanitizer {
      */
     public static String safePreview(String s, int maxChars) {
         if (s == null || s.isBlank()) return "";
-        String cleaned = s.replaceAll("\\p{Cntrl}", " ")  // one line, no forged structure
+        String cleaned = s.replaceAll("[\\p{Cntrl}\\u2028\\u2029]", " ")  // one line, no forged structure
                           .replaceAll("[=`]{3,}", "=")     // no forged fences
                           .replaceAll(" {2,}", " ")
                           .trim();

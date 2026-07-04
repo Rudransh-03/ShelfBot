@@ -40,14 +40,20 @@ public final class DeadlineScanService {
 
     /** Upper bound on input text per LLM call (~70K tokens, leaving room for output). */
     private static final int MAX_BATCH_CHARS      = 280_000;
+    /** Upper bound on DOCUMENTS per LLM call. The reply must carry one
+     *  classification entry per document plus every deadline, all inside
+     *  {@link #EXTRACTION_MAX_TOKENS} output tokens — an uncapped batch (e.g. a
+     *  whole freshly-indexed folder) forces a truncated, unparseable reply. */
+    private static final int MAX_BATCH_DOCS       = 10;
     /** Cap on one document's snippet text so a single huge doc can't dominate a batch. */
     private static final int MAX_DOC_CHARS        = 100_000;
     /** Cap on candidate snippets per doc (after merging adjacent windows). */
     private static final int MAX_SNIPPETS_PER_DOC = 40;
     /** Trim length for the cheap document header. */
     private static final int HEADER_MAX           = 500;
-    /** Output token ceiling for the extraction call (batched JSON can be sizeable). */
-    private static final int EXTRACTION_MAX_TOKENS = 2000;
+    /** Output token ceiling for the extraction call (batched JSON can be sizeable;
+     *  sized for MAX_BATCH_DOCS docs with the richer 1-2 sentence descriptions). */
+    private static final int EXTRACTION_MAX_TOKENS = 3000;
 
     private final IndexMetadataStore meta;
     private final VectorStore        vectorStore;
@@ -75,18 +81,32 @@ public final class DeadlineScanService {
      * {@code dailyBudget} caps LLM calls this UTC day across runs.
      */
     public ScanResult scan(GPT4oMiniClient llm, int dailyBudget, ProgressListener listener) {
+        return scan((sys, user) -> llm.oneShot(sys, user, EXTRACTION_MAX_TOKENS),
+                dailyBudget, listener);
+    }
+
+    /** Same scan over the {@link DeadlineExtractionEngine.LlmCall} seam, so the
+     *  batching and persistence rules are testable without a network client. */
+    ScanResult scan(DeadlineExtractionEngine.LlmCall llm, int dailyBudget, ProgressListener listener) {
         if (listener == null) listener = ProgressListener.NOOP;
         LocalDate today  = LocalDate.now();
         String    dayKey = LocalDate.now(ZoneOffset.UTC).toString();
 
         // Build the work list: indexed files not yet scanned at their current hash.
+        // Template/sample documents are skipped outright (marked scanned with no
+        // items): their placeholder dates aren't real obligations, and each one
+        // would otherwise burn a paid LLM call to extract junk.
         List<FileRecord> all = meta.listIndexedFilesBySizeDesc();
         List<FileRecord> pending = new ArrayList<>();
         for (FileRecord r : all) {
             if (r.getContentHash() == null) continue;
-            if (!meta.isDeadlineScanned(r.getAbsolutePath(), r.getContentHash())) {
-                pending.add(r);
+            if (meta.isDeadlineScanned(r.getAbsolutePath(), r.getContentHash())) continue;
+            if (com.localfilebrain.util.TemplateFiles.isTemplateName(r.getFileName())) {
+                meta.replaceDeadlinesForFile(r.getAbsolutePath(), r.getFileName(),
+                        r.getContentHash(), List.of()); // marker only, zero items
+                continue;
             }
+            pending.add(r);
         }
         int total = pending.size();
         if (total == 0) {
@@ -124,7 +144,8 @@ public final class DeadlineScanService {
 
             boolean lastIteration = (i == pending.size());
             boolean wouldOverflow = entry != null && !batch.isEmpty()
-                    && batchChars + entry.chars > MAX_BATCH_CHARS;
+                    && (batchChars + entry.chars > MAX_BATCH_CHARS
+                        || batch.size() >= MAX_BATCH_DOCS);
 
             // Flush the current batch when it's full or we've reached the end.
             if (!batch.isEmpty() && (wouldOverflow || lastIteration)) {
@@ -159,7 +180,7 @@ public final class DeadlineScanService {
 
     /** Sends one batch through the extraction engine and persists results. */
     private FlushResult flush(List<DocEntry> batch, LocalDate today,
-                              GPT4oMiniClient llm, String dayKey) {
+                              DeadlineExtractionEngine.LlmCall llm, String dayKey) {
         // Assign batch-local ids and build payloads.
         List<DeadlineExtractionEngine.DocPayload> payloads = new ArrayList<>(batch.size());
         Map<Integer, DocEntry> byId = new LinkedHashMap<>();
@@ -170,12 +191,11 @@ public final class DeadlineScanService {
             payloads.add(new DeadlineExtractionEngine.DocPayload(id, e.fileName, e.header, e.snippets));
         }
 
-        List<ExtractedDeadline> items;
         DeadlineExtractionEngine.BatchResult result;
         try {
-            result = DeadlineExtractionEngine.extractBatchFull(payloads, today,
-                    (sys, user) -> llm.oneShot(sys, user, EXTRACTION_MAX_TOKENS));
-            items = result.deadlines();
+            result = DeadlineExtractionEngine.extractBatchFull(payloads, today, llm);
+            // The upstream call was made (and billed) whether or not its reply
+            // was usable, so it always counts against the daily budget.
             meta.incrementDeadlineCallsToday(dayKey);
         } catch (GPT4oMiniClient.LLMException e) {
             String msg = e.getMessage() == null ? "" : e.getMessage().toLowerCase();
@@ -192,6 +212,18 @@ public final class DeadlineScanService {
             log.warn("Deadline extraction call failed: {}", e.getMessage());
             return new FlushResult(0, Stop.ERROR, e.getMessage());
         }
+
+        if (result.unreadable()) {
+            // The reply arrived but carried no readable JSON (truncated output,
+            // a refusal, prose). Stop WITHOUT stamping these files scanned and
+            // WITHOUT touching their stored deadlines — treating this as "zero
+            // deadlines" would silently wipe previously-extracted ones.
+            log.warn("Deadline extraction reply was unreadable for a {}-doc batch; nothing persisted",
+                    batch.size());
+            return new FlushResult(0, Stop.ERROR,
+                    "The AI's reply couldn't be read, so nothing was saved for this batch. Run the scan again.");
+        }
+        List<ExtractedDeadline> items = result.deadlines();
 
         // Group results by their (batch-local) document id and persist per file.
         Map<Integer, List<ExtractedDeadline>> grouped = new LinkedHashMap<>();

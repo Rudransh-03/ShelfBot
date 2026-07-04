@@ -198,9 +198,17 @@ function ChatLibrary({ onNav, onOpenSearch }) {
   )
 }
 
-export default function Sidebar({ active, onNav, connected, collapsed = false, onToggle, onOpenSearch }) {
-  const { stats, indexing, triggerIndex, deadlineStats, scanningDeadlines } = useApp()
+const BellIcon = () => (
+  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+    <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+  </svg>
+)
+
+export default function Sidebar({ active, onNav, connected, collapsed = false, onToggle, onOpenSearch, onOpenAttention }) {
+  const { stats, indexing, triggerIndex, deadlineStats, scanningDeadlines, attention } = useApp()
   const dueBadge = deadlineStats?.openUpcoming ?? 0
+  const attnCount = attention?.counts?.total ?? 0
 
   const mascotState = !connected ? 'sleeping' : indexing ? 'thinking' : 'idle'
 
@@ -232,6 +240,24 @@ export default function Sidebar({ active, onNav, connected, collapsed = false, o
           </div>
         )}
       </div>
+
+      {/* "Needs attention" — always visible, badge counts items requiring
+          action. Data is local + deterministic (never a guess), so the badge
+          can be trusted at a glance. */}
+      <button
+        className={`nav-item attn-btn${attnCount > 0 ? ' has-items' : ''}`}
+        onClick={onOpenAttention}
+        disabled={!connected}
+        title={collapsed
+          ? `Needs attention${attnCount > 0 ? ` (${attnCount})` : ''}`
+          : (attnCount > 0 ? `${attnCount} item${attnCount === 1 ? '' : 's'} need your attention` : 'Nothing needs you right now')}
+      >
+        <BellIcon />
+        {!collapsed && <span>Needs attention</span>}
+        {attnCount > 0 && (
+          <span className={`nav-badge attn-badge${collapsed ? ' dot' : ''}`}>{collapsed ? '' : attnCount}</span>
+        )}
+      </button>
 
       {!collapsed && <div className="sb-section">Workspace</div>}
 

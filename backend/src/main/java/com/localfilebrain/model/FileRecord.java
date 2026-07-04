@@ -28,6 +28,8 @@ public final class FileRecord {
     private final long   tokenCount;    // estimated tokens consumed during indexing
     private final Instant lastIndexedAt;
     private final String errorMessage;  // populated if status = FAILED
+    private final String docType;       // auto-classified document type (Invoice, Bank statement…); null until classified
+    private final String primaryDate;   // the document's own issue/period date (ISO yyyy-MM-dd); null when unknown
 
     private FileRecord(Builder builder) {
         this.absolutePath   = builder.absolutePath;
@@ -41,6 +43,8 @@ public final class FileRecord {
         this.tokenCount     = builder.tokenCount;
         this.lastIndexedAt  = builder.lastIndexedAt;
         this.errorMessage   = builder.errorMessage;
+        this.docType        = builder.docType;
+        this.primaryDate    = builder.primaryDate;
     }
 
     public String   getAbsolutePath()   { return absolutePath; }
@@ -54,6 +58,8 @@ public final class FileRecord {
     public long     getTokenCount()     { return tokenCount; }
     public Instant  getLastIndexedAt()  { return lastIndexedAt; }
     public String   getErrorMessage()   { return errorMessage; }
+    public String   getDocType()        { return docType; }
+    public String   getPrimaryDate()    { return primaryDate; }
 
     public static Builder builder() { return new Builder(); }
 
@@ -69,6 +75,8 @@ public final class FileRecord {
         private long   tokenCount;
         private Instant lastIndexedAt;
         private String errorMessage;
+        private String docType;
+        private String primaryDate;
 
         private Builder() {}
 
@@ -83,6 +91,8 @@ public final class FileRecord {
         public Builder tokenCount(long v)        { this.tokenCount = v; return this; }
         public Builder lastIndexedAt(Instant v)  { this.lastIndexedAt = v; return this; }
         public Builder errorMessage(String v)    { this.errorMessage = v; return this; }
+        public Builder docType(String v)         { this.docType = v; return this; }
+        public Builder primaryDate(String v)     { this.primaryDate = v; return this; }
 
         public FileRecord build() { return new FileRecord(this); }
     }

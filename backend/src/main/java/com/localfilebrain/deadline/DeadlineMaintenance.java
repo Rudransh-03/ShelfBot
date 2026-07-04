@@ -12,12 +12,14 @@ import java.util.List;
 
 /**
  * Startup housekeeping for extracted deadlines. Run once when the app opens:
- * past deadlines aren't actionable anymore, so
- *   - one-time (non-recurring) ones are deleted, and
- *   - recurring ones are rolled forward to their next occurrence,
- * so a yearly renewal stays in the upcoming list instead of vanishing after the
- * first year. Keeps both the "to set" list and the "reminders set" list showing
- * only things still ahead, with no past clutter to scroll past.
+ *   - one-time (non-recurring) past deadlines the user already HANDLED
+ *     (DONE/DISMISSED) are deleted — pure clutter once their date is gone.
+ *     A PENDING past deadline is deliberately KEPT: it's a missed obligation,
+ *     which is exactly what the Needs-attention panel exists to surface; it
+ *     leaves only when the user marks it done or dismisses it.
+ *   - recurring ones are rolled forward to their next occurrence, so a yearly
+ *     renewal stays in the upcoming list instead of vanishing after the first
+ *     year (a missed period is the MissingDocumentDetector's job to flag).
  */
 public final class DeadlineMaintenance {
 
@@ -59,11 +61,18 @@ public final class DeadlineMaintenance {
      * Returns a short summary for logging. Never throws — housekeeping must not
      * block startup.
      */
+    /** How long a MISSED (pending, past-due) one-time deadline stays visible
+     *  before it's treated as archive history. Recently-missed items are what
+     *  the Needs-attention panel exists for; months-old ones are either
+     *  pre-app document history or consciously ignored. */
+    public static final int MISSED_GRACE_DAYS = 60;
+
     public static String purgeAndRoll(IndexMetadataStore store, LocalDate today) {
         String todayIso = today.toString();
         int deleted = 0, rolled = 0;
         try {
-            deleted = store.deleteOneTimePastDeadlines(todayIso);
+            deleted = store.deleteOneTimePastDeadlines(
+                    todayIso, today.minusDays(MISSED_GRACE_DAYS).toString());
             List<DeadlineRow> recurring = store.listRecurringPastDeadlines(todayIso);
             for (DeadlineRow r : recurring) {
                 try {

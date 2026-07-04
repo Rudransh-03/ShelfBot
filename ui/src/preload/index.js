@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer } from 'electron'
 
 contextBridge.exposeInMainWorld('electron', {
   selectFolder:   ()     => ipcRenderer.invoke('select-folder'),
+  suggestFolders: ()     => ipcRenderer.invoke('suggest-folders'),
   openPath:       (path) => ipcRenderer.invoke('open-path', path),
   minimizeWindow: ()     => ipcRenderer.send('window-minimize'),
   maximizeWindow: ()     => ipcRenderer.send('window-maximize'),

@@ -241,19 +241,22 @@ export default function Deadlines({ active }) {
     if (E?.openPath) E.openPath(item.path).then(err => { if (err) toast(err, 'e') })
   }, [toast])
 
-  // Open = pending & upcoming. Overdue and undated are hidden — deadlines that
-  // were already in the past when their doc was indexed aren't actionable (the
-  // user started using the app later), and there's no point making them scroll
-  // past hundreds of them. Items that lapse while in use simply drop off here.
+  // Open = pending items that still need the user: recently MISSED (overdue),
+  // due soon, and upcoming. Overdue items survive here so they can be marked
+  // done/dismissed — they're what "needs attention" means; the backend purge
+  // caps how far back they reach (months-old archive dates never surface, so
+  // a first scan of old documents can't flood this list). Undated stay hidden.
   // "Reminders set" = items the user has put on their calendar.
   const { openItems, remindedItems, stat } = useMemo(() => {
     const all = items ?? []
-    const open = all.filter(it => it.status === 'PENDING' && (it.bucket === 'DUE_SOON' || it.bucket === 'UPCOMING'))
+    const open = all.filter(it => it.status === 'PENDING'
+      && (it.bucket === 'OVERDUE' || it.bucket === 'DUE_SOON' || it.bucket === 'UPCOMING'))
     const reminded = all.filter(it => it.status === 'DONE' || it.reminderSet)
     return {
       openItems: open,
       remindedItems: reminded,
       stat: {
+        overdue:   open.filter(it => it.bucket === 'OVERDUE').length,
         dueSoon:   open.filter(it => it.bucket === 'DUE_SOON').length,
         upcoming:  open.filter(it => it.bucket === 'UPCOMING').length,
         reminders: reminded.length,
@@ -335,6 +338,9 @@ export default function Deadlines({ active }) {
 
         {/* Summary chips */}
         <div className="dl-stats">
+          {stat.overdue > 0 && (
+            <div className="dl-stat overdue"><div className="dl-stat-n">{stat.overdue}</div><div className="dl-stat-l">Overdue</div></div>
+          )}
           <div className="dl-stat soon"><div className="dl-stat-n">{stat.dueSoon}</div><div className="dl-stat-l">Due soon</div></div>
           <div className="dl-stat up"><div className="dl-stat-n">{stat.upcoming}</div><div className="dl-stat-l">Upcoming</div></div>
           <div className="dl-stat"><div className="dl-stat-n">{stat.reminders}</div><div className="dl-stat-l">Reminders set</div></div>

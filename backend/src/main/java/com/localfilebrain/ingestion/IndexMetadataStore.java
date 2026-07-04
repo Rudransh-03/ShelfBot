@@ -238,6 +238,16 @@ public final class IndexMetadataStore implements AutoCloseable {
                     dismissed_at TEXT NOT NULL
                 )
                 """);
+            // "Needs attention" items the user cleared, by stable item key
+            // ("date:<path>|<date>" / "missing:<series>|<period>"), so a
+            // handled item never resurfaces. Deadline-backed items are NOT
+            // stored here — clearing those sets the deadline row DISMISSED.
+            stmt.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS attention_dismissed (
+                    item_key     TEXT PRIMARY KEY,
+                    dismissed_at TEXT NOT NULL
+                )
+                """);
 
             // Undo log for executed reorg batches. One row per file move.
             // Written BEFORE the move actually happens so a crash mid-move
@@ -261,12 +271,55 @@ public final class IndexMetadataStore implements AutoCloseable {
                     ON reorg_undo_log(batch_id)
                 """);
 
+            // Obligation dates (due / expiry / renewal) extracted by the free
+            // local LocalDateScanner. Powers the Timeline view.
+            stmt.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS document_dates (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    absolute_path  TEXT    NOT NULL,
+                    file_name      TEXT    NOT NULL,
+                    content_hash   TEXT    NOT NULL,
+                    event_date     TEXT    NOT NULL,
+                    title          TEXT    NOT NULL,
+                    source_excerpt TEXT,
+                    created_at     TEXT    NOT NULL
+                )
+                """);
+            stmt.executeUpdate("CREATE INDEX IF NOT EXISTS idx_dates_path ON document_dates(absolute_path)");
+            stmt.executeUpdate("CREATE INDEX IF NOT EXISTS idx_dates_date ON document_dates(event_date)");
+            // Per-file "scanned for dates at this hash" marker so the local date
+            // scan is incremental — even a file that yielded zero dates is never
+            // re-scanned until its content changes.
+            stmt.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS date_scan (
+                    absolute_path TEXT    PRIMARY KEY,
+                    content_hash  TEXT    NOT NULL,
+                    scanned_at    TEXT    NOT NULL
+                )
+                """);
+
             // Lightweight migration: pre-existing DBs from before token tracking
             // won't have the column. Adding it is idempotent — SQLite throws
             // "duplicate column" if it already exists, which we swallow.
             try {
                 stmt.executeUpdate("ALTER TABLE file_index ADD COLUMN token_count INTEGER NOT NULL DEFAULT 0");
                 log.info("Added token_count column to existing file_index table");
+            } catch (SQLException ignored) {
+                // Column already exists — nothing to do.
+            }
+            // Same idempotent migration for the auto-classified document type.
+            try {
+                stmt.executeUpdate("ALTER TABLE file_index ADD COLUMN doc_type TEXT");
+                log.info("Added doc_type column to existing file_index table");
+            } catch (SQLException ignored) {
+                // Column already exists — nothing to do.
+            }
+            // And for the document's primary date (its own issue/period date,
+            // ISO yyyy-MM-dd) — extracted free+locally by the date scan; makes
+            // "documents from February 2024" questions deterministic.
+            try {
+                stmt.executeUpdate("ALTER TABLE file_index ADD COLUMN primary_date TEXT");
+                log.info("Added primary_date column to existing file_index table");
             } catch (SQLException ignored) {
                 // Column already exists — nothing to do.
             }
@@ -525,6 +578,197 @@ public final class IndexMetadataStore implements AutoCloseable {
         // have entirely different dates, so drop its items and its scan marker
         // — the deadline scan will re-extract this file on its next pass.
         clearDeadlinesForFile(record.getAbsolutePath());
+        // Same for the (free, local) timeline dates, auto doc-type, and primary
+        // date: re-processed content gets re-scanned / re-classified next pass.
+        clearDatesForFile(record.getAbsolutePath());
+        clearDocType(record.getAbsolutePath());
+        try { setPrimaryDate(record.getAbsolutePath(), null); } catch (Exception ignored) { }
+    }
+
+    // -------------------------------------------------------------------------
+    // Document type (auto-classification → Library filter chips)
+    // -------------------------------------------------------------------------
+
+    /** Stores the auto-classified type for a file (e.g. "Invoice"). */
+    public synchronized void setDocType(String absolutePath, String docType) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "UPDATE file_index SET doc_type = ? WHERE absolute_path = ?")) {
+            ps.setString(1, docType);
+            ps.setString(2, absolutePath);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to set doc_type for: " + absolutePath, e);
+        }
+    }
+
+    /** Clears a file's type so it is re-classified after re-processing. */
+    public synchronized void clearDocType(String absolutePath) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "UPDATE file_index SET doc_type = NULL WHERE absolute_path = ?")) {
+            ps.setString(1, absolutePath);
+            ps.executeUpdate();
+        } catch (SQLException ignored) { /* best-effort */ }
+    }
+
+    // Every table that keys rows by a file's absolute path. When a reorg moves a
+    // file, ALL of these must follow it — otherwise chips can't open the file,
+    // and cached summaries / LLM-extracted deadlines would be re-paid for.
+    private static final String[] PATH_KEYED_TABLES = {
+            "file_index", "file_vectors", "file_summaries", "document_deadlines",
+            "deadline_scan", "document_series", "file_client", "document_entity",
+            "document_dates", "date_scan"
+    };
+
+    /**
+     * Re-points every record of {@code oldPath} at {@code newPath} — used after
+     * a reorg move (and its undo) so the index follows the file instead of
+     * dangling at the old location. Atomic across all tables; the file name is
+     * unchanged (reorg moves between folders, it never renames).
+     */
+    public synchronized void renamePath(String oldPath, String newPath) {
+        try {
+            connection.setAutoCommit(false);
+            for (String table : PATH_KEYED_TABLES) {
+                try (PreparedStatement ps = connection.prepareStatement(
+                        "UPDATE " + table + " SET absolute_path = ? WHERE absolute_path = ?")) {
+                    ps.setString(1, newPath);
+                    ps.setString(2, oldPath);
+                    ps.executeUpdate();
+                }
+            }
+            connection.commit();
+        } catch (SQLException e) {
+            try { connection.rollback(); } catch (SQLException ignored) {}
+            throw new MetadataStoreException(
+                    "Failed to rename path " + oldPath + " -> " + newPath, e);
+        } finally {
+            try { connection.setAutoCommit(true); } catch (SQLException ignored) {}
+        }
+    }
+
+    /** Stores the file's primary date (ISO yyyy-MM-dd, or null when none found). */
+    public synchronized void setPrimaryDate(String absolutePath, String isoDate) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "UPDATE file_index SET primary_date = ? WHERE absolute_path = ?")) {
+            ps.setString(1, isoDate);
+            ps.setString(2, absolutePath);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to set primary_date for: " + absolutePath, e);
+        }
+    }
+
+    /** Indexed-file counts grouped by auto type, for the Library filter chips. */
+    public synchronized java.util.LinkedHashMap<String, Integer> docTypeCounts() {
+        java.util.LinkedHashMap<String, Integer> out = new java.util.LinkedHashMap<>();
+        String sql = "SELECT COALESCE(doc_type, 'Other') AS t, COUNT(*) AS n "
+                   + "FROM file_index WHERE status = 'INDEXED' GROUP BY t ORDER BY n DESC";
+        try (Statement st = connection.createStatement(); ResultSet rs = st.executeQuery(sql)) {
+            while (rs.next()) out.put(rs.getString("t"), rs.getInt("n"));
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to count doc types", e);
+        }
+        return out;
+    }
+
+    // -------------------------------------------------------------------------
+    // Timeline dates (free local extraction → Timeline view)
+    // -------------------------------------------------------------------------
+
+    /** A freshly-extracted obligation date (id/timestamp assigned by the store). */
+    public record NewDate(String eventDate, String title, String sourceExcerpt) {}
+
+    /** One stored timeline date row. */
+    public record DateRow(long id, String absolutePath, String fileName,
+                          String eventDate, String title, String sourceExcerpt,
+                          String docType) {}
+
+    /** True if {@code absolutePath} was already date-scanned at {@code contentHash}. */
+    public synchronized boolean isDateScanned(String absolutePath, String contentHash) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT content_hash FROM date_scan WHERE absolute_path = ?")) {
+            ps.setString(1, absolutePath);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() && contentHash != null && contentHash.equals(rs.getString("content_hash"));
+            }
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to check date scan for: " + absolutePath, e);
+        }
+    }
+
+    /** Replaces a file's stored dates and records the scan marker, atomically. */
+    public synchronized void replaceDatesForFile(String absolutePath, String fileName,
+                                                 String contentHash, List<NewDate> events) {
+        String now = Instant.now().toString();
+        try {
+            connection.setAutoCommit(false);
+            try (PreparedStatement del = connection.prepareStatement(
+                    "DELETE FROM document_dates WHERE absolute_path = ?")) {
+                del.setString(1, absolutePath);
+                del.executeUpdate();
+            }
+            try (PreparedStatement ins = connection.prepareStatement(
+                    "INSERT INTO document_dates (absolute_path, file_name, content_hash, "
+                  + "event_date, title, source_excerpt, created_at) VALUES (?,?,?,?,?,?,?)")) {
+                for (NewDate e : events) {
+                    ins.setString(1, absolutePath);
+                    ins.setString(2, fileName);
+                    ins.setString(3, contentHash);
+                    ins.setString(4, e.eventDate());
+                    ins.setString(5, e.title());
+                    ins.setString(6, truncate(e.sourceExcerpt(), 300));
+                    ins.setString(7, now);
+                    ins.addBatch();
+                }
+                ins.executeBatch();
+            }
+            try (PreparedStatement mk = connection.prepareStatement(
+                    "INSERT INTO date_scan (absolute_path, content_hash, scanned_at) VALUES (?,?,?) "
+                  + "ON CONFLICT(absolute_path) DO UPDATE SET content_hash = excluded.content_hash, "
+                  + "scanned_at = excluded.scanned_at")) {
+                mk.setString(1, absolutePath);
+                mk.setString(2, contentHash);
+                mk.setString(3, now);
+                mk.executeUpdate();
+            }
+            connection.commit();
+        } catch (SQLException e) {
+            try { connection.rollback(); } catch (SQLException ignored) {}
+            throw new MetadataStoreException("Failed to store dates for: " + absolutePath, e);
+        } finally {
+            try { connection.setAutoCommit(true); } catch (SQLException ignored) {}
+        }
+    }
+
+    /** Drops a file's stored dates + scan marker (called on re-process / delete). */
+    public synchronized void clearDatesForFile(String absolutePath) {
+        try (PreparedStatement a = connection.prepareStatement(
+                "DELETE FROM document_dates WHERE absolute_path = ?");
+             PreparedStatement b = connection.prepareStatement(
+                "DELETE FROM date_scan WHERE absolute_path = ?")) {
+            a.setString(1, absolutePath); a.executeUpdate();
+            b.setString(1, absolutePath); b.executeUpdate();
+        } catch (SQLException ignored) { /* best-effort */ }
+    }
+
+    /** All timeline dates, chronological, joined to each file's auto doc type. */
+    public synchronized List<DateRow> listTimeline() {
+        String sql = "SELECT d.id, d.absolute_path, d.file_name, d.event_date, d.title, "
+                   + "d.source_excerpt, f.doc_type "
+                   + "FROM document_dates d LEFT JOIN file_index f ON f.absolute_path = d.absolute_path "
+                   + "ORDER BY d.event_date ASC";
+        List<DateRow> out = new ArrayList<>();
+        try (Statement st = connection.createStatement(); ResultSet rs = st.executeQuery(sql)) {
+            while (rs.next()) {
+                out.add(new DateRow(
+                        rs.getLong("id"), rs.getString("absolute_path"), rs.getString("file_name"),
+                        rs.getString("event_date"), rs.getString("title"),
+                        rs.getString("source_excerpt"), rs.getString("doc_type")));
+            }
+        } catch (SQLException e) {
+            throw new MetadataStoreException("Failed to list timeline", e);
+        }
+        return out;
     }
 
     /**
@@ -582,6 +826,7 @@ public final class IndexMetadataStore implements AutoCloseable {
         deleteFileVector(absolutePath);
         deleteSummary(absolutePath);
         clearDeadlinesForFile(absolutePath);
+        clearDatesForFile(absolutePath); // drop its timeline dates too
         unassignFile(absolutePath); // the file is gone — drop its client assignment
     }
 
@@ -1159,6 +1404,24 @@ public final class IndexMetadataStore implements AutoCloseable {
         return out;
     }
 
+    /** Permanently clears one "Needs attention" item (date/missing kinds) by its stable key. */
+    public synchronized void dismissAttentionItem(String itemKey) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "INSERT OR IGNORE INTO attention_dismissed (item_key, dismissed_at) VALUES (?, ?)")) {
+            ps.setString(1, itemKey); ps.setString(2, Instant.now().toString());
+            ps.executeUpdate();
+        } catch (SQLException e) { throw new MetadataStoreException("Failed to dismiss attention item", e); }
+    }
+
+    public synchronized java.util.Set<String> dismissedAttentionKeys() {
+        java.util.Set<String> out = new java.util.HashSet<>();
+        try (PreparedStatement ps = connection.prepareStatement("SELECT item_key FROM attention_dismissed");
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) out.add(rs.getString(1));
+        } catch (SQLException e) { throw new MetadataStoreException("Failed to list dismissed attention items", e); }
+        return out;
+    }
+
     // -------------------------------------------------------------------------
     // Per-client workspaces
     // -------------------------------------------------------------------------
@@ -1457,12 +1720,23 @@ public final class IndexMetadataStore implements AutoCloseable {
      * actionable. Recurring ones are NOT deleted here (they're rolled forward
      * separately). ISO dates compare correctly as strings. Returns rows removed.
      */
-    public synchronized int deleteOneTimePastDeadlines(String todayIso) {
+    /**
+     * Purges past one-time deadlines with status-aware retention:
+     * handled items (DONE/DISMISSED) go as soon as their date is past — pure
+     * clutter — but a PENDING past deadline is a MISSED obligation (the most
+     * attention-worthy thing the app knows) and survives until
+     * {@code pendingCutoffIso}. Beyond that it's pre-app archive history
+     * (a first scan of old documents extracts hundreds of long-past dates)
+     * or something the user has ignored for months — either way, clutter.
+     */
+    public synchronized int deleteOneTimePastDeadlines(String todayIso, String pendingCutoffIso) {
         String sql = "DELETE FROM document_deadlines "
                    + "WHERE due_date IS NOT NULL AND due_date < ? "
-                   + "AND (recurring IS NULL OR recurring = 'NONE')";
+                   + "AND (recurring IS NULL OR recurring = 'NONE') "
+                   + "AND (status IN ('DONE','DISMISSED') OR due_date < ?)";
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
             ps.setString(1, todayIso);
+            ps.setString(2, pendingCutoffIso);
             return ps.executeUpdate();
         } catch (SQLException e) {
             throw new MetadataStoreException("Failed to purge past one-time deadlines", e);
@@ -1556,6 +1830,20 @@ public final class IndexMetadataStore implements AutoCloseable {
             // Older row without the column — leave at 0.
         }
 
+        String docType = null;
+        try {
+            docType = rs.getString("doc_type");
+        } catch (SQLException ignored) {
+            // Older row without the column — leave null (unclassified).
+        }
+
+        String primaryDate = null;
+        try {
+            primaryDate = rs.getString("primary_date");
+        } catch (SQLException ignored) {
+            // Older row without the column — leave null (unknown).
+        }
+
         return FileRecord.builder()
             .absolutePath(rs.getString("absolute_path"))
             .fileName(rs.getString("file_name"))
@@ -1568,6 +1856,8 @@ public final class IndexMetadataStore implements AutoCloseable {
             .tokenCount(tokenCount)
             .lastIndexedAt(lastIndexed)
             .errorMessage(rs.getString("error_message"))
+            .docType(docType)
+            .primaryDate(primaryDate)
             .build();
     }
 

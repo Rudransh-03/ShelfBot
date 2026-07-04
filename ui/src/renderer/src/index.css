@@ -3814,3 +3814,164 @@ input:focus-visible {
 .dl-field-row { display: flex; gap: 12px; }
 .dl-field-row .dl-field { flex: 1; }
 .dl-modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 6px; }
+
+/* ───────────────────────────────────────────────────────────────────────────
+   Library: document-type filter chips + per-file type pill (self-sorting)
+   ─────────────────────────────────────────────────────────────────────────── */
+.type-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-bottom: 12px;
+}
+.type-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background .15s, border-color .15s, color .15s;
+}
+.type-chip:hover { border-color: var(--border-hi); color: var(--text-1); }
+.type-chip.active {
+  background: var(--accent-faint);
+  border-color: var(--border-hi);
+  color: var(--accent-bright);
+}
+.type-chip-count {
+  font-size: 11px;
+  color: var(--text-4);
+  background: rgba(140, 180, 255, 0.08);
+  border-radius: 999px;
+  padding: 1px 6px;
+  min-width: 16px;
+  text-align: center;
+}
+.type-chip.active .type-chip-count { color: var(--accent-bright); }
+
+.file-type-pill {
+  display: inline-block;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .2px;
+  color: var(--accent-bright);
+  background: var(--accent-faint);
+  border: 1px solid var(--border-hi);
+  border-radius: 5px;
+  padding: 1px 6px;
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+   Needs attention — sidebar button + panel
+   ─────────────────────────────────────────────────────────────────────────── */
+.attn-btn { position: relative; }
+.attn-btn.has-items { color: var(--text-1); }
+.attn-badge { background: var(--warn); color: #1a1205; }
+
+.attn-modal { max-width: 560px; width: min(560px, 92vw); }
+
+.attn-body {
+  max-height: 52vh;
+  overflow-y: auto;
+  margin: 6px 0 10px;
+  padding-right: 4px;
+}
+
+.attn-group { margin-top: 12px; }
+.attn-group:first-child { margin-top: 2px; }
+.attn-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .3px;
+  text-transform: uppercase;
+  margin-bottom: 7px;
+}
+.attn-group-head.soon { color: var(--warn); }
+.attn-group-head.over { color: var(--red-deep); }
+.attn-group-head.miss { color: var(--text-3); }
+.attn-group-n {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3);
+  background: var(--surface-3);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+
+.attn-list { list-style: none; margin: 0; padding: 0; }
+.attn-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 8px 2px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.attn-row:last-child { border-bottom: none; }
+.attn-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  margin-top: 5px;
+  flex: none;
+  background: var(--text-4);
+}
+.attn-row.attn-due_today .attn-dot { background: var(--warn); }
+.attn-row.attn-overdue   .attn-dot { background: var(--red-deep); }
+
+.attn-main { min-width: 0; flex: 1; }
+.attn-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.attn-when { font-size: 11.5px; font-weight: 500; color: var(--text-3); }
+.attn-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 3px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  font-size: 12px;
+  cursor: pointer;
+  max-width: 100%;
+}
+.attn-file:hover { color: var(--accent-bright); text-decoration: underline; }
+.attn-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attn-detail { font-size: 12px; color: var(--text-3); margin-top: 3px; line-height: 1.5; }
+
+/* Per-row "handled" button — clears the item for good. */
+.attn-clear {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px; height: 26px;
+  margin-top: 1px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-4);
+  cursor: pointer;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.attn-clear:hover:not(:disabled) {
+  color: var(--ok, #4ade80);
+  border-color: currentColor;
+  background: rgba(74, 222, 128, .08);
+}
+.attn-clear:disabled { opacity: .5; cursor: default; }

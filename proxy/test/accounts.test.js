@@ -151,6 +151,26 @@ test('reorg is blocked for trial accounts (chat-only)', async () => {
   assert.equal((await r.json()).reason, 'reorg_not_in_trial')
 })
 
+test('pro accounts CAN start reorgs (with pro cap) and use the session', async () => {
+  const { url } = await startProxy({ PRO_EMAILS: 'boss@example.com', PRO_REORG_DAILY: '2' })
+  const { token } = await (await signIn(url, code('google-sub-pro', 'boss@example.com'))).json()
+  const r = await fetch(`${url}/reorg/start`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({}),
+  })
+  assert.equal(r.status, 200, 'pro account may start a reorg')
+  const b = await r.json()
+  assert.equal(b.plan, 'pro')
+  assert.equal(b.usage.limit, 2)
+  // The session it opened is usable by the same account.
+  const llm = await fetch(`${url}/reorg/llm`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ sessionId: b.sessionId, model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'hi' }] }),
+  })
+  assert.equal(llm.status, 200, 'pro account can draw from its reorg session')
+})
+
 test('an expired trial blocks chat with 402', async () => {
   const { url } = await startProxy({ TRIAL_WINDOW_HOURS: '0' }) // any trial is already expired
   const { token } = await (await signIn(url, code('google-sub-7', 'frank@example.com'))).json()

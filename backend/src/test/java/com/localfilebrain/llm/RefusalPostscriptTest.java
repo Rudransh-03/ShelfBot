@@ -61,4 +61,35 @@ class RefusalPostscriptTest {
     void nullSafe() {
         assertNull(GPT4oMiniClient.stripRefusalPostscript(null));
     }
+
+    // ── stripInternalJargon: "the excerpts" must never reach the user ────────
+
+    @Test
+    void jargon_leadingFromTheExcerpts_rewritten() {
+        String out = GPT4oMiniClient.stripInternalJargon(
+                "From the excerpts, Rohan Mehta is a graphic designer.");
+        assertEquals("From your files, Rohan Mehta is a graphic designer.", out);
+    }
+
+    @Test
+    void jargon_sentenceStart_recapitalized() {
+        String out = GPT4oMiniClient.stripInternalJargon(
+                "The excerpts do not mention a car insurance premium.");
+        assertEquals("Your files do not mention a car insurance premium.", out);
+    }
+
+    @Test
+    void jargon_providedVariants_rewritten() {
+        assertEquals("Based on your files, the rent is 40,000.",
+                GPT4oMiniClient.stripInternalJargon("Based on the provided excerpts, the rent is 40,000."));
+        assertEquals("Your files show two resumes.",
+                GPT4oMiniClient.stripInternalJargon("these excerpts provided show two resumes."));
+    }
+
+    @Test
+    void jargon_cleanAnswerAndFilenamesUntouched() {
+        String input = "From AcmeCorp-Invoice-330.pdf: the total due is 10,62,000.";
+        assertEquals(input, GPT4oMiniClient.stripInternalJargon(input));
+        assertNull(GPT4oMiniClient.stripInternalJargon(null));
+    }
 }

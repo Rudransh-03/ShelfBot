@@ -539,7 +539,12 @@ export default function Chat({ active }) {
         const next = m.slice()
         const last = next[next.length - 1]
         if (last && last.role === 'ai') {
-          next[next.length - 1] = { ...last, streaming: false, ...patch }
+          const merged = { ...last, streaming: false, ...patch }
+          // Safety net: if nothing streamed but the done event carried the
+          // answer, show it — a reply must never render as an empty bubble.
+          if (!merged.text && patch.answer) merged.text = patch.answer
+          delete merged.answer
+          next[next.length - 1] = merged
         }
         return next
       })
@@ -555,11 +560,11 @@ export default function Chat({ active }) {
         conversationId: activeConversationId,
         clientId,
         onToken: appendToken,
-        onDone:  ({ sources = [], found = true, conversationId: cid, clarify, scope }) => {
+        onDone:  ({ sources = [], found = true, answer, conversationId: cid, clarify, scope }) => {
           // `clarify` (array of {id,name}) means Rudo needs to know which client;
           // we stash it + the question on the bubble so its chips can re-ask.
           finalize({ sources, variant: !found ? 'not-found' : undefined,
-                     clarify, clarifyQuestion: question, scope })
+                     answer, clarify, clarifyQuestion: question, scope })
           // Adopt the thread id without triggering a reload of the messages
           // we just streamed (loadedIdRef is set before the state update).
           // Only adopt the (possibly newly-created) thread id if the user is

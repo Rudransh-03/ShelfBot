@@ -97,6 +97,28 @@ class DeadlineExtractionEngineTest {
     }
 
     @Test
+    void unreadableReplyIsFlagged_soCallerNeverStoresItAsZeroDeadlines() {
+        // A refusal / prose reply: no JSON at all.
+        var refusal = DeadlineExtractionEngine.extractBatchFull(
+                List.of(DOC1), LocalDate.now(), (s, u) -> "I'm sorry, I can't help with that.");
+        assertTrue(refusal.unreadable());
+
+        // Output truncated mid-JSON (the max_tokens ceiling): must be flagged,
+        // even though it contains braces.
+        var truncated = DeadlineExtractionEngine.extractBatchFull(
+                List.of(DOC1), LocalDate.now(),
+                (s, u) -> "{\"deadlines\":[{\"doc\":1,\"title\":\"GST filing\",\"date\":\"2026-07-31\"},{\"doc\":1,\"ti");
+        assertTrue(truncated.unreadable());
+
+        // A VALID empty result is not "unreadable" — genuinely deadline-free
+        // batches must still be stamped scanned.
+        var empty = DeadlineExtractionEngine.extractBatchFull(
+                List.of(DOC1), LocalDate.now(), (s, u) -> "{\"deadlines\":[],\"documents\":[]}");
+        assertFalse(empty.unreadable());
+        assertTrue(empty.deadlines().isEmpty());
+    }
+
+    @Test
     void parsesDocumentEntityAndValidatesIds() {
         String reply = """
             { "deadlines": [],

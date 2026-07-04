@@ -38,6 +38,10 @@ export function AppProvider({ children }) {
   const [scanningDeadlines,    setScanningDeadlines]    = useState(false)
   const [deadlineScanProgress, setDeadlineScanProgress] = useState(null) // { processed, total, found }
 
+  // "Needs attention" — the sidebar button's badge + panel data. Local +
+  // deterministic on the backend, so refreshing is free.
+  const [attention, setAttention] = useState(null) // { items, counts } | null
+
   // Saved chat threads — shared by the Sidebar (list/search/select) and the
   // Chat view (load/send). activeConversationId === null means a fresh,
   // not-yet-persisted chat.
@@ -140,6 +144,13 @@ export function AppProvider({ children }) {
     }
   }, [api])
 
+  // "Needs attention" refresh — declared before the pollers that call it.
+  const loadAttention = useCallback(async () => {
+    if (!api) return
+    try { setAttention(await api.getAttention()) }
+    catch { /* non-fatal: keep the last snapshot */ }
+  }, [api])
+
   // Busy poll: while an indexing job is running, hit /api/index every couple
   // of seconds to detect completion. Cleared automatically when the job ends.
   const startBusyPolling = useCallback(() => {
@@ -158,9 +169,16 @@ export function AppProvider({ children }) {
           setIndexing(false)
           setProgress(null)
           setActiveFiles([])
-          if (s.result) { setLastJob({ ok: true,  data: s.result }); toast('Indexing complete', 's') }
+          if (s.result) {
+            setLastJob({ ok: true, data: s.result })
+            // Friendly, concrete completion so the first run lands as "it already
+            // gets my files" rather than a bare "done".
+            const n = s.result.filesProcessed ?? s.result.indexedFiles
+            toast(n > 0 ? `Indexed ${n} file${n === 1 ? '' : 's'} — ask me anything about them` : 'Indexing complete', 's')
+          }
           if (s.error)  { setLastJob({ ok: false, msg:  s.error  }); toast('Indexing failed', 'e') }
           loadStats()
+          loadAttention() // fresh corpus → fresh dates/types → fresh badge
         }
       } catch {
         clearInterval(busyTimer.current)
@@ -170,7 +188,7 @@ export function AppProvider({ children }) {
         setActiveFiles([])
       }
     }, BUSY_POLL_MS)
-  }, [api, loadStats, toast])
+  }, [api, loadStats, loadAttention, toast])
 
   const triggerIndex = useCallback(async () => {
     if (!api || indexing) return
@@ -212,6 +230,7 @@ export function AppProvider({ children }) {
           clearInterval(deadlineTimer.current); deadlineTimer.current = null
           setScanningDeadlines(false); setDeadlineScanProgress(null)
           loadDeadlineStats()
+          loadAttention() // new/changed deadlines feed the attention panel too
           if (s.hasRun && s.message) {
             if (s.stop === 'PAUSED_QUOTA')      toast(s.message, 'i')
             else if (s.stop && s.stop !== 'COMPLETE' && s.stop !== 'NOT_SIGNED_IN') toast(s.message, 'e')
@@ -223,7 +242,7 @@ export function AppProvider({ children }) {
         setScanningDeadlines(false); setDeadlineScanProgress(null)
       }
     }, 1500)
-  }, [api, loadDeadlineStats, toast])
+  }, [api, loadDeadlineStats, loadAttention, toast])
 
   const scanDeadlines = useCallback(async () => {
     if (!api || scanningDeadlines) return
@@ -273,16 +292,18 @@ export function AppProvider({ children }) {
     if (!connected || !api) return
     loadStats()
     loadDeadlineStats()
+    loadAttention()
     idleTimer.current = setInterval(() => {
       if (!indexing) loadStats()
       loadDeadlineStats()
+      loadAttention() // local + deterministic — keeps the badge honest as dates roll over
       refreshAuth()
     }, IDLE_POLL_MS)
     return () => {
       if (idleTimer.current) clearInterval(idleTimer.current)
       idleTimer.current = null
     }
-  }, [connected, api, loadStats, loadDeadlineStats, refreshAuth, indexing])
+  }, [connected, api, loadStats, loadDeadlineStats, loadAttention, refreshAuth, indexing])
 
   // Keep refs to the latest indexing flag + scanDeadlines so the debounced
   // timer below always sees current state (no stale closures).
@@ -357,6 +378,7 @@ export function AppProvider({ children }) {
       loadStats, triggerIndex,
       deadlineStats, scanningDeadlines, deadlineScanProgress, deadlinesEnabled,
       scanDeadlines, loadDeadlineStats,
+      attention, loadAttention,
       auth, logout, refreshAuth, signInWithGoogle,
       conversations, activeConversationId, setActiveConversationId,
       refreshConversations, newConversation, openConversation,

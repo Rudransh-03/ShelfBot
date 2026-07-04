@@ -130,8 +130,20 @@ export class ApiClient {
     return this._r('/api/config', { method: 'POST', body: JSON.stringify(body) })
   }
 
-  /** Returns indexed files sorted by size desc. */
+  /** Returns indexed files sorted by size desc. Each carries an auto `docType`. */
   listFiles()       { return this._r('/api/files') }
+
+  /**
+   * Strictly TODAY's action items: obligations due today, overdue obligations,
+   * likely-missing recurring docs (anything due later lives in Deadlines).
+   * Deterministic + local (no LLM). Returns { items: [{id, kind, bucket, title,
+   * detail, date, daysUntil, fileName, path, docType}], counts: {total,
+   * overdue, dueToday, missing} }.
+   */
+  getAttention()    { return this._r('/api/attention') }
+
+  /** Permanently clears one attention item by its id so it never resurfaces. */
+  dismissAttention(id) { return this._r('/api/attention/dismiss', { method: 'POST', body: JSON.stringify({ id }) }) }
 
   /** Files that failed to index, each with a `reason` (error message). */
   listFailedFiles() { return this._r('/api/files?status=failed') }

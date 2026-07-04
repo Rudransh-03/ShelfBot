@@ -28,9 +28,11 @@ const JWT_SECRET            = process.env.JWT_SECRET
 const JWT_TTL_SECONDS       = parseInt(process.env.JWT_TTL_SECONDS || '2592000', 10)
 const FREE_DAILY            = parseInt(process.env.FREE_DAILY || '5', 10)
 const PRO_DAILY             = parseInt(process.env.PRO_DAILY  || '25', 10)
-// TESTING: bumped to 20/20 for now. Restore to 1 (free) / 5 (pro) before shipping.
-const FREE_REORG_DAILY      = parseInt(process.env.FREE_REORG_DAILY || '20', 10)
-const PRO_REORG_DAILY       = parseInt(process.env.PRO_REORG_DAILY  || '20', 10)
+// Ship defaults. Each reorg start unlocks a REORG_LLM_BUDGET-call session, so
+// these caps bound the worst-case daily LLM spend per device. Raise via env
+// (FREE_REORG_DAILY/PRO_REORG_DAILY) for local testing — never in production.
+const FREE_REORG_DAILY      = parseInt(process.env.FREE_REORG_DAILY || '1', 10)
+const PRO_REORG_DAILY       = parseInt(process.env.PRO_REORG_DAILY  || '5', 10)
 const REORG_LLM_BUDGET      = parseInt(process.env.REORG_LLM_BUDGET || '50', 10)
 const REORG_SESSION_TTL_MIN = parseInt(process.env.REORG_SESSION_TTL_MIN || '30', 10)
 const OPENAI_API_KEY        = process.env.OPENAI_API_KEY
@@ -481,10 +483,17 @@ app.post('/proxy/chat/completions', limitProxy, auth.requireAuth, async (req, re
 // from the session's budget, refunding on upstream failure. The session ID
 // is opaque to the backend and bound to the device that opened it.
 
+// Reorg quota/session key for a principal. Always a STRING (the reorg tables
+// are TEXT-keyed); account ids are namespaced so they can never collide with
+// legacy device row ids.
+function reorgKeyFor(p) {
+  return p.kind === 'account' ? 'acct:' + p.id : String(p.id)
+}
+
 app.post('/reorg/start', limitProxy, auth.requireAuth, (req, res) => {
-  // Reorg is not part of the chat-only trial. (Per-account reorg quota lands
-  // with the paid plan / billing webhook; legacy device tokens still work.)
-  if (req.principal.kind === 'account') {
+  // Reorg is not part of the chat-only trial — but PRO accounts (paid or
+  // founder/team) get it, with the same per-day cap as pro devices.
+  if (req.principal.kind === 'account' && req.principal.plan !== 'pro') {
     return res.status(403).json({
       error:  'Reorganize isn’t part of the trial.',
       reason: 'reorg_not_in_trial',
@@ -492,33 +501,34 @@ app.post('/reorg/start', limitProxy, auth.requireAuth, (req, res) => {
     })
   }
 
+  const key   = reorgKeyFor(req.principal)
   const day   = todayKey()
-  const limit = reorgPlanLimit(req.device.plan)
-  const used  = db.getReorgStartsToday(req.device.id, day)
+  const limit = reorgPlanLimit(req.principal.plan)
+  const used  = db.getReorgStartsToday(key, day)
 
   if (used >= limit) {
     return res.status(429).json({
       error:       'Daily reorganization limit reached for this device.',
       detail:      `You've used ${used} of ${limit} reorganizations today. The limit resets at midnight UTC.`,
-      plan:        req.device.plan,
+      plan:        req.principal.plan,
       used,
       limit,
       remaining:   0,
-      upgradeHint: req.device.plan === 'free'
+      upgradeHint: req.principal.plan === 'free'
         ? `Upgrade to Pro for ${PRO_REORG_DAILY} reorganizations/day.`
         : null,
     })
   }
 
-  const after = db.incrementReorgStartsToday(req.device.id, day)
+  const after = db.incrementReorgStartsToday(key, day)
 
   const sessionId = randomUUID()
   const expiresAt = new Date(Date.now() + REORG_SESSION_TTL_MIN * 60 * 1000).toISOString()
   try {
-    db.createReorgSession(sessionId, req.device.id, REORG_LLM_BUDGET, expiresAt)
+    db.createReorgSession(sessionId, key, REORG_LLM_BUDGET, expiresAt)
   } catch (e) {
     // Roll back the day-cap decrement so the user isn't charged for our error.
-    db.decrementReorgStartsToday(req.device.id, day)
+    db.decrementReorgStartsToday(key, day)
     return res.status(500).json({ error: 'Failed to create reorg session: ' + e.message })
   }
 
@@ -526,13 +536,13 @@ app.post('/reorg/start', limitProxy, auth.requireAuth, (req, res) => {
     sessionId,
     llmBudget:    REORG_LLM_BUDGET,
     expiresAt,
-    plan:         req.device.plan,
+    plan:         req.principal.plan,
     usage:        { used: after, limit, remaining: Math.max(0, limit - after) },
   })
 })
 
 app.post('/reorg/llm', limitProxy, auth.requireAuth, async (req, res) => {
-  if (req.principal.kind === 'account') {
+  if (req.principal.kind === 'account' && req.principal.plan !== 'pro') {
     return res.status(403).json({
       error:  'Reorganize isn’t part of the trial.',
       reason: 'reorg_not_in_trial',
@@ -552,7 +562,7 @@ app.post('/reorg/llm', limitProxy, auth.requireAuth, async (req, res) => {
       detail: 'Start a new reorganization to get a fresh session.',
     })
   }
-  if (session.device_id !== req.device.id) {
+  if (session.device_id !== reorgKeyFor(req.principal)) {
     // Session belongs to a different device. Treat as not-found to avoid
     // leaking the existence of other devices' sessions.
     return res.status(404).json({

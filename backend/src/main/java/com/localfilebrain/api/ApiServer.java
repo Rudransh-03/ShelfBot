@@ -131,6 +131,19 @@ public final class ApiServer {
         return t;
     });
 
+    // ── Extraction job state (Extract Mode / Bulk Q&A; independent of the above) ─
+    private final AtomicBoolean                     extractionRunning = new AtomicBoolean(false);
+    // Set by DELETE /api/extract; polled by the running job between batches.
+    private final AtomicBoolean                     extractionCancel  = new AtomicBoolean(false);
+    // Holds the last run's status; contains rows once finished (see handleExtract).
+    private final AtomicReference<Map<String, Object>> extractionResult = new AtomicReference<>(null);
+    private final AtomicReference<int[]>            extractionProgress = new AtomicReference<>(null); // {processed,total}
+    private final ExecutorService                   extractionExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "shelfbot-extract");
+        t.setDaemon(true);
+        return t;
+    });
+
     // ─────────────────────────────────────────────────────────────────────────
     // Constructor
     // ─────────────────────────────────────────────────────────────────────────
@@ -172,6 +185,7 @@ public final class ApiServer {
         server.stop(2);
         bgExecutor.shutdown();
         deadlineExecutor.shutdown();
+        extractionExecutor.shutdown();
         ChatStore cs = chatStore;
         if (cs != null) cs.close();
     }
@@ -190,6 +204,7 @@ public final class ApiServer {
         register("/api/config",       this::handleConfig);
         register("/api/files/summary", this::handleFileSummary);
         register("/api/files",        this::handleFiles);
+        register("/api/extract",        this::handleExtract);
         register("/api/deadlines/scan", this::handleDeadlineScan);
         register("/api/deadlines",      this::handleDeadlines);
         register("/api/missing",        this::handleMissing);
@@ -897,6 +912,209 @@ public final class ApiServer {
      * upstream daily quota, so it's safe to call after every index — it simply
      * resumes where it left off on the next pass.
      */
+    /**
+     * POST /api/extract — start a structured extraction over selected documents
+     * (Extract Mode and Bulk Q&A). Reuses the deadline engine's batching model
+     * via {@link ExtractionService}. Body:
+     *   {
+     *     "paths":   ["/abs/a.pdf", ...]   // OR
+     *     "folder":  "/abs/dir",           // OR
+     *     "clientId":"...",                // scope; else all indexed files
+     *     "fields":  [{ "name","type","description","required" }],
+     *     "options": { "currency": { "symbol":"₹", "grouping":"INDIAN|WESTERN" } }
+     *   }
+     * GET  /api/extract — poll running/last-run status; carries the result rows
+     * once finished. Single-flight (409 if a run is already going).
+     */
+    private void handleExtract(HttpExchange ex) throws IOException {
+        if (preflight(ex)) return;
+
+        if (isMethod(ex, "GET")) {
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("running", extractionRunning.get());
+            Map<String, Object> result = extractionResult.get();
+            body.put("hasRun", result != null);
+            if (result != null) body.putAll(result);
+            int[] p = extractionProgress.get();
+            if (p != null && extractionRunning.get()) {
+                body.put("progress", map("processed", p[0], "total", p[1]));
+            }
+            sendJson(ex, 200, body);
+            return;
+        }
+
+        // DELETE /api/extract — request cancellation of the running job. The job
+        // stops at the next batch boundary and returns the rows done so far.
+        if (isMethod(ex, "DELETE")) {
+            if (extractionRunning.get()) extractionCancel.set(true);
+            sendJson(ex, 200, map("cancelling", extractionRunning.get()));
+            return;
+        }
+
+        if (!isMethod(ex, "POST")) { methodNotAllowed(ex); return; }
+
+        if (!tokenStore.isAuthenticated()) {
+            sendError(ex, 401, "Please sign in to Rudo before running an extraction.");
+            return;
+        }
+
+        final List<com.localfilebrain.extract.ExtractionField> schema;
+        final com.localfilebrain.extract.ExtractionOptions options;
+        final List<com.localfilebrain.extract.ExtractionService.FileRef> targets;
+        try {
+            Map<?, ?> req = readJson(ex);
+            schema  = parseSchema(req.get("fields"));
+            if (schema.isEmpty()) { sendError(ex, 400, "At least one extraction field is required."); return; }
+            options = parseExtractOptions(req.get("options"));
+            targets = resolveExtractTargets(req);
+            if (targets.isEmpty()) { sendError(ex, 400, "No indexed documents match the selection."); return; }
+            if (targets.size() > 1000) {
+                sendError(ex, 400, "Too many documents selected (" + targets.size()
+                        + "). Please narrow the selection to 1000 or fewer.");
+                return;
+            }
+        } catch (IllegalArgumentException bad) {
+            sendError(ex, 400, bad.getMessage());
+            return;
+        } catch (Exception e) {
+            sendError(ex, 400, "Invalid request: " + e.getMessage());
+            return;
+        }
+
+        if (!extractionRunning.compareAndSet(false, true)) {
+            sendJson(ex, 409, map("error", "An extraction is already in progress"));
+            return;
+        }
+        extractionResult.set(null);
+        extractionCancel.set(false);
+        extractionProgress.set(new int[]{0, targets.size()});
+
+        extractionExecutor.submit(() -> {
+            try {
+                AppConfig fresh = AppConfig.load();
+                GPT4oMiniClient llm = new GPT4oMiniClient(fresh, tokenStore);
+                com.localfilebrain.extract.ExtractionService svc =
+                        new com.localfilebrain.extract.ExtractionService(vectorStore);
+                com.localfilebrain.extract.ExtractionService.Result r = svc.run(
+                        targets, schema, options,
+                        (sys, user) -> llm.oneShot(sys, user,
+                                com.localfilebrain.extract.ExtractionService.EXTRACTION_MAX_TOKENS),
+                        (processed, total) -> extractionProgress.set(new int[]{processed, total}),
+                        extractionCancel::get);
+                extractionResult.set(buildExtractionResult(schema, r));
+                log.info("Extraction finished: {} row(s), {} truncated batch(es), cancelled={}",
+                        r.rows().size(), r.truncatedBatches(), r.cancelled());
+            } catch (Throwable t) {
+                log.error("Extraction failed", t);
+                String msg = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
+                extractionResult.set(map("error", msg, "rows", List.of()));
+            } finally {
+                extractionProgress.set(null);
+                extractionCancel.set(false);
+                extractionRunning.set(false);
+            }
+        });
+
+        sendJson(ex, 202, map("started", true, "total", targets.size()));
+    }
+
+    /** Parses the schema array into typed {@link com.localfilebrain.extract.ExtractionField}s.
+     *  Field names are de-duplicated (case-insensitive, first wins) so a duplicate
+     *  column can't desync the result columns from each row's per-field map. */
+    private List<com.localfilebrain.extract.ExtractionField> parseSchema(Object raw) {
+        List<com.localfilebrain.extract.ExtractionField> out = new ArrayList<>();
+        if (!(raw instanceof List<?> list)) return out;
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        for (Object o : list) {
+            if (!(o instanceof Map<?, ?> m)) continue;
+            Object name = m.get("name");
+            if (name == null || String.valueOf(name).isBlank()) continue;
+            String nm = String.valueOf(name).trim();
+            if (!seen.add(nm.toLowerCase())) continue; // skip duplicate column names
+            com.localfilebrain.extract.FieldType type =
+                    com.localfilebrain.extract.FieldType.from(m.get("type") == null ? null : String.valueOf(m.get("type")));
+            String desc = m.get("description") == null ? "" : String.valueOf(m.get("description"));
+            boolean required = Boolean.TRUE.equals(m.get("required"));
+            out.add(new com.localfilebrain.extract.ExtractionField(nm, type, desc, required));
+        }
+        return out;
+    }
+
+    /** Parses {@code options.currency}; absent → neutral (never silently ₹). */
+    private com.localfilebrain.extract.ExtractionOptions parseExtractOptions(Object raw) {
+        if (raw instanceof Map<?, ?> opts && opts.get("currency") instanceof Map<?, ?> cur) {
+            String symbol = cur.get("symbol") == null ? "" : String.valueOf(cur.get("symbol"));
+            com.localfilebrain.extract.CurrencyDescriptor.Grouping grouping =
+                    "INDIAN".equalsIgnoreCase(String.valueOf(cur.get("grouping")))
+                            ? com.localfilebrain.extract.CurrencyDescriptor.Grouping.INDIAN
+                            : com.localfilebrain.extract.CurrencyDescriptor.Grouping.WESTERN;
+            return new com.localfilebrain.extract.ExtractionOptions(
+                    new com.localfilebrain.extract.CurrencyDescriptor(symbol, grouping));
+        }
+        return com.localfilebrain.extract.ExtractionOptions.defaults();
+    }
+
+    /** Resolves the target files from paths | folder | clientId | (all indexed). */
+    private List<com.localfilebrain.extract.ExtractionService.FileRef> resolveExtractTargets(Map<?, ?> req) {
+        // path → display name, over all indexed files.
+        LinkedHashMap<String, String> nameByPath = new LinkedHashMap<>();
+        for (var fr : metadataStore.listIndexedFilesBySizeDesc()) {
+            nameByPath.put(fr.getAbsolutePath(), fr.getFileName());
+        }
+
+        java.util.List<String> chosen = new ArrayList<>();
+        if (req.get("paths") instanceof List<?> list && !list.isEmpty()) {
+            for (Object o : list) { String p = String.valueOf(o); if (nameByPath.containsKey(p)) chosen.add(p); }
+        } else if (req.get("folder") instanceof String folder && !folder.isBlank()) {
+            // Separator-agnostic prefix match (handles both '/' and '\\') so a
+            // parent folder selects its files on macOS and Windows alike.
+            String base = folder.replaceAll("[/\\\\]+$", "");
+            for (String p : nameByPath.keySet()) {
+                if (p.equals(base) || p.startsWith(base + "/") || p.startsWith(base + "\\")) chosen.add(p);
+            }
+        } else if (req.get("clientId") instanceof String cid && !cid.isBlank()) {
+            for (String p : metadataStore.pathsForClient(cid)) if (nameByPath.containsKey(p)) chosen.add(p);
+        } else {
+            chosen.addAll(nameByPath.keySet());
+        }
+
+        List<com.localfilebrain.extract.ExtractionService.FileRef> out = new ArrayList<>(chosen.size());
+        for (String p : chosen) {
+            out.add(new com.localfilebrain.extract.ExtractionService.FileRef(nameByPath.get(p), p));
+        }
+        return out;
+    }
+
+    /** Serializes an extraction result for the poll response (columns + rows,
+     *  each cell carrying its value/status/note so ambiguity survives to export). */
+    private Map<String, Object> buildExtractionResult(
+            List<com.localfilebrain.extract.ExtractionField> schema,
+            com.localfilebrain.extract.ExtractionService.Result r) {
+        List<Map<String, Object>> columns = new ArrayList<>();
+        for (var f : schema) columns.add(map("name", f.name(), "type", f.type().name().toLowerCase()));
+
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (var row : r.rows()) {
+            List<Map<String, Object>> cells = new ArrayList<>();
+            for (var f : schema) {
+                var v = row.fields().get(f.name());
+                cells.add(map(
+                        "name",   f.name(),
+                        "value",  v == null ? "" : v.value(),
+                        "status", v == null ? "MISSING" : v.status().name(),
+                        "note",   v == null ? "" : v.note()));
+            }
+            rows.add(map(
+                    "fileName",     row.fileName(),
+                    "absolutePath", row.absolutePath(),
+                    "ambiguous",    row.hasAmbiguity(),
+                    "cells",        cells));
+        }
+        return map("done", true, "columns", columns, "rows", rows,
+                "count", rows.size(), "truncatedBatches", r.truncatedBatches(),
+                "cancelled", r.cancelled());
+    }
+
     private void handleDeadlineScan(HttpExchange ex) throws IOException {
         if (preflight(ex)) return;
 
@@ -1266,10 +1484,9 @@ public final class ApiServer {
         if (chatStore != null) return chatStore;
         synchronized (this) {
             if (chatStore == null) {
-                Path path = config.getMetadataDbPath()
-                        .toAbsolutePath()
-                        .resolveSibling("shelfbot-chats.db");
-                chatStore = new ChatStore(path);
+                // Lives in the per-user data root (resolved by AppConfig), never
+                // beside the working / install directory.
+                chatStore = new ChatStore(config.getChatDbPath().toAbsolutePath());
             }
         }
         return chatStore;
@@ -1601,7 +1818,8 @@ public final class ApiServer {
      * list and remove the legacy single key to keep the file unambiguous.
      */
     private void updateConfigRootPaths(List<String> newPaths) throws IOException {
-        Path configFile = Paths.get("config.properties");
+        Path configFile = config.getConfigFilePath();
+        Files.createDirectories(configFile.toAbsolutePath().getParent());
         Properties props = new Properties();
         if (Files.exists(configFile)) {
             try (InputStream in = Files.newInputStream(configFile)) {

@@ -13,6 +13,15 @@ contextBridge.exposeInMainWorld('electron', {
     ipcRenderer.on('api-port', handler)
     return () => ipcRenderer.removeListener('api-port', handler)
   },
+  // Backend supervisor lifecycle: { state:'ready'|'restarting'|'restarted'|
+  // 'failed'|'stopped', reason?, message?, port?, attempt?, restartCount? }.
+  // Lets the UI show a non-blocking notice when the backend is restarted or
+  // becomes permanently unavailable.
+  onBackendStatus: (cb) => {
+    const handler = (_e, s) => cb(s)
+    ipcRenderer.on('backend-status', handler)
+    return () => ipcRenderer.removeListener('backend-status', handler)
+  },
   platform:       process.platform,
 
   // Calendar reminders (.ics — works on every OS with a calendar app)
@@ -20,6 +29,9 @@ contextBridge.exposeInMainWorld('electron', {
 
   // Export a generated file (e.g. CSV for Excel) via a native Save dialog.
   exportFile: (payload) => ipcRenderer.invoke('export:file', payload),
+
+  // Render a self-contained HTML report to a PDF via a native Save dialog.
+  generateReport: (payload) => ipcRenderer.invoke('report:generate', payload),
 
   // Auto-updater
   onUpdateStatus:    (cb) => {

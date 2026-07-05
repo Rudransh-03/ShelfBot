@@ -35,6 +35,7 @@ import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.ArrayUtil;
 import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.store.NIOFSDirectory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -106,7 +107,7 @@ public final class VectorStore implements AutoCloseable {
         try {
             Files.createDirectories(indexDirPath);
 
-            this.directory = FSDirectory.open(indexDirPath);
+            this.directory = new NIOFSDirectory(indexDirPath);
 
             IndexWriterConfig config = new IndexWriterConfig();
             // Custom codec so we control HNSW parameters explicitly rather

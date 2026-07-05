@@ -18,13 +18,36 @@ public final class AppConfig {
     private static final String CONFIG_FILE = "config.properties";
 
     private final Properties props;
+    /** OS-standard per-user data root every durable path resolves against. */
+    private final UserDataPaths dataPaths;
 
-    private AppConfig(Properties props) { this.props = props; }
+    private AppConfig(Properties props, UserDataPaths dataPaths) {
+        this.props     = props;
+        this.dataPaths = dataPaths;
+    }
 
     public static AppConfig load() {
+        UserDataPaths dataPaths = UserDataPaths.resolve();
+        try {
+            dataPaths.ensureDirectories();
+        } catch (IOException e) {
+            throw new ConfigurationException("Could not create data directory: " + dataPaths.root(), e);
+        }
+
         Properties props = new Properties();
-        Path externalConfig = Paths.get(CONFIG_FILE);
-        if (Files.exists(externalConfig)) {
+        // Config resolution, in priority order:
+        //   1. The user data directory (authoritative; where the UI writes and
+        //      where migration relocates any prior config).
+        //   2. A legacy config.properties in the working directory — dev / CLI /
+        //      test runs that pre-date the data-dir move. We only READ this; we
+        //      never write there, and migration folds it into the data dir.
+        //   3. The shipped classpath default (fresh install).
+        Path dataConfig   = dataPaths.configFile();
+        Path legacyConfig = Paths.get(CONFIG_FILE);
+        Path externalConfig = Files.exists(dataConfig) ? dataConfig
+                            : (Files.exists(legacyConfig) ? legacyConfig : null);
+
+        if (externalConfig != null) {
             try (InputStream in = Files.newInputStream(externalConfig)) {
                 props.load(in);
                 log.info("Loaded config from: {}", externalConfig.toAbsolutePath());
@@ -35,15 +58,15 @@ public final class AppConfig {
             try (InputStream in = AppConfig.class.getClassLoader().getResourceAsStream(CONFIG_FILE)) {
                 if (in != null) {
                     props.load(in);
-                    log.info("Loaded config from classpath");
+                    log.info("Loaded config from classpath (data dir: {})", dataPaths.root());
                 } else {
-                    log.warn("No config.properties found. Using defaults only.");
+                    log.warn("No config.properties found. Using defaults only. (data dir: {})", dataPaths.root());
                 }
             } catch (IOException e) {
                 throw new ConfigurationException("Failed to read classpath config", e);
             }
         }
-        return new AppConfig(props);
+        return new AppConfig(props, dataPaths);
     }
 
     // -------------------------------------------------------------------------
@@ -126,8 +149,35 @@ public final class AppConfig {
         return defaults;
     }
 
+    /** The per-user data root. Every durable path lives under this directory. */
+    public Path getDataRoot() {
+        return dataPaths.root();
+    }
+
     public Path getMetadataDbPath() {
-        return Paths.get(getOrDefault("metadata.db.path", "shelfbot-metadata.db"));
+        return resolveDataPath("metadata.db.path", dataPaths.metadataDb());
+    }
+
+    /** Local chat-thread DB. Kept beside the metadata DB in the data root. */
+    public Path getChatDbPath() {
+        return resolveDataPath("chat.db.path", dataPaths.chatDb());
+    }
+
+    /** Where the UI-editable {@code config.properties} is read from and written to. */
+    public Path getConfigFilePath() {
+        return dataPaths.configFile();
+    }
+
+    /**
+     * Resolves a configurable path property: an absolute override is honored as
+     * given; a relative one (or the absence of one) resolves against the data
+     * root so nothing ever lands in the working / install directory.
+     */
+    private Path resolveDataPath(String key, Path defaultAbsolute) {
+        String v = getOrDefault(key, "");
+        if (v.isBlank()) return defaultAbsolute;
+        Path p = Paths.get(v);
+        return p.isAbsolute() ? p : dataPaths.root().resolve(p).normalize();
     }
 
     /**
@@ -247,7 +297,7 @@ public final class AppConfig {
      * on first run.
      */
     public Path getVectorIndexPath() {
-        return Paths.get(getOrDefault("vector.index.path", "shelfbot-vector-index"));
+        return resolveDataPath("vector.index.path", dataPaths.vectorIndex());
     }
 
     // -------------------------------------------------------------------------

@@ -166,6 +166,19 @@ export class ApiClient {
 
   // ── Deadlines (cross-document intelligence) ──────────────────────────────
 
+  // ── Extract Mode / Bulk Q&A (structured extraction) ──────────────────────
+  /**
+   * Starts a structured extraction over selected documents. body:
+   *   { paths?|folder?|clientId?, fields:[{name,type,description,required}],
+   *     options:{ currency:{ symbol, grouping:'INDIAN'|'WESTERN' } } }
+   * → 202 { started, total }, or 4xx { error }.
+   */
+  startExtract(body)   { return this._r('/api/extract', { method: 'POST', body: JSON.stringify(body) }) }
+  /** Polls the running/last extraction: { running, hasRun, progress?, done?, columns?, rows?, truncatedBatches?, cancelled? }. */
+  pollExtract()        { return this._r('/api/extract') }
+  /** Requests cancellation of the running extraction (stops at the next batch). */
+  cancelExtract()      { return this._r('/api/extract', { method: 'DELETE' }) }
+
   /** Starts the incremental deadline scan (one batched LLM call per group). */
   scanDeadlines()      { return this._r('/api/deadlines/scan', { method: 'POST' }) }
   /** Polls the running/last scan: { running, hasRun, stop?, message?, progress? }. */

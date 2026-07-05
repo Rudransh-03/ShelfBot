@@ -16,7 +16,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -80,6 +79,7 @@ public final class Main {
         }
 
         // ── Interactive CLI mode ─────────────────────────────────────────────
+        migrateUserData();
         printBanner();
         Scanner scanner = new Scanner(System.in);
 
@@ -110,12 +110,36 @@ public final class Main {
         }
     }
 
+    /**
+     * Relocates pre-existing user data into the OS-standard per-user data
+     * directory exactly once. Delegates to {@link com.localfilebrain.config.DataMigrator},
+     * which is idempotent, verifies every copy before removing the originals,
+     * and never overwrites newer data. Failures are logged and swallowed — the
+     * app boots against the (possibly empty) new location and retries next launch.
+     */
+    private static void migrateUserData() {
+        try {
+            var target = com.localfilebrain.config.UserDataPaths.resolve();
+            var result = com.localfilebrain.config.DataMigrator.migrateIfNeeded(
+                    target, com.localfilebrain.config.DataMigrator.defaultLegacyCandidates());
+            log.info("[startup] user-data migration: {} — {}", result.status(), result.message());
+        } catch (Exception e) {
+            log.warn("[startup] user-data migration skipped ({})", e.getMessage());
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Server mode — started by the Electron UI via --server flag
     // -------------------------------------------------------------------------
 
     private static void runServerMode(int port) throws InterruptedException {
         log.info("Starting ShelfBot API server on port {}", port);
+
+        // One-time relocation of any pre-existing data (old working-dir store)
+        // into the OS-standard per-user data directory. Idempotent and safe:
+        // it verifies copies before touching the originals and never runs twice.
+        // Must happen BEFORE any store is opened.
+        migrateUserData();
 
         AppConfig config = AppConfig.load();
 
@@ -124,7 +148,8 @@ public final class Main {
             metadataStore = new IndexMetadataStore(config.getMetadataDbPath());
         } catch (Exception e) {
             log.warn("Could not open metadata store at configured path, using default: {}", e.getMessage());
-            metadataStore = new IndexMetadataStore(Paths.get("shelfbot-metadata.db"));
+            metadataStore = new IndexMetadataStore(
+                    com.localfilebrain.config.UserDataPaths.resolve().metadataDb());
         }
 
         // Holds the JWT issued by the proxy after sign-in. The Electron

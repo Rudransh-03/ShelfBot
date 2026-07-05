@@ -8,6 +8,7 @@ import { machineIdSync } from 'node-machine-id'
 import { randomUUID, randomBytes, createHash } from 'crypto'
 import { promisify }     from 'util'
 import { buildCalendar } from './ics.js'
+import { BackendSupervisor, describeReason } from './supervisor.js'
 
 const execFileP = promisify(execFile)
 
@@ -169,6 +170,37 @@ const JAR_PROD     = join(process.resourcesPath ?? '', 'shelfbot.jar')
 const DEFAULT_PORT   = 9876
 const START_TIMEOUT  = 35_000 // ms
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Persistent user-data directory
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ALL durable backend data (Lucene index, metadata + chat DBs, config, logs)
+// lives here — the OS-standard per-user application-data directory, NEVER the
+// working directory or the app bundle. This is what makes user data survive an
+// auto-update (which replaces the bundle wholesale) and keeps the macOS code
+// signature intact. The same value is handed to the Java backend via
+// SHELFBOT_DATA_DIR so both sides agree on one location.
+//
+//   macOS   → ~/Library/Application Support/Rudo
+//   Windows → %LOCALAPPDATA%\Rudo
+//   Linux   → $XDG_DATA_HOME/Rudo  (else ~/.local/share/Rudo)
+function resolveDataDir() {
+  if (process.env.SHELFBOT_DATA_DIR && process.env.SHELFBOT_DATA_DIR.trim()) {
+    return process.env.SHELFBOT_DATA_DIR.trim()
+  }
+  if (process.platform === 'darwin') {
+    return join(app.getPath('appData'), 'Rudo') // appData = ~/Library/Application Support
+  }
+  if (process.platform === 'win32') {
+    return join(process.env.LOCALAPPDATA || app.getPath('appData'), 'Rudo')
+  }
+  const xdg = process.env.XDG_DATA_HOME || join(app.getPath('home'), '.local', 'share')
+  return join(xdg, 'Rudo')
+}
+
+const DATA_DIR = resolveDataDir()
+const LOG_DIR  = join(DATA_DIR, 'logs')
+
 // Per-launch secret shared only between this main process, the Java backend
 // (passed via env), and our own renderer (passed over IPC). The backend rejects
 // any /api/* request that doesn't echo it in X-Shelfbot-Token — so a malicious
@@ -177,7 +209,7 @@ const START_TIMEOUT  = 35_000 // ms
 const LOCAL_API_TOKEN = randomUUID()
 
 let mainWindow  = null
-let javaProcess = null
+let supervisor  = null
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -273,8 +305,10 @@ async function killOrphanedJava() {
     return
   }
 
-  // Don't kill our own child (it shouldn't exist this early, but safe-guard).
-  pids = pids.filter(p => !javaProcess || javaProcess.pid !== p)
+  // Don't kill our own live child (during a supervised restart the previous
+  // child has already exited, so this is just a safety-guard).
+  const ownPid = supervisor?.child?.pid
+  pids = pids.filter(p => p !== ownPid)
   if (pids.length === 0) return
 
   console.log('[ShelfBot] killing orphan Java pid(s):', pids.join(', '))
@@ -291,7 +325,7 @@ async function killOrphanedJava() {
   // Some hard kills leave Lucene's write.lock on disk. Remove it so the
   // fresh JVM can open the index. Lock contents don't matter — Lucene
   // recreates on open.
-  const lockFile = join(BACKEND_ROOT, 'shelfbot-vector-index', 'write.lock')
+  const lockFile = join(DATA_DIR, 'shelfbot-vector-index', 'write.lock')
   try {
     if (existsSync(lockFile)) {
       unlinkSync(lockFile)
@@ -306,66 +340,149 @@ async function killOrphanedJava() {
 // Java backend
 // ─────────────────────────────────────────────────────────────────────────────
 
-function startJavaBackend() {
+/**
+ * Spawns the Java backend ONCE and resolves { child, port } as soon as it
+ * prints its readiness line. Rejects (with an error code the supervisor can
+ * classify) if the JVM can't be found, the process errors, or it exits before
+ * signalling ready. The BackendSupervisor owns retries, health monitoring, and
+ * restart policy — this function is just "start one instance".
+ */
+function launchBackendOnce() {
   const jar = getJarPath()
   if (!jar) {
-    console.error('[ShelfBot] JAR not found — run `mvn package` inside backend/')
-    return Promise.resolve(DEFAULT_PORT)
+    const e = new Error('Backend JAR not found — run `mvn package` inside backend/')
+    e.code = 'ENOENT'
+    return Promise.reject(e)
   }
 
-  return new Promise(async (resolve) => {
+  return new Promise(async (resolve, reject) => {
     // Always sweep orphaned JVMs first — see killOrphanedJava() for why.
     await killOrphanedJava()
-    const port = await findFreePort()
+    const port    = await findFreePort()
     const javaBin = getJavaBin()
+    try { mkdirSync(LOG_DIR, { recursive: true }) } catch { /* best effort */ }
     console.log(`[ShelfBot] Starting Java on port ${port}  (${javaBin} -jar ${jar})`)
 
-    // -Djava.awt.headless=true keeps the JVM from initializing AWT — which
-    //   (a) prevents the Java dock/menu icon appearing on macOS, and
-    //   (b) avoids loading the windowing system at all on headless Linux servers.
-    // Tika's OCR + PDF image parsers pull AWT in transitively, so without this
-    //   the user sees a Java icon pop into their dock alongside ShelfBot.
-    javaProcess = spawn(javaBin, ['-Djava.awt.headless=true', '-Xmx512m', '-jar', jar, '--server', '--port', String(port)], {
-      cwd:   BACKEND_ROOT,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      // Hand the backend the per-launch API secret + the resolved proxy URL.
-      // Spread process.env so the JVM still inherits PATH etc.; passing via env
-      // (not argv) keeps the secret out of `ps`/pgrep output. SHELFBOT_PROXY_URL
-      // is set explicitly (after the spread) so the backend points at the SAME
-      // proxy this app resolved — including the production URL, which no shipped
-      // config.properties would otherwise provide.
-      env:   { ...process.env, SHELFBOT_LOCAL_TOKEN: LOCAL_API_TOKEN, SHELFBOT_PROXY_URL: PROXY_URL },
-    })
-
-    const timer = setTimeout(() => {
-      console.warn('[ShelfBot] Backend start timed out — opening UI anyway')
-      resolve(port)
-    }, START_TIMEOUT)
-
-    function checkReady(data) {
-      const text = data.toString()
-      process.stdout.write('[Java] ' + text)
-      const m = text.match(/SHELFBOT_SERVER_READY:(\d+)/)
-      if (m) { clearTimeout(timer); resolve(parseInt(m[1], 10)) }
+    let child
+    try {
+      // -Djava.awt.headless=true keeps the JVM from initializing AWT (no Java
+      //   dock icon on macOS; no windowing system on headless Linux).
+      // -Drudo.log.dir points Logback's rolling file appender at the data dir.
+      child = spawn(javaBin, [
+        '-Djava.awt.headless=true',
+        `-Drudo.log.dir=${LOG_DIR}`,
+        '-Xmx512m',
+        '-jar', jar, '--server', '--port', String(port),
+      ], {
+        cwd:   DATA_DIR,     // never the app bundle; keeps any stray relative path safe
+        stdio: ['ignore', 'pipe', 'pipe'],
+        // Spread process.env for PATH etc.; the secrets/paths after the spread
+        // are authoritative. Passing via env (not argv) keeps the token out of
+        // `ps`/pgrep. SHELFBOT_DATA_DIR pins the data root; SHELFBOT_LEGACY_DIR
+        // tells the backend where to look for pre-existing data to migrate.
+        env: {
+          ...process.env,
+          SHELFBOT_LOCAL_TOKEN: LOCAL_API_TOKEN,
+          SHELFBOT_PROXY_URL:   PROXY_URL,
+          SHELFBOT_DATA_DIR:    DATA_DIR,
+          SHELFBOT_LEGACY_DIR:  BACKEND_ROOT,
+        },
+      })
+    } catch (err) {
+      reject(err)
+      return
     }
 
-    javaProcess.stdout.on('data', checkReady)
-    javaProcess.stderr.on('data', data => {
-      process.stderr.write('[Java/err] ' + data.toString())
-      checkReady(data)   // READY line sometimes lands on stderr via Logback
-    })
+    // Permanent passthrough so dev still sees backend logs on the console.
+    child.stdout.on('data', d => process.stdout.write('[Java] ' + d.toString()))
+    child.stderr.on('data', d => process.stderr.write('[Java/err] ' + d.toString()))
 
-    javaProcess.on('error', err => {
-      clearTimeout(timer)
-      console.error('[ShelfBot] spawn error:', err.message)
-      resolve(port)
-    })
+    let settled = false
+    const onData = (data) => {
+      const m = data.toString().match(/SHELFBOT_SERVER_READY:(\d+)/)
+      if (m && !settled) { settled = true; cleanup(); resolve({ child, port: parseInt(m[1], 10) }) }
+    }
+    const onError = (err) => { if (!settled) { settled = true; cleanup(); reject(err) } }
+    const onExit  = (code, signal) => {
+      if (!settled) {
+        settled = true; cleanup()
+        const e = new Error(`backend exited before ready (code=${code}, signal=${signal})`)
+        e.code = code
+        reject(e)
+      }
+    }
+    function cleanup() {
+      child.stdout.off('data', onData)
+      child.stderr.off('data', onData)
+      child.off('error', onError)
+      child.off('exit',  onExit)
+    }
+    // READY line can land on stdout or (via Logback) stderr.
+    child.stdout.on('data', onData)
+    child.stderr.on('data', onData)
+    child.once('error', onError)
+    child.once('exit',  onExit)
   })
 }
 
-function stopJava() {
-  javaProcess?.kill('SIGTERM')
-  javaProcess = null
+/** Liveness probe used by the supervisor's runtime health monitor. */
+async function checkBackendHealth(port) {
+  try {
+    const res = await fetch(`http://localhost:${port}/api/health`, {
+      signal: AbortSignal.timeout(4_000),
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+/** Sends the current API port + local token to the renderer so it (re)connects. */
+function sendApiPort(port) {
+  lastApiPort = port
+  sendToRenderer('api-port', { port, token: LOCAL_API_TOKEN })
+}
+
+/** Broadcasts supervisor lifecycle to the renderer for user-facing notices. */
+function sendBackendStatus(payload) {
+  sendToRenderer('backend-status', payload)
+}
+
+/** Builds + wires the supervisor. Idempotent — reuses an existing instance. */
+function createSupervisor() {
+  if (supervisor) return supervisor
+  supervisor = new BackendSupervisor({
+    launch:           launchBackendOnce,
+    checkHealth:      checkBackendHealth,
+    logger:           console,
+    startupTimeoutMs: START_TIMEOUT,
+  })
+
+  supervisor.on('ready', ({ port, durationMs }) => {
+    console.log(`[ShelfBot] backend ready on ${port} (${durationMs}ms)`)
+    sendApiPort(port)
+    sendBackendStatus({ state: 'ready', port })
+  })
+  supervisor.on('restarting', ({ reason, attempt, message }) => {
+    sendBackendStatus({ state: 'restarting', reason, attempt, message: describeReason(reason) })
+    console.warn(`[ShelfBot] backend restarting (attempt ${attempt}): ${message}`)
+  })
+  supervisor.on('restarted', ({ port, restartCount }) => {
+    console.log(`[ShelfBot] backend restarted on ${port} (restart #${restartCount})`)
+    sendApiPort(port)
+    // The fresh JVM has no auth token yet — re-push the saved JWT so chat,
+    // deadlines, and extraction keep working without a manual re-sign-in.
+    const saved = loadToken()
+    if (saved?.token) pushTokenToBackend(saved.token)
+    sendBackendStatus({ state: 'restarted', port, restartCount })
+  })
+  supervisor.on('failed', ({ reason, message }) => {
+    console.error(`[ShelfBot] backend permanently unavailable: ${reason} — ${message}`)
+    sendBackendStatus({ state: 'failed', reason, message: describeReason(reason) })
+  })
+  supervisor.on('stopped', () => sendBackendStatus({ state: 'stopped' }))
+
+  return supervisor
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -413,7 +530,11 @@ function createWindow(port) {
   })
 
   mainWindow.webContents.on('did-finish-load', () => {
-    mainWindow.webContents.send('api-port', { port, token: LOCAL_API_TOKEN })
+    // Use the supervisor's current port (source of truth) — it may have changed
+    // if the backend restarted before the window finished loading. Null when
+    // the backend failed to start; the renderer then relies on backend-status.
+    const p = lastApiPort ?? port
+    if (p) mainWindow.webContents.send('api-port', { port: p, token: LOCAL_API_TOKEN })
     mainWindow.show()
   })
 
@@ -441,20 +562,39 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(async () => {
     console.log('[ShelfBot] app name:', app.getName())
     console.log('[ShelfBot] userData:', app.getPath('userData'))
+    console.log('[ShelfBot] data dir:', DATA_DIR)
     console.log('[ShelfBot] token file:', TOKEN_FILE())
     console.log('[ShelfBot] device file:', DEVICE_FILE())
     console.log('[ShelfBot] safeStorage available:', safeStorage.isEncryptionAvailable())
     console.log('[ShelfBot] proxy url:', PROXY_URL)
-    const port = await startJavaBackend()
-    lastApiPort = port
+
+    createSupervisor()
+    let port = null
+    try {
+      const r = await supervisor.start()
+      port = r.port
+    } catch (e) {
+      // Permanent startup failure. Still open the window so the user sees a
+      // specific, actionable error (via backend-status) instead of nothing.
+      console.error('[ShelfBot] backend failed to start:', e.reason || e.message)
+    }
     createWindow(port)
     // Defer the update check so the window paints first and the user isn't
     // staring at a hanging window while we hit GitHub.
     setTimeout(initAutoUpdater, 4_000)
   })
 
-  app.on('window-all-closed', () => { stopJava(); app.quit() })
-  app.on('before-quit', stopJava)
+  app.on('window-all-closed', () => { app.quit() })
+
+  // Graceful shutdown: give the supervisor a chance to stop the backend cleanly
+  // (clean commit + close) before the app exits. Guarded so we don't loop.
+  let shuttingDown = false
+  app.on('before-quit', (e) => {
+    if (shuttingDown || !supervisor) return
+    e.preventDefault()
+    shuttingDown = true
+    Promise.resolve(supervisor.stop()).catch(() => {}).finally(() => app.quit())
+  })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -600,6 +740,57 @@ ipcMain.handle('export:file', async (_e, payload) => {
   } catch (e) {
     console.error('[ShelfBot] export:file failed:', e.message)
     return { ok: false, error: e.message }
+  }
+})
+
+// Renders a self-contained HTML report to a PDF via Electron's built-in
+// printToPDF (no external dependency, no report persistence — on demand only).
+// The HTML is written to a temp file, loaded into an offscreen window, printed,
+// and the temp file removed. The user picks the destination via a save dialog.
+ipcMain.handle('report:generate', async (_e, payload) => {
+  let win = null
+  let tmp = null
+  try {
+    const html = payload?.html
+    if (typeof html !== 'string' || html.length === 0) {
+      return { ok: false, error: 'Nothing to render' }
+    }
+    if (!mainWindow) return { ok: false, error: 'No window' }
+
+    const suggested = (typeof payload?.suggestedName === 'string' && payload.suggestedName)
+      ? payload.suggestedName
+      : `rudo-report-${Date.now()}.pdf`
+
+    const r = await dialog.showSaveDialog(mainWindow, {
+      title: 'Export report to PDF',
+      defaultPath: join(app.getPath('documents'), suggested),
+      filters: [{ name: 'PDF document', extensions: ['pdf'] }],
+    })
+    if (r.canceled || !r.filePath) return { ok: false, canceled: true }
+
+    tmp = join(app.getPath('temp'), `rudo-report-${Date.now()}-${randomBytes(4).toString('hex')}.html`)
+    writeFileSync(tmp, html, 'utf8')
+
+    win = new BrowserWindow({
+      show: false,
+      width: 900,
+      height: 1200,
+      webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false, javascript: false },
+    })
+    await win.loadFile(tmp)
+
+    const pdf = await win.webContents.printToPDF({
+      printBackground: true,
+      pageSize: 'A4',
+    })
+    writeFileSync(r.filePath, pdf)
+    return { ok: true, path: r.filePath }
+  } catch (e) {
+    console.error('[ShelfBot] report:generate failed:', e.message)
+    return { ok: false, error: e.message }
+  } finally {
+    if (win) { try { win.destroy() } catch { /* ignore */ } }
+    if (tmp) { try { unlinkSync(tmp) } catch { /* ignore */ } }
   }
 })
 

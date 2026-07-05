@@ -1,7 +1,29 @@
 <configuration>
+    <!-- Log directory: the Electron main process passes -Drudo.log.dir pointing
+         at <userDataDir>/logs. Standalone/CLI runs fall back to a per-user dir
+         so logs never land in the working / install directory. -->
+    <property name="LOG_DIR" value="${rudo.log.dir:-${user.home}/.rudo/logs}" />
+
     <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
         <encoder>
             <pattern>%d{HH:mm:ss.SSS} [%-5level] %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- Rolling file log for field diagnostics. Size+time based so a long-running
+         install never grows an unbounded file: 10 MB per file, 7 days kept,
+         100 MB total cap. Appends across app restarts and lives in the data dir
+         so a diagnostics bundle can collect it. -->
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/rudo-backend.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/rudo-backend.%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <maxFileSize>10MB</maxFileSize>
+            <maxHistory>7</maxHistory>
+            <totalSizeCap>100MB</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] [%-5level] %logger{36} - %msg%n</pattern>
         </encoder>
     </appender>
 
@@ -13,5 +35,6 @@
 
     <root level="INFO">
         <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="FILE"/>
     </root>
 </configuration>

@@ -4,6 +4,7 @@ import remarkGfm from 'remark-gfm'
 import { useApp } from '../context/AppContext'
 import BookshelfIcon from '../components/BookshelfIcon'
 import Mascot       from '../components/Mascot'
+import ReportModal  from '../components/ReportModal'
 import { extractTables, tablesToCsv } from '../utils/tableExport'
 
 const SUGGESTIONS = [
@@ -90,6 +91,14 @@ const SheetIcon = () => (
     <polyline points="14 2 14 8 20 8"/>
     <line x1="8" y1="13" x2="16" y2="13"/>
     <line x1="8" y1="17" x2="16" y2="17"/>
+  </svg>
+)
+
+const ReportIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+    <polyline points="14 2 14 8 20 8"/>
+    <line x1="8" y1="13" x2="13" y2="13"/><line x1="8" y1="17" x2="11" y2="17"/>
   </svg>
 )
 
@@ -241,7 +250,7 @@ function SourceChip({ source, onOpen }) {
   )
 }
 
-function Message({ role, text, sources = [], variant, onOpenSource, streaming = false,
+function Message({ role, text, sources = [], variant, onOpenSource, onReport, streaming = false,
                    highlight = '', occOffset = 0, activeMatch = -1, activeRef,
                    clarify, clarifyQuestion, scope, onClarify }) {
   const [copied, setCopied] = useState(false)
@@ -361,6 +370,11 @@ function Message({ role, text, sources = [], variant, onOpenSource, streaming = 
                   <span>{exported ? 'Exported' : 'Export'}</span>
                 </button>
               )}
+              <button className="msg-action" onClick={() => onReport?.(text, sources)}
+                      title="Generate a PDF report from this answer">
+                <ReportIcon />
+                <span>Report</span>
+              </button>
             </div>
           )}
         </div>
@@ -407,6 +421,7 @@ export default function Chat({ active }) {
   const [input,    setInput]      = useState('')
   const [loading,  setLoading]    = useState(false)
   const [justAnswered, setJustAnswered] = useState(false)
+  const [reportCtx, setReportCtx] = useState(null)  // { answerText, sources } for the PDF report modal
   const msgsRef  = useRef(null)
   const inputRef = useRef(null)
   // Which conversation's messages are currently displayed. Lets us skip a
@@ -692,6 +707,7 @@ export default function Chat({ active }) {
                 variant={m.variant}
                 streaming={m.streaming}
                 onOpenSource={openSource}
+                onReport={(text, sources) => setReportCtx({ answerText: text, sources })}
                 highlight={findOpen ? findQuery.trim() : ''}
                 occOffset={find.offsets[i] || 0}
                 activeMatch={activeMatch}
@@ -735,6 +751,14 @@ export default function Chat({ active }) {
           </button>
         </div>
       </div>
+
+      {reportCtx && (
+        <ReportModal
+          context={{ source: 'chat', answerText: reportCtx.answerText, sources: reportCtx.sources }}
+          toast={toast}
+          onClose={() => setReportCtx(null)}
+        />
+      )}
     </div>
   )
 }

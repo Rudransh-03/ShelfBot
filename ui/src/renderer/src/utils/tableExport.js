@@ -141,3 +141,34 @@ export function tablesToCsv(tables) {
   )
   return '\uFEFF' + blocks.join('\r\n\r\n') + '\r\n'
 }
+
+// Renders one extraction cell for export. Ambiguity/confidence metadata is
+// preserved (not dropped) by annotating the value inline, so a flagged value
+// never leaves the app looking identical to a confident one. MISSING \u2192 blank.
+function renderExtractionCell(cell) {
+  if (!cell || cell.status === 'MISSING') return ''
+  if (cell.status === 'AMBIGUOUS') return `${cell.value} [AMBIGUOUS]`
+  return cell.value ?? ''
+}
+
+/**
+ * Adapts a structured extraction result (dynamic columns + one row per document)
+ * to CSV by reusing {@link tablesToCsv} \u2014 the same generic serializer the chat
+ * "Export to Excel" action uses. Supports arbitrary field names / column counts,
+ * appends a "Source File" citation column, and preserves per-cell
+ * ambiguity/confidence metadata.
+ *
+ * @param columns [{ name, type }]
+ * @param rows    [{ fileName, cells: [{ name, value, status, note }] }]
+ */
+export function extractionToCsv(columns, rows) {
+  if (!Array.isArray(columns) || columns.length === 0) return ''
+  const headers = [...columns.map(c => c.name), 'Source File']
+  const body = (rows || []).map(r => {
+    const byName = new Map((r.cells || []).map(c => [c.name, c]))
+    const cells = columns.map(col => renderExtractionCell(byName.get(col.name)))
+    cells.push(r.fileName || '')
+    return cells
+  })
+  return tablesToCsv([{ headers, rows: body }])
+}

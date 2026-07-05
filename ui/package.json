@@ -11,7 +11,8 @@
     "start": "electron-vite preview",
     "build:runtime": "node scripts/build-runtime.mjs",
     "dist": "npm run build:runtime && electron-vite build && electron-builder",
-    "publish": "npm run build:runtime && electron-vite build && electron-builder --publish always"
+    "publish": "npm run build:runtime && electron-vite build && electron-builder --publish always",
+    "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "electron-log": "^5.1.7",

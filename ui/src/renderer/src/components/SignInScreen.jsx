@@ -31,7 +31,7 @@ export default function SignInScreen() {
           start your free trial.
         </div>
         <button className="signin-btn" onClick={onSignIn} disabled={busy}>
-          <GoogleGlyph />
+          <span className="g-circle"><GoogleGlyph /></span>
           {busy ? 'Opening browser…' : 'Sign in with Google'}
         </button>
         <div className="signin-fine">

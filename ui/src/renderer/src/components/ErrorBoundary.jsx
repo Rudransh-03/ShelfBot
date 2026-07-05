@@ -25,8 +25,8 @@ export default class ErrorBoundary extends Component {
       <div style={{
         position: 'fixed', inset: 0, display: 'flex', flexDirection: 'column',
         alignItems: 'center', justifyContent: 'center', gap: 16, padding: 32,
-        background: '#0b0b14', color: '#e7e7ef', textAlign: 'center',
-        fontFamily: 'system-ui, sans-serif',
+        background: '#f2ede6', color: '#141313', textAlign: 'center',
+        fontFamily: 'Manrope, system-ui, sans-serif',
       }}>
         <div style={{ fontSize: 40 }}>😵‍💫</div>
         <h2 style={{ margin: 0, fontSize: 18 }}>Something went wrong</h2>
@@ -37,8 +37,8 @@ export default class ErrorBoundary extends Component {
         <button
           onClick={() => window.location.reload()}
           style={{
-            marginTop: 8, padding: '10px 20px', borderRadius: 8, border: 'none',
-            background: '#6c5cff', color: '#fff', fontSize: 14, cursor: 'pointer',
+            marginTop: 8, padding: '10px 20px', borderRadius: 10, border: 'none',
+            background: '#1f1d1d', color: '#f2ede6', fontSize: 14, fontWeight: 600, cursor: 'pointer',
           }}
         >
           Reload Rudo

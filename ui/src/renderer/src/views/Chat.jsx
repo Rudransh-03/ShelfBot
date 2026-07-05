@@ -171,9 +171,10 @@ function renderHighlighted(text, query, occOffset, activeMatch, activeRef) {
 }
 
 function AiAvatar() {
+  // Canonical design: the mascot sits beside every Rudo answer.
   return (
     <div className="msg-avatar">
-      <BookshelfIcon size={14} color="#e8c995" />
+      <Mascot size="sm" state="idle" />
     </div>
   )
 }
@@ -223,8 +224,10 @@ function SourceChip({ source, onOpen }) {
         disabled={!clickable}
         title={clickable ? `Open ${fileName}${pageLabel ? ` ${pageLabel}` : ''}` : fileName}
       >
-        {fileName}
-        {pageLabel && <span className="src-chip-page"> {pageLabel}</span>}
+        <span className="src-chip-name">
+          {fileName}
+          {pageLabel && <span className="src-chip-page"> {pageLabel}</span>}
+        </span>
       </button>
       {snippets.length > 0 && (
         <span className="src-preview" role="tooltip">
@@ -321,7 +324,46 @@ function Message({ role, text, sources = [], variant, onOpenSource, streaming = 
     <div className={`msg-row ${role}`}>
       {role === 'ai' ? <AiAvatar /> : <UserAvatar />}
       <div className="msg-content">
-        <div className={`msg-bubble${variant ? ` ${variant}` : ''}`}>{body}</div>
+        <div className={`msg-bubble${variant ? ` ${variant}` : ''}`}>
+          {role === 'ai' && !variant && (
+            /* Answer-card header: name + the on-device trust badge */
+            <div className="msg-head">
+              <span className="msg-name">Rudo</span>
+              <span className="msg-ondevice">On-device</span>
+            </div>
+          )}
+          {body}
+          {role === 'ai' && sources.length > 0 && (
+            <div className="msg-sources">
+              {sources.map((s, i) => (
+                <SourceChip
+                  key={(typeof s === 'string' ? s : s.absolutePath || s.fileName) + ':' + i}
+                  source={s}
+                  onOpen={onOpenSource}
+                />
+              ))}
+            </div>
+          )}
+          {showActions && (
+            <div className="msg-actions">
+              <button className="msg-action" onClick={copy} title="Copy response">
+                {copied ? <CheckIcon /> : <CopyIcon />}
+                <span>{copied ? 'Copied' : 'Copy'}</span>
+              </button>
+              <button className="msg-action" onClick={email} title="Email this response">
+                {emailed ? <CheckIcon /> : <MailIcon />}
+                <span>{emailed ? 'Copied' : 'Email'}</span>
+              </button>
+              {tables.length > 0 && (
+                <button className="msg-action" onClick={exportExcel}
+                        title="Export table to Excel (.csv)">
+                  {exported ? <CheckIcon /> : <SheetIcon />}
+                  <span>{exported ? 'Exported' : 'Export'}</span>
+                </button>
+              )}
+            </div>
+          )}
+        </div>
         {Array.isArray(clarify) && clarify.length > 0 && (
           <div className="clarify-chips">
             {clarify.map(opt => (
@@ -333,36 +375,6 @@ function Message({ role, text, sources = [], variant, onOpenSource, streaming = 
           </div>
         )}
         {scope && <div className="msg-scope">Answering about: {scope}</div>}
-        {sources.length > 0 && (
-          <div className="msg-sources">
-            {sources.map((s, i) => (
-              <SourceChip
-                key={(typeof s === 'string' ? s : s.absolutePath || s.fileName) + ':' + i}
-                source={s}
-                onOpen={onOpenSource}
-              />
-            ))}
-          </div>
-        )}
-        {showActions && (
-          <div className="msg-actions">
-            <button className="msg-action" onClick={copy} title="Copy response">
-              {copied ? <CheckIcon /> : <CopyIcon />}
-              <span>{copied ? 'Copied' : 'Copy'}</span>
-            </button>
-            <button className="msg-action" onClick={email} title="Email this response">
-              {emailed ? <CheckIcon /> : <MailIcon />}
-              <span>{emailed ? 'Copied' : 'Email'}</span>
-            </button>
-            {tables.length > 0 && (
-              <button className="msg-action" onClick={exportExcel}
-                      title="Export table to Excel (.csv)">
-                {exported ? <CheckIcon /> : <SheetIcon />}
-                <span>{exported ? 'Exported' : 'Export'}</span>
-              </button>
-            )}
-          </div>
-        )}
       </div>
     </div>
   )

@@ -11,7 +11,6 @@ import SearchModal    from './components/SearchModal'
 import ClientSuggestionModal from './components/ClientSuggestionModal'
 import DeadlineReviewModal from './components/DeadlineReviewModal'
 import AttentionModal  from './components/AttentionModal'
-import BackgroundFX   from './components/BackgroundFX'
 import Chat           from './views/Chat'
 import Library        from './views/Library'
 import Deadlines      from './views/Deadlines'
@@ -91,7 +90,8 @@ function Shell() {
 
   return (
     <>
-      <BackgroundFX />
+      {/* BackgroundFX (neon constellation) retired — the paper aesthetic uses
+          a static dashed-grid backdrop painted by body::before in index.css. */}
       <LoadingOverlay visible={!loaded || !auth.checked} msg={loadMsg} />
 
       {showSignIn ? (

@@ -236,7 +236,7 @@ export default function Sidebar({ active, onNav, connected, collapsed = false, o
         {!collapsed && (
           <div className="sb-brand">
             <Mascot size="sm" state={mascotState} className="sb-brand-mascot" />
-            <div className="sb-brand-name">Rudo</div>
+            <div className="sb-brand-name">rudo<span className="brand-dot">.</span></div>
           </div>
         )}
       </div>

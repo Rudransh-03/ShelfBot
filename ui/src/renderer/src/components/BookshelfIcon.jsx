@@ -1,5 +1,6 @@
-/** Reusable inline SVG bookshelf logo used throughout the app. */
-export default function BookshelfIcon({ size = 24, color = 'white' }) {
+/** Reusable inline SVG bookshelf logo used throughout the app.
+    Defaults to the brand taupe; pass `currentColor` to inherit. */
+export default function BookshelfIcon({ size = 24, color = '#B3A798' }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none">
       <rect x="3"    y="3"    width="2.5" height="16"   rx=".8" fill={color} opacity=".9"/>

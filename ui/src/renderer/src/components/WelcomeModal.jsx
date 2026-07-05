@@ -126,7 +126,7 @@ export default function WelcomeModal() {
         {step === 0 && (
           <div className="welcome-step">
             <div className="welcome-hero">
-              <BookshelfIcon size={36} color="#e8c995" />
+              <BookshelfIcon size={36} />
             </div>
             <h2 className="welcome-title">Welcome to Rudo</h2>
             <p className="welcome-sub">

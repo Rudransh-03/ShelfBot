@@ -795,7 +795,7 @@ export default function Library({ active, onGoSettings }) {
             <button className="btn-primary" onClick={handleIndex} disabled={indexing || !connected}>
               {indexing ? (
                 <>
-                  <div className="spin-sm" style={{ borderTopColor: '#1a1610', borderColor: 'rgba(26,22,16,.3)' }} />
+                  <div className="spin-sm" style={{ borderTopColor: 'rgba(242,237,230,.95)', borderColor: 'rgba(242,237,230,.35)' }} />
                   Indexing…
                 </>
               ) : (

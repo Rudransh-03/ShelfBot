@@ -81,32 +81,31 @@ export default function Mascot({
         <defs>
           {/* Body — pale ice top to deeper neon-blue bottom for a glossy 3D feel. */}
           <linearGradient id="rudo-body" x1="0%" y1="0%" x2="0%" y2="100%">
-            <stop offset="0%"   stopColor="#f4f8ff" />
-            <stop offset="40%"  stopColor="#d3e3ff" />
-            <stop offset="100%" stopColor="#7aa6ee" />
-          </linearGradient>
+            <stop offset="0%"   stopColor="#FFFDF9" />
+            <stop offset="40%"  stopColor="#FAF8F3" />
+            <stop offset="100%" stopColor="#EDE6DA" />          </linearGradient>
           {/* Visor — dark glass strip across the head for the "smart" read. */}
           <linearGradient id="rudo-visor" x1="0%" y1="0%" x2="0%" y2="100%">
-            <stop offset="0%"   stopColor="#1a2952" />
-            <stop offset="100%" stopColor="#050816" />
+            <stop offset="0%"   stopColor="#2A2727" />
+            <stop offset="100%" stopColor="#1F1D1D" />
           </linearGradient>
           {/* Glowing chest core. */}
           <radialGradient id="rudo-core" cx="50%" cy="50%" r="50%">
-            <stop offset="0%"   stopColor="#bdf3ff" />
-            <stop offset="55%"  stopColor="#4ddbff" />
-            <stop offset="100%" stopColor="rgba(77, 219, 255, 0)" />
+            <stop offset="0%"   stopColor="#FFFDF9" />
+            <stop offset="55%"  stopColor="#B3A798" />
+            <stop offset="100%" stopColor="rgba(179, 167, 152, 0)" />
           </radialGradient>
           {/* Book cover. */}
           <linearGradient id="rudo-book" x1="0%" y1="0%" x2="0%" y2="100%">
-            <stop offset="0%"   stopColor="#2c4490" />
-            <stop offset="100%" stopColor="#1a2856" />
+            <stop offset="0%"   stopColor="#C4B8A9" />
+            <stop offset="100%" stopColor="#B3A798" />
           </linearGradient>
         </defs>
 
         {/* ── Ground shadow (hovering effect) ─────────────────────────── */}
         <ellipse
           cx="100" cy="225" rx="48" ry="6"
-          fill="rgba(0, 0, 0, 0.35)"
+          fill="rgba(20, 19, 19, 0.18)"
           className="mascot-shadow"
         />
 
@@ -115,43 +114,43 @@ export default function Mascot({
 
           {/* ── Antennae (two short ears with neon tips) ──────────────── */}
           <g className="mascot-ears">
-            <line x1="74" y1="38" x2="68" y2="22" stroke="#5b9dff" strokeWidth="3" strokeLinecap="round" />
-            <circle cx="68" cy="20" r="4" fill="#7feaff" className="mascot-antenna-tip" />
-            <line x1="126" y1="38" x2="132" y2="22" stroke="#5b9dff" strokeWidth="3" strokeLinecap="round" />
-            <circle cx="132" cy="20" r="4" fill="#7feaff" className="mascot-antenna-tip" />
+            <line x1="74" y1="38" x2="68" y2="22" stroke="#141313" strokeWidth="3" strokeLinecap="round" />
+            <circle cx="68" cy="20" r="4" fill="#B3A798" className="mascot-antenna-tip" />
+            <line x1="126" y1="38" x2="132" y2="22" stroke="#141313" strokeWidth="3" strokeLinecap="round" />
+            <circle cx="132" cy="20" r="4" fill="#B3A798" className="mascot-antenna-tip" />
           </g>
 
           {/* ── Head ──────────────────────────────────────────────────── */}
           <g className="mascot-head">
             {/* Head shape — rounded rectangle */}
-            <rect x="50" y="36" width="100" height="92" rx="38" ry="38" fill="url(#rudo-body)" />
+            <rect x="50" y="36" width="100" height="92" rx="38" ry="38" fill="url(#rudo-body)" stroke="#141313" strokeWidth="2.6" />
             {/* Subtle glossy highlight */}
-            <ellipse cx="76" cy="58" rx="16" ry="7" fill="rgba(255, 255, 255, 0.55)" />
+            <ellipse cx="76" cy="58" rx="16" ry="7" fill="rgba(255, 255, 255, 0.5)" />
             {/* Dark visor strip across the face */}
             <rect x="58" y="68" width="84" height="34" rx="17" ry="17" fill="url(#rudo-visor)" />
             {/* Visor edge highlight */}
-            <rect x="58" y="68" width="84" height="2" rx="1" fill="rgba(91, 157, 255, 0.4)" />
+            <rect x="58" y="68" width="84" height="2" rx="1" fill="rgba(242, 237, 230, 0.18)" />
 
             {/* Eyes inside visor */}
             <g className="mascot-eyes">
               {eyesHappy ? (
                 <>
-                  <path d="M 72 90 Q 80 80 88 90" stroke="#7feaff" strokeWidth="3.5" strokeLinecap="round" fill="none" />
-                  <path d="M 112 90 Q 120 80 128 90" stroke="#7feaff" strokeWidth="3.5" strokeLinecap="round" fill="none" />
+                  <path d="M 72 90 Q 80 80 88 90" stroke="#F2EDE6" strokeWidth="3.5" strokeLinecap="round" fill="none" />
+                  <path d="M 112 90 Q 120 80 128 90" stroke="#F2EDE6" strokeWidth="3.5" strokeLinecap="round" fill="none" />
                 </>
               ) : eyesClosed ? (
                 <>
-                  <line x1="72" y1="86" x2="88" y2="86" stroke="#7feaff" strokeWidth="3.5" strokeLinecap="round" />
-                  <line x1="112" y1="86" x2="128" y2="86" stroke="#7feaff" strokeWidth="3.5" strokeLinecap="round" />
+                  <line x1="72" y1="86" x2="88" y2="86" stroke="#F2EDE6" strokeWidth="3.5" strokeLinecap="round" />
+                  <line x1="112" y1="86" x2="128" y2="86" stroke="#F2EDE6" strokeWidth="3.5" strokeLinecap="round" />
                 </>
               ) : (
                 <>
                   {/* Glowing cyan eyes — bigger when listening */}
-                  <circle cx="80"  cy="86" r={listening ? 6 : 5} fill="#7feaff" className="mascot-eye" />
-                  <circle cx="120" cy="86" r={listening ? 6 : 5} fill="#7feaff" className="mascot-eye" />
+                  <circle cx="80"  cy="86" r={listening ? 6 : 5} fill="#F2EDE6" className="mascot-eye" />
+                  <circle cx="120" cy="86" r={listening ? 6 : 5} fill="#F2EDE6" className="mascot-eye" />
                   {/* Pupils — centered, not offset, so Rudo looks straight at the user */}
-                  <circle cx="80"  cy="86" r="1.8" fill="#021022" />
-                  <circle cx="120" cy="86" r="1.8" fill="#021022" />
+                  <circle cx="80"  cy="86" r="1.8" fill="#141313" />
+                  <circle cx="120" cy="86" r="1.8" fill="#141313" />
                   {/* Tiny catch-light specular highlight, top-left of each eye */}
                   <circle cx="78"  cy="84" r="0.9" fill="rgba(255,255,255,0.8)" />
                   <circle cx="118" cy="84" r="0.9" fill="rgba(255,255,255,0.8)" />
@@ -161,15 +160,15 @@ export default function Mascot({
 
             {/* Glasses frame outside the visor for the "smart" silhouette */}
             <g className="mascot-glasses" opacity="0.7">
-              <circle cx="80"  cy="86" r="11" fill="none" stroke="#0a1530" strokeWidth="1.8" />
-              <circle cx="120" cy="86" r="11" fill="none" stroke="#0a1530" strokeWidth="1.8" />
-              <line x1="91" y1="86" x2="109" y2="86" stroke="#0a1530" strokeWidth="1.8" />
+              <circle cx="80"  cy="86" r="11" fill="none" stroke="#141313" strokeWidth="1.8" />
+              <circle cx="120" cy="86" r="11" fill="none" stroke="#141313" strokeWidth="1.8" />
+              <line x1="91" y1="86" x2="109" y2="86" stroke="#141313" strokeWidth="1.8" />
             </g>
 
             {/* Small mouth */}
             <path
               d={eyesHappy ? 'M 88 116 Q 100 124 112 116' : 'M 92 116 Q 100 119 108 116'}
-              stroke="#2c3a66"
+              stroke="#5e564c"
               strokeWidth="2"
               fill="none"
               strokeLinecap="round"
@@ -177,7 +176,7 @@ export default function Mascot({
           </g>
 
           {/* ── Neck connector ────────────────────────────────────────── */}
-          <rect x="93" y="128" width="14" height="8" rx="3" fill="#7aa6ee" />
+          <rect x="93" y="128" width="14" height="8" rx="3" fill="#C4B8A9" stroke="#141313" strokeWidth="1.6" />
 
           {/* ── Body / torso ──────────────────────────────────────────── */}
           <g className="mascot-torso">
@@ -192,53 +191,56 @@ export default function Mascot({
                  L 68 204
                  Q 56 204 56 192 Z"
               fill="url(#rudo-body)"
+              stroke="#141313"
+              strokeWidth="2.4"
+              strokeLinejoin="round"
             />
             {/* Subtle highlight on body */}
-            <ellipse cx="80" cy="150" rx="12" ry="5" fill="rgba(255,255,255,0.4)" />
+            <ellipse cx="80" cy="150" rx="12" ry="5" fill="rgba(255,255,255,0.45)" />
 
             {/* Chest core — glowing */}
             <circle cx="100" cy="170" r="14" fill="url(#rudo-core)" className="mascot-core-glow" />
-            <circle cx="100" cy="170" r="6"  fill="#bdf3ff" className="mascot-core" />
+            <circle cx="100" cy="170" r="6"  fill="#FFFDF9" className="mascot-core" />
             <circle cx="100" cy="170" r="3"  fill="#fff" />
 
             {/* A small badge under the core like a "ShelfBot" label hint */}
-            <rect x="86" y="190" width="28" height="3" rx="1.5" fill="rgba(255,255,255,0.5)" />
+            <rect x="86" y="190" width="28" height="3" rx="1.5" fill="rgba(20,19,19,0.18)" />
           </g>
 
           {/* ── Left arm holding an open book ─────────────────────────── */}
           <g className="mascot-arm-left">
             {/* upper arm */}
-            <rect x="38" y="148" width="14" height="32" rx="7" fill="url(#rudo-body)" transform="rotate(-12 45 164)" />
+            <rect x="38" y="148" width="14" height="32" rx="7" fill="url(#rudo-body)" stroke="#141313" strokeWidth="2" transform="rotate(-12 45 164)" />
             {/* hand */}
-            <circle cx="34" cy="184" r="9" fill="#d3e3ff" />
+            <circle cx="34" cy="184" r="9" fill="#FAF8F3" stroke="#141313" strokeWidth="2" />
             {/* open book held in the hand */}
             <g transform="translate(8, 178) rotate(-8)">
-              <rect x="0" y="0" width="36" height="26" rx="2" fill="url(#rudo-book)" />
+              <rect x="0" y="0" width="36" height="26" rx="2" fill="url(#rudo-book)" stroke="#141313" strokeWidth="1.8" />
               {/* page split */}
-              <line x1="18" y1="2" x2="18" y2="24" stroke="rgba(255,255,255,0.5)" strokeWidth="1" />
+              <line x1="18" y1="2" x2="18" y2="24" stroke="rgba(255,253,249,0.75)" strokeWidth="1" />
               {/* text lines */}
-              <line x1="3"  y1="8"  x2="14" y2="8"  stroke="rgba(255,255,255,0.7)" strokeWidth="1.4" strokeLinecap="round" />
-              <line x1="3"  y1="13" x2="14" y2="13" stroke="rgba(255,255,255,0.7)" strokeWidth="1.4" strokeLinecap="round" />
-              <line x1="3"  y1="18" x2="11" y2="18" stroke="rgba(255,255,255,0.7)" strokeWidth="1.4" strokeLinecap="round" />
-              <line x1="22" y1="8"  x2="33" y2="8"  stroke="rgba(255,255,255,0.7)" strokeWidth="1.4" strokeLinecap="round" />
-              <line x1="22" y1="13" x2="33" y2="13" stroke="rgba(255,255,255,0.7)" strokeWidth="1.4" strokeLinecap="round" />
-              <line x1="22" y1="18" x2="30" y2="18" stroke="rgba(255,255,255,0.7)" strokeWidth="1.4" strokeLinecap="round" />
+              <line x1="3"  y1="8"  x2="14" y2="8"  stroke="rgba(20,19,19,0.45)" strokeWidth="1.4" strokeLinecap="round" />
+              <line x1="3"  y1="13" x2="14" y2="13" stroke="rgba(20,19,19,0.45)" strokeWidth="1.4" strokeLinecap="round" />
+              <line x1="3"  y1="18" x2="11" y2="18" stroke="rgba(20,19,19,0.45)" strokeWidth="1.4" strokeLinecap="round" />
+              <line x1="22" y1="8"  x2="33" y2="8"  stroke="rgba(20,19,19,0.45)" strokeWidth="1.4" strokeLinecap="round" />
+              <line x1="22" y1="13" x2="33" y2="13" stroke="rgba(20,19,19,0.45)" strokeWidth="1.4" strokeLinecap="round" />
+              <line x1="22" y1="18" x2="30" y2="18" stroke="rgba(20,19,19,0.45)" strokeWidth="1.4" strokeLinecap="round" />
             </g>
           </g>
 
           {/* ── Right arm — small wave that bumps on happy ────────────── */}
           <g className="mascot-arm-right">
-            <rect x="148" y="148" width="14" height="32" rx="7" fill="url(#rudo-body)" transform="rotate(12 155 164)" />
-            <circle cx="166" cy="184" r="9" fill="#d3e3ff" />
+            <rect x="148" y="148" width="14" height="32" rx="7" fill="url(#rudo-body)" stroke="#141313" strokeWidth="2" transform="rotate(12 155 164)" />
+            <circle cx="166" cy="184" r="9" fill="#FAF8F3" stroke="#141313" strokeWidth="2" />
           </g>
         </g>
 
         {/* Thinking: three dots orbiting the head */}
         {state === 'thinking' && (
           <g className="mascot-orbit" style={{ transformOrigin: '100px 84px' }}>
-            <circle cx="100" cy="20" r="3" fill="#4ddbff" />
-            <circle cx="100" cy="20" r="3" fill="#4ddbff" transform="rotate(120 100 84)" opacity="0.6" />
-            <circle cx="100" cy="20" r="3" fill="#4ddbff" transform="rotate(240 100 84)" opacity="0.3" />
+            <circle cx="100" cy="20" r="3" fill="#B3A798" />
+            <circle cx="100" cy="20" r="3" fill="#B3A798" transform="rotate(120 100 84)" opacity="0.6" />
+            <circle cx="100" cy="20" r="3" fill="#B3A798" transform="rotate(240 100 84)" opacity="0.3" />
           </g>
         )}
 
@@ -246,10 +248,10 @@ export default function Mascot({
         {state === 'sleeping' && (
           <text
             x="146" y="50"
-            fill="#7aa6ee"
+            fill="#B3A798"
             fontSize="18"
             fontWeight="700"
-            fontFamily="Space Grotesk, ui-sans-serif, system-ui"
+            fontFamily="Manrope, ui-sans-serif, system-ui"
             className="mascot-zzz"
           >z</text>
         )}

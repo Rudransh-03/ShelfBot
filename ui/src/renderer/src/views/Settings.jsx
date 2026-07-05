@@ -497,7 +497,7 @@ export default function Settings({ active, onGoLibrary }) {
           <div className="scard-sub">Project information.</div>
           <div className="about-inner">
             <div className="about-logo">
-              <BookshelfIcon size={28} color="#e8c995" />
+              <BookshelfIcon size={28} />
             </div>
             <div className="about-info">
               <h3>Rudo <span className="ver-badge">v1.0.0</span></h3>

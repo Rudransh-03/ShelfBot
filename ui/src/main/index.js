@@ -380,7 +380,7 @@ function createWindow(port) {
     minHeight: 580,
     frame:           false,
     titleBarStyle:   'hidden',
-    backgroundColor: '#0b0b14',
+    backgroundColor: '#f2ede6', // paper — no dark flash before React mounts
     show:            false,
     webPreferences: {
       preload:          join(__dirname, '../preload/index.js'),

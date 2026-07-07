@@ -31,12 +31,17 @@ public final class ExtractionService {
 
     private static final Logger log = LoggerFactory.getLogger(ExtractionService.class);
 
-    // Reuse the deadline scan's proven batch bounds.
     private static final int MAX_BATCH_CHARS = 280_000;
-    private static final int MAX_BATCH_DOCS  = 10;
-    /** Per-document content cap. Extraction reads a document prefix (header
-     *  fields), not the whole file, so batches stay within the reply budget. */
-    private static final int MAX_DOC_CHARS   = 8_000;
+    /** Documents per LLM call. Kept SMALL (was 10): packing many documents into
+     *  one reply dilutes the model's attention and lets one document's value bleed
+     *  into another's row. Fewer docs per call trades a modest cost/latency
+     *  increase for materially higher per-field accuracy. */
+    private static final int MAX_BATCH_DOCS  = 3;
+    /** Per-document content cap. Raised (was 8k) so a value that sits deeper than
+     *  the first page — an invoice total, a mid-contract clause — actually reaches
+     *  the model instead of being truncated away. Still bounded so a batch of
+     *  {@link #MAX_BATCH_DOCS} documents stays well within the model's context. */
+    private static final int MAX_DOC_CHARS   = 16_000;
     /** Output-token ceiling for one extraction call. */
     public static final int EXTRACTION_MAX_TOKENS = 3_000;
 

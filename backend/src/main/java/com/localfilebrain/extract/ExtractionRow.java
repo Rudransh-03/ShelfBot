@@ -26,4 +26,9 @@ public record ExtractionRow(int docId, String fileName, String absolutePath,
     public boolean hasAmbiguity() {
         return fields.values().stream().anyMatch(ExtractedValue::isAmbiguous);
     }
+
+    /** True when at least one field needs review (ambiguous OR unverified). */
+    public boolean hasFlagged() {
+        return fields.values().stream().anyMatch(ExtractedValue::isFlagged);
+    }
 }

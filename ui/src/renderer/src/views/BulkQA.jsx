@@ -256,6 +256,11 @@ export default function BulkQA({ active }) {
 
 function BulkCell({ cell }) {
   if (!cell || cell.status === 'MISSING') return <td className="ex-cell ex-cell-missing">— not found in this document</td>
-  if (cell.status === 'AMBIGUOUS') return <td className="ex-cell ex-cell-ambiguous" title={cell.note}>{cell.value} <span className="ex-amb-flag">⚠ ambiguous</span></td>
-  return <td className="ex-cell">{cell.value}</td>
+  const evidenceTip = cell.evidence ? `Found in document: “${cell.evidence}”` : ''
+  if (cell.status === 'AMBIGUOUS' || cell.status === 'UNVERIFIED') {
+    const flag = cell.status === 'UNVERIFIED' ? '⚠ unverified' : '⚠ ambiguous'
+    const tip = [cell.note, evidenceTip].filter(Boolean).join('\n') || 'Needs review'
+    return <td className="ex-cell ex-cell-ambiguous" title={tip}>{cell.value} <span className="ex-amb-flag">{flag}</span></td>
+  }
+  return <td className="ex-cell" title={evidenceTip || undefined}>{cell.value}</td>
 }

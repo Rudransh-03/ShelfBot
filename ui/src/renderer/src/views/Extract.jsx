@@ -402,15 +402,20 @@ export default function Extract({ active }) {
   )
 }
 
-// One result cell. Ambiguous → muted + marker + tooltip; missing → em dash.
+// One result cell. Flagged (ambiguous / unverified) → muted + marker + tooltip;
+// missing → em dash. Every present value carries its source evidence quote as a
+// hover tooltip so the user can verify without reopening the file.
 function ExCell({ cell }) {
   if (!cell || cell.status === 'MISSING') return <td className="ex-cell ex-cell-missing">—</td>
-  if (cell.status === 'AMBIGUOUS') {
+  const evidenceTip = cell.evidence ? `Found in document: “${cell.evidence}”` : ''
+  if (cell.status === 'AMBIGUOUS' || cell.status === 'UNVERIFIED') {
+    const flag = cell.status === 'UNVERIFIED' ? '⚠ unverified' : '⚠ ambiguous'
+    const tip = [cell.note, evidenceTip].filter(Boolean).join('\n') || 'Needs review'
     return (
-      <td className="ex-cell ex-cell-ambiguous" title={cell.note || 'Ambiguous value'}>
-        {cell.value} <span className="ex-amb-flag">⚠ ambiguous</span>
+      <td className="ex-cell ex-cell-ambiguous" title={tip}>
+        {cell.value} <span className="ex-amb-flag">{flag}</span>
       </td>
     )
   }
-  return <td className="ex-cell">{cell.value}</td>
+  return <td className="ex-cell" title={evidenceTip || undefined}>{cell.value}</td>
 }

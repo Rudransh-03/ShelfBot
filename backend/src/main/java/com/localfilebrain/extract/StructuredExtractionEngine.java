@@ -42,6 +42,16 @@ public final class StructuredExtractionEngine {
     private static final Logger log = LoggerFactory.getLogger(StructuredExtractionEngine.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    /** Total attempts for one batch when the model replies without parseable JSON.
+     *  A transient bad reply (prose, a truncated object) is retried with a
+     *  stricter reminder before we give up and record the batch unreadable. */
+    private static final int MAX_ATTEMPTS = 3;
+
+    /** Appended to the user prompt on a retry after an unparseable reply. */
+    private static final String JSON_RETRY_SUFFIX =
+            "\n\nIMPORTANT: your previous reply was not valid JSON. Reply with ONLY "
+          + "the JSON object described above — no prose, no explanation, no markdown fences.";
+
     private StructuredExtractionEngine() {}
 
     /** Seam over the LLM so prompt-building + parsing are testable with a fake. */
@@ -77,13 +87,24 @@ public final class StructuredExtractionEngine {
             return new BatchResult(List.of(), false);
         if (opts == null) opts = ExtractionOptions.defaults();
 
-        String raw = llm.call(buildSystemPrompt(schema), buildUserPrompt(docs, schema));
-        JsonNode root = rootJson(raw);
-        if (root == null) {
-            log.warn("Extraction reply had no readable JSON; head: {}",
-                    raw == null ? "" : raw.substring(0, Math.min(raw.length(), 160)));
-            return new BatchResult(List.of(), true);
+        // Retry an unparseable reply a couple of times with a stricter reminder
+        // before giving up — a transient prose/truncated response shouldn't cost
+        // the whole batch its rows.
+        String sys      = buildSystemPrompt(schema);
+        String baseUser = buildUserPrompt(docs, schema);
+        JsonNode root   = null;
+        int attempts    = 0;
+        for (int attempt = 1; attempt <= MAX_ATTEMPTS && root == null; attempt++) {
+            attempts = attempt;
+            String user = attempt == 1 ? baseUser : baseUser + JSON_RETRY_SUFFIX;
+            String raw  = llm.call(sys, user);
+            root = rootJson(raw);
+            if (root == null) {
+                log.warn("Extraction reply had no readable JSON (attempt {}/{}); head: {}",
+                        attempt, MAX_ATTEMPTS, raw == null ? "" : raw.substring(0, Math.min(raw.length(), 160)));
+            }
         }
+        if (root == null) return new BatchResult(List.of(), true);
 
         Map<Integer, DocPayload> byId = new LinkedHashMap<>();
         for (DocPayload d : docs) byId.put(d.docId(), d);
@@ -93,6 +114,7 @@ public final class StructuredExtractionEngine {
         if (rows == null || !rows.isArray()) return new BatchResult(List.of(), false);
 
         List<ExtractionRow> out = new ArrayList<>();
+        int unverified = 0;
         for (JsonNode node : rows) {
             int docId = node.path("doc").asInt(node.path("docId").asInt(0));
             DocPayload d = byId.get(docId);
@@ -100,18 +122,109 @@ public final class StructuredExtractionEngine {
                 log.debug("Dropping extracted row with unknown docId {}", docId);
                 continue;
             }
+            // The source text this document's values must be grounded against.
+            String sourceText = d.snippets() == null ? "" : String.join("\n", d.snippets());
             JsonNode fieldsNode = node.get("fields");
             Map<String, ExtractedValue> fields = new LinkedHashMap<>();
             for (ExtractionField f : schema) {
-                String rawVal = fieldsNode == null ? null : textOrNull(fieldsNode, f.name());
-                fields.put(f.name(), validate(f, rawVal, opts));
+                FieldVal fv = readField(fieldsNode, f.name());
+                ExtractedValue typed    = validate(f, fv.value(), opts);            // format layer
+                ExtractedValue grounded = ground(typed, fv.evidence(), sourceText, f.type()); // verification layer
+                if (grounded.isUnverified()) unverified++;
+                fields.put(f.name(), grounded);
             }
             out.add(new ExtractionRow(docId, d.fileName(), null, fields));
         }
-        log.info("Extraction batch: {} doc(s) -> {} row(s), {} field(s) (1 LLM call)",
-                docs.size(), out.size(), schema.size());
+        log.info("Extraction batch: {} doc(s) -> {} row(s), {} field(s), {} unverified ({} LLM attempt(s))",
+                docs.size(), out.size(), schema.size(), unverified, attempts);
         return new BatchResult(out, false);
     }
+
+    /** A field's raw contribution from the model reply: value + cited evidence. */
+    private record FieldVal(String value, String evidence) {}
+
+    /**
+     * Reads one field from the reply, tolerating both the evidence-carrying shape
+     * {@code {"value":..,"evidence":..}} and a bare {@code "value"} string (older
+     * / lazy replies). Missing or null → (null, "").
+     */
+    private static FieldVal readField(JsonNode fieldsNode, String name) {
+        if (fieldsNode == null) return new FieldVal(null, "");
+        JsonNode fn = fieldsNode.get(name);
+        if (fn == null || fn.isNull()) return new FieldVal(null, "");
+        if (fn.isObject()) {
+            return new FieldVal(textOrNull(fn, "value"), nullToEmpty(textOrNull(fn, "evidence")));
+        }
+        return new FieldVal(fn.isValueNode() ? fn.asText() : fn.toString(), "");
+    }
+
+    // ── Grounding: reject values that aren't actually in the document ──────────
+
+    /**
+     * Verifies a typed value against the document's own text. Faithfulness layer,
+     * separate from format validation:
+     * <ul>
+     *   <li>If the model cited evidence that ISN'T in the source, the value is
+     *       {@link ExtractedValue.Status#UNVERIFIED} (fabricated citation).
+     *   <li>For factual fields (currency/number/date), the value's digits/text
+     *       must appear in the cited evidence or the source, else UNVERIFIED.
+     *   <li>Free-text / boolean values are grounded by a valid evidence quote;
+     *       when the model gives no evidence for them we can't verify prose, so
+     *       we keep the value rather than over-flag it.
+     * </ul>
+     * A grounded value keeps its status (OK/AMBIGUOUS) and carries the evidence.
+     * MISSING values pass through untouched.
+     */
+    static ExtractedValue ground(ExtractedValue typed, String evidence, String source, FieldType type) {
+        if (typed.isMissing()) return typed;
+
+        String ev       = evidence == null ? "" : evidence.trim();
+        String nSource  = norm(source);
+        boolean provided = !ev.isEmpty();
+        boolean evidenceFound = provided && !nSource.isEmpty() && nSource.contains(norm(ev));
+
+        if (provided && !evidenceFound) {
+            return ExtractedValue.unverified(typed.value(), ev,
+                    "The quoted evidence was not found in the document — please verify.");
+        }
+
+        boolean grounded;
+        if (evidenceFound) {
+            grounded = !isFactual(type)
+                    || valueInText(typed.value(), norm(ev))
+                    || valueInText(typed.value(), nSource);
+        } else { // no evidence provided
+            grounded = !isFactual(type) || valueInText(typed.value(), nSource);
+        }
+
+        if (grounded) return typed.withEvidence(evidenceFound ? ev : "");
+        return ExtractedValue.unverified(typed.value(), ev,
+                "This value could not be located in the document text — please verify.");
+    }
+
+    private static boolean isFactual(FieldType type) {
+        return type == FieldType.CURRENCY || type == FieldType.NUMBER || type == FieldType.DATE;
+    }
+
+    /** True if the value (as text, or as a grouping-insensitive digit run) occurs in {@code haystack}. */
+    static boolean valueInText(String value, String haystack) {
+        String nv = norm(value);
+        if (nv.isEmpty() || haystack == null || haystack.isEmpty()) return false;
+        if (haystack.contains(nv)) return true;
+        String dv = digitsOf(value);
+        return !dv.isEmpty() && digitsOf(haystack).contains(dv);
+    }
+
+    /** Lowercase + whitespace-collapsed, for tolerant substring matching. */
+    static String norm(String s) {
+        return s == null ? "" : s.toLowerCase().replaceAll("\\s+", " ").trim();
+    }
+
+    private static String digitsOf(String s) {
+        return s == null ? "" : s.replaceAll("[^0-9]", "");
+    }
+
+    private static String nullToEmpty(String s) { return s == null ? "" : s; }
 
     // ── Per-type validation (the only non-generic step; still domain-neutral) ─
 
@@ -240,20 +353,31 @@ public final class StructuredExtractionEngine {
             {
               "rows": [
                 { "doc": <integer document id, copied from the excerpt header>,
-                  "fields": { "<field name>": "<value as a string>", ... } }
+                  "fields": {
+                    "<field name>": {
+                       "value":    "<value as a string, or null if not present>",
+                       "evidence": "<a SHORT VERBATIM quote copied from THIS document that contains the value>"
+                    }
+                  } }
               ]
             }
 
             Rules:
               - Emit exactly ONE row per document id you were given.
               - Use ONLY the excerpts. NEVER invent a value. If a field is not
-                present in a document, set it to null (do not guess).
+                present in a document, set its "value" to null and "evidence" to "".
+              - EVIDENCE IS MANDATORY for every non-null value. Copy a short, EXACT
+                quote (a few words, verbatim, INCLUDING the value) straight from
+                that document's excerpts — do not paraphrase or shorten it beyond
+                recognition. If you cannot quote the value from the text, it is not
+                really there: return null instead of guessing. A value whose
+                evidence is not found verbatim in the document will be rejected.
               - Copy values as they appear in the document. For DATE fields, return
                 the date EXACTLY as written — do NOT reorder, reformat, or convert
                 day/month order. For CURRENCY/NUMBER fields, return the number as
                 written (a downstream step formats it); never fabricate an amount.
               - For BOOLEAN fields answer "Yes" or "No" when the document makes it
-                clear, else null.
+                clear (still give the evidence quote), else null.
               - Keep every value short (a single field value, not a sentence),
                 unless the field description asks for a longer answer.
             """;
@@ -275,7 +399,7 @@ public final class StructuredExtractionEngine {
             sb.append(" ===\n");
             int n = 1;
             for (String snip : d.snippets()) {
-                sb.append("Excerpt ").append(n++).append(": ").append(trim(snip, 1600)).append("\n");
+                sb.append("Excerpt ").append(n++).append(": ").append(trim(snip, 6000)).append("\n");
             }
             sb.append("\n");
         }

@@ -147,7 +147,8 @@ export function tablesToCsv(tables) {
 // never leaves the app looking identical to a confident one. MISSING \u2192 blank.
 function renderExtractionCell(cell) {
   if (!cell || cell.status === 'MISSING') return ''
-  if (cell.status === 'AMBIGUOUS') return `${cell.value} [AMBIGUOUS]`
+  if (cell.status === 'AMBIGUOUS')  return `${cell.value} [AMBIGUOUS]`
+  if (cell.status === 'UNVERIFIED') return `${cell.value} [UNVERIFIED]`
   return cell.value ?? ''
 }
 

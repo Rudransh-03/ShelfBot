@@ -53,8 +53,8 @@ class ExtractionServiceTest {
         assertEquals(25, r.rows().size());
         assertFalse(r.cancelled());
         assertEquals(0, r.truncatedBatches());
-        // 25 docs / 10 per batch → 3 batches (3 progress ticks).
-        assertEquals(3, batches.get());
+        // 25 docs / 3 per batch → 9 batches (ceil), one progress tick each.
+        assertEquals(9, batches.get());
         for (int i = 0; i < 25; i++) {
             assertEquals("f" + (i + 1) + ".pdf", r.rows().get(i).fileName());
             assertEquals("/docs/f" + (i + 1) + ".pdf", r.rows().get(i).absolutePath());
@@ -77,7 +77,7 @@ class ExtractionServiceTest {
                 ExtractionService.ProgressListener.NOOP, () -> false);
         assertEquals(15, r.rows().size());
         assertTrue(r.rows().stream().allMatch(x -> x.fields().get("Answer").isMissing()));
-        assertEquals(2, r.truncatedBatches()); // 15 → batches of 10 + 5
+        assertEquals(5, r.truncatedBatches()); // 15 docs / 3 per batch → 5 batches
     }
 
     @Test
@@ -85,9 +85,9 @@ class ExtractionServiceTest {
         AtomicInteger processed = new AtomicInteger();
         var r = svc().run(files(25), SCHEMA, ExtractionOptions.defaults(), echo("yes", -1),
                 (proc, total) -> processed.set(proc),
-                () -> processed.get() >= 10);  // cancel once the first batch is done
+                () -> processed.get() >= 3);  // cancel once the first batch (3 docs) is done
         assertTrue(r.cancelled());
-        assertEquals(10, r.rows().size(), "only the first completed batch is returned");
+        assertEquals(3, r.rows().size(), "only the first completed batch is returned");
     }
 
     @Test

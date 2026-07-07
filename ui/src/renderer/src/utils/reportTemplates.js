@@ -61,9 +61,11 @@ function reportShell(title, subtitle, bodyHtml) {
 
 function cellHtml(cell) {
   if (!cell || cell.status === 'MISSING') return `<td class="missing">—</td>`
-  if (cell.status === 'AMBIGUOUS') {
-    return `<td class="ambiguous">${esc(cell.value)}<span class="flag">⚠ ambiguous</span>` +
-      `${cell.note ? `<div class="note">${esc(cell.note)}</div>` : ''}</td>`
+  if (cell.status === 'AMBIGUOUS' || cell.status === 'UNVERIFIED') {
+    const flag = cell.status === 'UNVERIFIED' ? '⚠ unverified' : '⚠ ambiguous'
+    const note = cell.note ? `<div class="note">${esc(cell.note)}</div>` : ''
+    const ev   = cell.evidence ? `<div class="note">Evidence: “${esc(cell.evidence)}”</div>` : ''
+    return `<td class="ambiguous">${esc(cell.value)}<span class="flag">${flag}</span>${note}${ev}</td>`
   }
   return `<td>${esc(cell.value)}</td>`
 }
@@ -73,7 +75,7 @@ function findCell(row, name) {
 }
 
 function hasAnyAmbiguity(rows) {
-  return (rows || []).some(r => (r.cells || []).some(c => c.status === 'AMBIGUOUS'))
+  return (rows || []).some(r => (r.cells || []).some(c => c.status === 'AMBIGUOUS' || c.status === 'UNVERIFIED'))
 }
 
 // ── Extraction Report / Client Summary (structured table) ───────────────────

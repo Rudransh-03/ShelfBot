@@ -1099,15 +1099,18 @@ public final class ApiServer {
             for (var f : schema) {
                 var v = row.fields().get(f.name());
                 cells.add(map(
-                        "name",   f.name(),
-                        "value",  v == null ? "" : v.value(),
-                        "status", v == null ? "MISSING" : v.status().name(),
-                        "note",   v == null ? "" : v.note()));
+                        "name",     f.name(),
+                        "value",    v == null ? "" : v.value(),
+                        "status",   v == null ? "MISSING" : v.status().name(),
+                        "note",     v == null ? "" : v.note(),
+                        "evidence", v == null ? "" : v.evidence()));
             }
             rows.add(map(
                     "fileName",     row.fileName(),
                     "absolutePath", row.absolutePath(),
-                    "ambiguous",    row.hasAmbiguity(),
+                    // "ambiguous" now means "needs review" (ambiguous OR unverified)
+                    // so the UI's review indicator lights up for both.
+                    "ambiguous",    row.hasFlagged(),
                     "cells",        cells));
         }
         return map("done", true, "columns", columns, "rows", rows,

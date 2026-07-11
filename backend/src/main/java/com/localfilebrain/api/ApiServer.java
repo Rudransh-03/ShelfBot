@@ -1556,16 +1556,40 @@ public final class ApiServer {
         String realFocus = (focus != null && metadataStore.clientExists(focus)) ? focus : null;
         ClientResolver.Resolution r = ClientResolver.resolve(question, realFocus, clients);
         switch (r.kind()) {
-            case NONE -> { return ScopeDecision.unscoped(); }
+            case NONE -> {
+                // Carry an explicit "Personal / unfiled" choice across plain follow-ups.
+                if (UNASSIGNED.equals(focus)) {
+                    return ScopeDecision.scoped(unassignedPaths(), UNASSIGNED, "Personal / unfiled");
+                }
+                // A general question RELEASES any stale client focus, so it can't
+                // haunt the NEXT turn. Without this, a chat that touched client A
+                // then asked something general kept A in focus, and a later bare
+                // follow-up ("what's the penalty if they miss it?") wrongly
+                // re-scoped to A and dead-ended (the AOC-4 bug).
+                if (focus != null) cs.setFocus(convId, null);
+                return ScopeDecision.unscoped();
+            }
             case SCOPED -> {
                 cs.setFocus(convId, r.clientId());
                 return ScopeDecision.scoped(new java.util.HashSet<>(metadataStore.pathsForClient(r.clientId())),
                         r.clientId(), clientName(clients, r.clientId()));
             }
             case CLARIFY -> {
-                // Carry an explicit "Personal / unfiled" choice across plain follow-ups.
-                if (UNASSIGNED.equals(focus) && "no client specified".equals(r.reason())) {
-                    return ScopeDecision.scoped(unassignedPaths(), UNASSIGNED, "Personal / unfiled");
+                // Duplicate registrations of the SAME entity ("Meridian Exports
+                // Pvt Ltd" vs "Meridian Exports Private Limited") are not real
+                // ambiguity — and their files are typically conflicted-out of
+                // both, so scoping to either would find nothing. Answer
+                // generally instead of interrogating the user.
+                List<String> candidateNames = new ArrayList<>();
+                for (String id : r.candidateIds()) candidateNames.add(clientName(clients, id));
+                if (com.localfilebrain.client.ClientMatcher.sameEntityNames(candidateNames)) {
+                    log.info("Clarify skipped: candidates {} are the same entity — answering generally",
+                            candidateNames);
+                    // The question named a (duplicate-registered) entity and we
+                    // answered generally — release any prior, unrelated focus so it
+                    // can't leak into the next follow-up.
+                    if (focus != null) cs.setFocus(convId, null);
+                    return ScopeDecision.unscoped();
                 }
                 return ScopeDecision.clarify(clarifyOptions(clients, r.candidateIds()), clarifyMessage());
             }
@@ -1587,14 +1611,13 @@ public final class ApiServer {
     }
 
     private static String clarifyMessage() {
-        return "I can only answer about one client at a time, and I'm not sure which you mean. "
-             + "Which should I use?";
+        return "That could be about more than one of your clients — which one do you mean?";
     }
 
     private List<Map<String, Object>> clarifyOptions(List<IndexMetadataStore.Client> clients, List<String> candidateIds) {
         List<Map<String, Object>> opts = new ArrayList<>();
         for (String id : candidateIds) opts.add(map("id", id, "name", clientName(clients, id)));
-        opts.add(map("id", UNASSIGNED, "name", "Personal / unfiled"));
+        opts.add(map("id", ALL_SCOPE, "name", "All documents"));
         return opts;
     }
 

@@ -56,8 +56,11 @@ public final class EntitySuggester {
             String gstin = firstNonBlank(g, EntityRow::gstin);
             String pan   = firstNonBlank(g, EntityRow::pan);
             String name  = mostCommonName(g);
-            if (name == null) name = gstin != null ? gstin : pan; // fall back to the id
-            if (name == null) continue;
+            // No human-readable name anywhere in the group → never suggest it.
+            // A bare GSTIN/PAN as a client "name" produces unrecognizable UI
+            // everywhere the client is shown (clarify chips, pickers, lists) —
+            // nobody can tell which client "07AABCM4562P1ZK" is.
+            if (name == null || looksLikeBareId(name)) continue;
 
             // Skip when this identity is already a registered client (any of its
             // tokens is claimed).
@@ -95,4 +98,13 @@ public final class EntitySuggester {
     }
 
     private static boolean notBlank(String s) { return s != null && !s.isBlank(); }
+
+    // A "name" that is actually a bare GSTIN (15 chars) or PAN (10 chars) —
+    // extraction sometimes fills the entity field with the id itself.
+    private static final java.util.regex.Pattern BARE_ID = java.util.regex.Pattern.compile(
+            "(?i)(?:[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]|[A-Z]{5}[0-9]{4}[A-Z])");
+
+    static boolean looksLikeBareId(String name) {
+        return BARE_ID.matcher(name.replaceAll("\\s", "")).matches();
+    }
 }

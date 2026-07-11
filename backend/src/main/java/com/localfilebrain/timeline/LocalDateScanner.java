@@ -70,7 +70,11 @@ public final class LocalDateScanner {
             t("expir(?:es|y|ing|ation)|valid\\s+(?:until|till|upto|up\\s+to)|lapses?", "Expires"),
             t("response\\s+(?:required|due)|respond\\s+by|reply\\s+by", "Response due"),
             t("deadline", "Deadline"),
-            t("due\\s+(?:by|date|on)|due:", "Due"));
+            t("due\\s+(?:by|date|on)|due:", "Due"),
+            // Formal obligation phrasing without a trigger noun: "furnish your
+            // submissions ... ON OR BEFORE 18/07/2026" (a DRC-01A notice missed
+            // live because nothing above matched).
+            t("on\\s+or\\s+before|no\\s+later\\s+than", "Due"));
 
     // Completion guard: if, BETWEEN the trigger and the date, the text says the
     // obligation was already fulfilled ("renewal completed on…", "was paid on…",
@@ -111,7 +115,9 @@ public final class LocalDateScanner {
     // v5: completed-event labels ("Date of filing :", "Submitted on") no longer
     //     count as obligations, and excerpts are sentence-bounded, not blind
     //     byte slices — re-extract so stored rows pick up both.
-    private static final String SCAN_VERSION = "v5:";
+    // v6: "on or before" / "no later than" count as obligation triggers (a
+    //     DRC-01A's reply-by date was missed live).
+    private static final String SCAN_VERSION = "v6:";
 
     // ── Primary-date extraction (the document's OWN date, for period queries) ──
 

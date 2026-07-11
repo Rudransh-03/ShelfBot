@@ -59,9 +59,10 @@ class ClientResolverTest {
 
     @Test
     void genericWordDoesNotScopeOnItsOwn() {
-        // "textiles" is a generic descriptor → must not silently scope to Verma.
+        // "textiles" is a generic descriptor → must not silently scope to Verma;
+        // with no client identified it's a general question → general answer.
         Resolution r = ClientResolver.resolve("what are the textiles due dates?", null, TWO);
-        assertEquals(Kind.CLARIFY, r.kind());
+        assertEquals(Kind.NONE, r.kind());
     }
 
     @Test
@@ -81,24 +82,32 @@ class ClientResolverTest {
     }
 
     @Test
-    void noClientNamedNoFocusMultipleClientsClarify() {
-        Resolution r = ClientResolver.resolve("what are the overdue returns?", null, TWO);
-        assertEquals(Kind.CLARIFY, r.kind());
-        assertEquals("no client specified", r.reason());
+    void generalQuestionAnswersGenerally_neverInterrogates() {
+        // No client named, none in focus → GENERAL question → search everything.
+        // (A clarify wall on every unscoped message — even "hi" — made the app
+        // unusable; this was a live failure.)
+        assertEquals(Kind.NONE,
+                ClientResolver.resolve("what are the overdue returns?", null, TWO).kind());
+        assertEquals(Kind.NONE,
+                ClientResolver.resolve("Summarize what's in my documents", null, TWO).kind());
+        assertEquals(Kind.NONE, ClientResolver.resolve("hi", null, TWO).kind());
     }
 
     @Test
-    void singleClientNeedsNoClarification() {
+    void singleClient_generalQuestionStillGeneral() {
+        // Even with exactly one client, an unscoped question must search
+        // everything — the client's scope would exclude the user's own
+        // non-client files.
         Resolution r = ClientResolver.resolve("what are the overdue returns?", null, List.of(A));
-        assertEquals(Kind.SCOPED, r.kind());
-        assertEquals("A", r.clientId());
+        assertEquals(Kind.NONE, r.kind());
     }
 
     @Test
     void staleFocusIsIgnored() {
-        // Focus points to a client that no longer exists → treated as no focus.
+        // Focus points to a client that no longer exists → treated as no focus,
+        // so the follow-up is answered generally rather than interrogated.
         Resolution r = ClientResolver.resolve("and March?", "GHOST", TWO);
-        assertEquals(Kind.CLARIFY, r.kind());
+        assertEquals(Kind.NONE, r.kind());
     }
 
     @Test
@@ -108,5 +117,66 @@ class ClientResolverTest {
         Client b2 = c("B", "Sharma Traders", "Sharma");
         Resolution r = ClientResolver.resolve("Sharma's GST for March", "A", List.of(a2, b2));
         assertEquals(Kind.CLARIFY, r.kind());
+    }
+
+    @Test
+    void freshQuestionDoesNotInheritStaleFocus() {
+        // In focus on A, but the new question names no client and is NOT a
+        // continuation (no pronoun/opener) → a fresh general question, answered
+        // across everything. This is the reported "engagement letter locked to
+        // Anjali" bug: it must NOT stay scoped to A.
+        Resolution r = ClientResolver.resolve(
+                "what are the terms of the engagement letter?", "A", TWO);
+        assertEquals(Kind.NONE, r.kind());
+    }
+
+    @Test
+    void pronounFollowUpKeepsFocus() {
+        // A genuine continuation (pronoun referring back) still rides the focus.
+        Resolution r = ClientResolver.resolve("what is their PAN?", "A", TWO);
+        assertEquals(Kind.SCOPED, r.kind());
+        assertEquals("A", r.clientId());
+    }
+
+    @Test
+    void weakDeicticThisWeekIsNotAContinuation() {
+        // "this week" must not count as a back-reference and trap a fresh
+        // obligations question inside the focused client.
+        Resolution r = ClientResolver.resolve("what should I chase this week?", "A", TWO);
+        assertEquals(Kind.NONE, r.kind());
+    }
+
+    @Test
+    void explicitGeneralOverridesCarriedFocus() {
+        // In focus on A, but the user says "in general" → broaden.
+        Resolution r = ClientResolver.resolve(
+                "in general, is there an engagement letter?", "A", TWO);
+        assertEquals(Kind.NONE, r.kind());
+    }
+
+    @Test
+    void relativeFollowUpBroadensBeyondClient() {
+        // "his son's PAN" is about a DIFFERENT person than the focused client, whose
+        // papers are filed separately → answer generally, don't dead-end in scope.
+        assertEquals(Kind.NONE, ClientResolver.resolve("what is his son's PAN?", "A", TWO).kind());
+        // Even with the client named: the daughter's docs live elsewhere.
+        assertEquals(Kind.NONE, ClientResolver.resolve("who is Sharma Bakery's daughter?", null, TWO).kind());
+    }
+
+    @Test
+    void nonRelativePronounStillKeepsFocus() {
+        // Control: a pronoun follow-up that is NOT about a relative rides the focus.
+        Resolution r = ClientResolver.resolve("what is his GST number?", "A", TWO);
+        assertEquals(Kind.SCOPED, r.kind());
+        assertEquals("A", r.clientId());
+    }
+
+    @Test
+    void explicitExclusionOverridesTheNamedClient() {
+        // Names Sharma only to EXCLUDE it ("don't answer about Sharma") → must
+        // broaden, not scope to Sharma. Reproduces the user's exact phrasing.
+        Resolution r = ClientResolver.resolve(
+                "don't answer about Sharma, in general is there an engagement letter?", "A", TWO);
+        assertEquals(Kind.NONE, r.kind());
     }
 }

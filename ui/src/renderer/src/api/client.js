@@ -91,8 +91,11 @@ export class ApiClient {
             buffer = buffer.slice(nl + 1)
             if (line === '') { flush(); continue }
             if (line.startsWith('event:')) currentEvent = line.slice(6).trim()
-            else if (line.startsWith('data:')) currentData.push(line.slice(5).trim().length === 0 ? '' : line.slice(line.startsWith('data: ') ? 6 : 5))
-            // Note: 'data:' with no space is still valid SSE; the slice above handles both.
+            // Preserve the data content EXACTLY — only the single space after "data:"
+            // is the SSE delimiter. Trimming here dropped whitespace-only tokens (a
+            // lone space the model streams between a word and a number), which is why
+            // answers rendered like "has29AABC" / "October30,2026".
+            else if (line.startsWith('data:')) currentData.push(line.startsWith('data: ') ? line.slice(6) : line.slice(5))
           }
         }
         flush()

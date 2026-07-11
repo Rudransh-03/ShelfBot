@@ -60,6 +60,6 @@ class TemplateSkipTest {
         assertEquals("/d/RealCo-Invoice-9.txt", rows.get(0).absolutePath());
 
         // The template is marked scanned (won't be re-visited every pass).
-        assertTrue(meta.isDateScanned("/d/invoice_TEMPLATE.txt", "v5:h"));
+        assertTrue(meta.isDateScanned("/d/invoice_TEMPLATE.txt", "v6:h"));
     }
 }

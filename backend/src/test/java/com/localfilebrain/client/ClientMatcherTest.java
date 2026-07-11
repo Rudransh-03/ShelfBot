@@ -52,6 +52,20 @@ class ClientMatcherTest {
     }
 
     @Test
+    void sameEntityNames_detectsDuplicateSpellings() {
+        // Duplicate registrations of one entity — must NOT trigger a clarify.
+        assertTrue(ClientMatcher.sameEntityNames(
+                List.of("Meridian Exports Private Limited", "MERIDIAN EXPORTS PVT LTD")));
+        assertTrue(ClientMatcher.sameEntityNames(
+                List.of("M/s Malhotra & Associates", "Malhotra & Associates")));
+        // Genuinely different clients — clarify stays.
+        assertFalse(ClientMatcher.sameEntityNames(
+                List.of("Verma Textiles", "Verma Exports")));
+        assertFalse(ClientMatcher.sameEntityNames(
+                List.of("Sharma Bakery", "Sharma Traders")));
+    }
+
+    @Test
     void containsTokenRespectsBoundaries() {
         assertTrue(ClientMatcher.containsToken("a sharma bakery b", "sharma bakery"));
         assertFalse(ClientMatcher.containsToken("sharmabakery", "sharma"));

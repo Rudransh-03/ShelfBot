@@ -48,6 +48,30 @@ class LexicalFocusFilterTest {
     }
 
     @Test
+    void pluralQuestionMatchesSingularDocument() {
+        // Live miss: "which notices need a response" pruned BOTH real notice
+        // documents because they say "notice"/"reply", not "notices"/"response".
+        List<SearchResult> in = List.of(
+                chunk("drc01a.pdf", "This notice requires a reply by 18 July 2026"),
+                chunk("recipe.txt", "mix flour and water, bake for 20 minutes"));
+        List<SearchResult> out = QueryEngine.lexicalFocusFilter(in, "which notices need attention?");
+        assertEquals(1, out.size());
+        assertEquals("drc01a.pdf", out.get(0).fileName());
+    }
+
+    @Test
+    void fileNameTokensCountAsMatches() {
+        // "Tax Invoice" often appears only in the file NAME while the content
+        // uses other wording — the name must keep the file in focus.
+        List<SearchResult> in = List.of(
+                chunk("MA_Fee_Invoice_014.pdf", "professional fees for services rendered, payable in 15 days"),
+                chunk("recipe.txt", "mix flour and water, bake for 20 minutes"));
+        List<SearchResult> out = QueryEngine.lexicalFocusFilter(in, "show my invoices");
+        assertEquals(1, out.size());
+        assertEquals("MA_Fee_Invoice_014.pdf", out.get(0).fileName());
+    }
+
+    @Test
     void unchangedWhenNoChunkContainsAQueryTerm() {
         // Paraphrased / purely-semantic query: nothing matches verbatim, so
         // the filter must be a no-op rather than emptying the pool.

@@ -79,4 +79,20 @@ class EntitySuggesterTest {
                 e("/a.pdf", null, null, null)), List.of(), Set.of());
         assertTrue(s.isEmpty());
     }
+
+    @Test
+    void idOnlyEntities_neverSuggested() {
+        // No human name → skip; a client "named" 07AABCM4562P1ZK is
+        // unrecognizable everywhere the UI shows it (live failure: 11 such
+        // clients turned every clarify prompt into a wall of raw ids).
+        List<Suggestion> noName = EntitySuggester.suggest(List.of(
+                e("/a.pdf", null, "07AABCM4562P1ZK", null),
+                e("/b.pdf", null, null, "AFHPG2314Q")), List.of(), Set.of());
+        assertTrue(noName.isEmpty());
+
+        // Same when extraction put the id INTO the name field.
+        List<Suggestion> idAsName = EntitySuggester.suggest(List.of(
+                e("/a.pdf", "07AABCM4562P1ZK", "07AABCM4562P1ZK", null)), List.of(), Set.of());
+        assertTrue(idAsName.isEmpty());
+    }
 }

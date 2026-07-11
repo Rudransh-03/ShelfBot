@@ -298,6 +298,20 @@ public final class IndexMetadataStore implements AutoCloseable {
                 )
                 """);
 
+            // Cache of fee-receivable tuples extracted from a prose document by
+            // the LLM, keyed by content hash. A document is sent to the LLM at
+            // most once per content version; every later "unpaid fees" question
+            // reuses the cached JSON for free. Cleared naturally when the file
+            // changes (hash mismatch) or is deleted.
+            stmt.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS fee_extract (
+                    absolute_path TEXT    PRIMARY KEY,
+                    content_hash  TEXT    NOT NULL,
+                    rows_json     TEXT    NOT NULL,
+                    extracted_at  TEXT    NOT NULL
+                )
+                """);
+
             // Lightweight migration: pre-existing DBs from before token tracking
             // won't have the column. Adding it is idempotent — SQLite throws
             // "duplicate column" if it already exists, which we swallow.
@@ -899,6 +913,48 @@ public final class IndexMetadataStore implements AutoCloseable {
             ps.executeUpdate();
         } catch (SQLException e) {
             log.warn("Failed to delete summary for '{}': {}", absolutePath, e.getMessage());
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Fee-extract cache (LLM-extracted receivable tuples, keyed by content hash)
+    // -------------------------------------------------------------------------
+
+    /** The cached extracted-rows JSON for {@code absolutePath} IF it was stored
+     *  at exactly {@code contentHash} (i.e. the file hasn't changed since);
+     *  empty otherwise, so a stale cache is never used. */
+    public synchronized Optional<String> getFeeExtract(String absolutePath, String contentHash) {
+        String sql = "SELECT rows_json FROM fee_extract WHERE absolute_path = ? AND content_hash = ?";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, absolutePath);
+            ps.setString(2, contentHash);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? Optional.of(rs.getString("rows_json")) : Optional.empty();
+            }
+        } catch (SQLException e) {
+            log.warn("Failed to read fee_extract for '{}': {}", absolutePath, e.getMessage());
+            return Optional.empty();
+        }
+    }
+
+    /** Inserts or replaces the cached fee-receivable rows for a file. */
+    public synchronized void putFeeExtract(String absolutePath, String contentHash, String rowsJson) {
+        String sql = """
+            INSERT INTO fee_extract (absolute_path, content_hash, rows_json, extracted_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(absolute_path) DO UPDATE SET
+              content_hash = excluded.content_hash,
+              rows_json    = excluded.rows_json,
+              extracted_at = excluded.extracted_at
+            """;
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, absolutePath);
+            ps.setString(2, contentHash);
+            ps.setString(3, rowsJson);
+            ps.setString(4, Instant.now().toString());
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            log.warn("Failed to put fee_extract for '{}': {}", absolutePath, e.getMessage());
         }
     }
 

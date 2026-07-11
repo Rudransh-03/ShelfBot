@@ -65,6 +65,39 @@ public final class ClientMatcher {
 
     private static boolean isWordChar(char ch) { return Character.isLetterOrDigit(ch); }
 
+    // Legal-form suffixes ignored when deciding whether two client NAMES are
+    // the same entity ("Meridian Exports Pvt Ltd" ≡ "Meridian Exports Private
+    // Limited").
+    private static final Set<String> LEGAL_SUFFIXES = Set.of(
+            "pvt", "private", "ltd", "limited", "llp", "llc", "inc",
+            "corp", "corporation", "co", "company");
+
+    /**
+     * True when every name in the list normalizes to the SAME entity once
+     * case, punctuation, single-letter fragments ("M/s" → m, s) and legal-form
+     * suffixes are ignored. Duplicate registrations of one entity are not real
+     * ambiguity — asking "which one do you mean?" between two spellings of the
+     * same company is nonsense to the user.
+     */
+    public static boolean sameEntityNames(List<String> names) {
+        if (names == null || names.size() < 2) return false;
+        String first = null;
+        for (String n : names) {
+            StringBuilder sb = new StringBuilder();
+            String cleaned = IndexMetadataStore.normToken(n == null ? "" : n)
+                    .replaceAll("[^a-z0-9]+", " "); // "m/s" → "m s", "&" → space
+            for (String t : cleaned.split("\\s+")) {
+                if (t.length() <= 1 || LEGAL_SUFFIXES.contains(t)) continue;
+                sb.append(t).append(' ');
+            }
+            String key = sb.toString().trim();
+            if (key.isEmpty()) return false;
+            if (first == null) first = key;
+            else if (!first.equals(key)) return false;
+        }
+        return true;
+    }
+
     // Generic words that must NOT, on their own, scope a question to a client —
     // legal forms + common business descriptors + stopwords. A client whose
     // distinctive word is one of these still matches via its full name/alias.
@@ -113,6 +146,22 @@ public final class ClientMatcher {
             if (hits.contains(c.id())) continue;
             for (String t : clientTokens.get(c.id())) {
                 if (tokenClientCount.get(t) == 1 && containsToken(hay, t)) { hits.add(c.id()); break; }
+            }
+        }
+        // A distinctive word shared by SEVERAL clients ("Verma" when both Verma
+        // Textiles and Verma Exports exist) can't scope on its own — but it
+        // clearly references those clients. Return them all so the caller can
+        // clarify among exactly those, rather than treating the question as
+        // general (never guess, never ignore). (When the "several" are just
+        // duplicate spellings of ONE entity, the caller detects that with
+        // sameEntityNames and skips the clarify.)
+        if (hits.isEmpty()) {
+            for (var e : tokenClientCount.entrySet()) {
+                if (e.getValue() > 1 && containsToken(hay, e.getKey())) {
+                    for (Client c : clients) {
+                        if (clientTokens.get(c.id()).contains(e.getKey())) hits.add(c.id());
+                    }
+                }
             }
         }
         return hits;

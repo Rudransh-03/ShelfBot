@@ -198,6 +198,21 @@ class LocalDateScannerTest {
     }
 
     @Test
+    void onOrBefore_isAnObligationTrigger() {
+        // DRC-01A phrasing missed live: no "due/filing/deadline" noun, just
+        // "furnish your submissions ... ON OR BEFORE <date>".
+        List<NewDate> out = LocalDateScanner.extractEvents(
+                "You are advised to furnish your submissions in PART-B ON OR BEFORE 18/07/2026, failing which action follows.");
+        assertEquals(1, out.size());
+        assertEquals("2026-07-18", out.get(0).eventDate());
+
+        List<NewDate> later = LocalDateScanner.extractEvents(
+                "Submit the reconciliation no later than 5 August 2026 to the officer.");
+        assertEquals(1, later.size());
+        assertEquals("2026-08-05", later.get(0).eventDate());
+    }
+
+    @Test
     void absurdYears_rejected() {
         assertTrue(LocalDateScanner.extractEvents(
                 "Warranty expires 31/12/9999 (lifetime).").isEmpty());

@@ -132,6 +132,25 @@
 /* ── Dark theme — set body[data-theme="dark"]; overriding the prototype
    base tokens is enough because every legacy token references them. ── */
 body[data-theme="dark"] {
+  /* Re-declare the legacy aliases here so they re-resolve against the DARK base
+     tokens below. Declaring them only at :root freezes their computed value to
+     the light base (a custom-property alias does not re-resolve across the theme
+     boundary), which left alias-based backgrounds like .dl-stat / .dl-missing
+     stuck light in dark mode. */
+  --bg:           var(--paper);
+  --bg-2:         var(--ghost);
+  --surface:      var(--card);
+  --surface-2:    var(--inset);
+  --surface-3:    var(--ghost);
+  --border:       var(--line);
+  --border-soft:  var(--hov2);
+  --border-hi:    var(--line2);
+  --border-focus: var(--focus);
+  --text-1:       var(--ink);
+  --text-2:       var(--soft);
+  --text-3:       var(--faint);
+  --text-4:       var(--taupe);
+
   --paper:  rgb(33,31,29);
   --ink:    rgb(235,229,220);
   --soft:   rgb(166,157,145);
@@ -3721,6 +3740,7 @@ input:focus-visible {
 
 .dl-body {
   flex: 1;
+  min-height: 0;            /* a flex child needs this to scroll instead of growing to content */
   overflow-y: auto;
   padding: 8px var(--content-pad) var(--content-pad);
   display: flex;
@@ -3815,10 +3835,34 @@ input:focus-visible {
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   padding: 14px 16px;
+  /* now a <button> that filters the list — reset native button styling */
+  display: block;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  appearance: none;
+  transition: border-color .15s var(--ease-out), background .15s var(--ease-out), transform .12s var(--ease-out);
 }
+.dl-stat:hover  { border-color: var(--border-hi); }
+.dl-stat:active { transform: translateY(1px); }
+.dl-stat.sel    { border-color: var(--terra); background: var(--hov); }
 .dl-stat-n { font-size: 22px; font-weight: 600; letter-spacing: -.03em; color: var(--ink); font-family: var(--font-sans); }
 .dl-stat-l { font-size: 12px; color: var(--soft); margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--line2); }
 .dl-stat.overdue .dl-stat-n { color: var(--terraTx); }
+
+.dl-tab-clear {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--soft);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 4px 6px;
+}
+.dl-tab-clear:hover { color: var(--ink); }
 
 /* Possibly-missing recurring documents */
 .dl-missing {

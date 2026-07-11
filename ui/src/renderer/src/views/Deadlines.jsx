@@ -189,8 +189,13 @@ export default function Deadlines({ active }) {
   const [items, setItems] = useState(null)       // ALL items; filtered client-side
   const [missing, setMissing] = useState([])      // gaps in recurring series
   const [tab, setTab] = useState('open')          // 'open' | 'reminders'
+  const [bucketFilter, setBucketFilter] = useState(null) // null = all open buckets, else OVERDUE/DUE_SOON/UPCOMING
   const [loading, setLoading] = useState(false)
   const [reminderItem, setReminderItem] = useState(null)
+
+  // Clicking a summary card jumps to the open list filtered to that bucket;
+  // clicking the same card again clears the filter (toggle).
+  const pickBucket = (b) => { setTab('open'); setBucketFilter(prev => prev === b ? null : b) }
 
   const load = useCallback(async () => {
     if (!api || !connected) return
@@ -336,14 +341,26 @@ export default function Deadlines({ active }) {
           </div>
         )}
 
-        {/* Summary chips */}
+        {/* Summary chips — clickable: each filters the list to that bucket */}
         <div className="dl-stats">
           {stat.overdue > 0 && (
-            <div className="dl-stat overdue"><div className="dl-stat-n">{stat.overdue}</div><div className="dl-stat-l">Overdue</div></div>
+            <button type="button" className={`dl-stat overdue${tab === 'open' && bucketFilter === 'OVERDUE' ? ' sel' : ''}`}
+                    onClick={() => pickBucket('OVERDUE')}>
+              <div className="dl-stat-n">{stat.overdue}</div><div className="dl-stat-l">Overdue</div>
+            </button>
           )}
-          <div className="dl-stat soon"><div className="dl-stat-n">{stat.dueSoon}</div><div className="dl-stat-l">Due soon</div></div>
-          <div className="dl-stat up"><div className="dl-stat-n">{stat.upcoming}</div><div className="dl-stat-l">Upcoming</div></div>
-          <div className="dl-stat"><div className="dl-stat-n">{stat.reminders}</div><div className="dl-stat-l">Reminders set</div></div>
+          <button type="button" className={`dl-stat soon${tab === 'open' && bucketFilter === 'DUE_SOON' ? ' sel' : ''}`}
+                  onClick={() => pickBucket('DUE_SOON')}>
+            <div className="dl-stat-n">{stat.dueSoon}</div><div className="dl-stat-l">Due soon</div>
+          </button>
+          <button type="button" className={`dl-stat up${tab === 'open' && bucketFilter === 'UPCOMING' ? ' sel' : ''}`}
+                  onClick={() => pickBucket('UPCOMING')}>
+            <div className="dl-stat-n">{stat.upcoming}</div><div className="dl-stat-l">Upcoming</div>
+          </button>
+          <button type="button" className={`dl-stat${tab === 'reminders' ? ' sel' : ''}`}
+                  onClick={() => { setTab('reminders'); setBucketFilter(null) }}>
+            <div className="dl-stat-n">{stat.reminders}</div><div className="dl-stat-l">Reminders set</div>
+          </button>
         </div>
 
         {/* Possibly-missing recurring documents (gaps in a series). */}
@@ -364,12 +381,17 @@ export default function Deadlines({ active }) {
 
         {/* Tabs */}
         <div className="dl-tabs">
-          <button className={`dl-tab${tab === 'open' ? ' active' : ''}`} onClick={() => setTab('open')}>
+          <button className={`dl-tab${tab === 'open' ? ' active' : ''}`} onClick={() => { setTab('open'); setBucketFilter(null) }}>
             Open{openItems.length ? ` (${openItems.length})` : ''}
           </button>
-          <button className={`dl-tab${tab === 'reminders' ? ' active' : ''}`} onClick={() => setTab('reminders')}>
+          <button className={`dl-tab${tab === 'reminders' ? ' active' : ''}`} onClick={() => { setTab('reminders'); setBucketFilter(null) }}>
             Reminders set{remindedItems.length ? ` (${remindedItems.length})` : ''}
           </button>
+          {tab === 'open' && bucketFilter && (
+            <button className="dl-tab-clear" onClick={() => setBucketFilter(null)}>
+              Showing {BUCKET_LABEL[bucketFilter]} · show all
+            </button>
+          )}
         </div>
 
         {/* List */}
@@ -382,7 +404,8 @@ export default function Deadlines({ active }) {
               : 'No reminders set yet.'}
           </div>
         ) : tab === 'open' ? (
-          BUCKET_ORDER.filter(b => (b === 'DUE_SOON' || b === 'UPCOMING') && groups[b]?.length).map(b => (
+          BUCKET_ORDER.filter(b => (b === 'OVERDUE' || b === 'DUE_SOON' || b === 'UPCOMING')
+              && (!bucketFilter || b === bucketFilter) && groups[b]?.length).map(b => (
             <div key={b} className="dl-group">
               <div className="dl-group-head">{BUCKET_LABEL[b]} <span className="dl-group-n">{groups[b].length}</span></div>
               <ul className="dl-list">

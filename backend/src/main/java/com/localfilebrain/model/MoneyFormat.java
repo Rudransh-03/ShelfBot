@@ -1,61 +1,53 @@
 package com.localfilebrain.model;
 
+import com.localfilebrain.config.RegionProfile;
+
+import java.util.Locale;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Locale seam for money parsing and formatting.
- *
- * <p>Only the India profile is wired today. US / Europe are added later as new
- * {@link Profile} branches WITHOUT touching any call site — everything that
- * parses or formats an amount routes through here, while the aggregation logic
- * (gather / extract / dedup / sum) stays locale-agnostic. Onboarding will set
- * {@link #setActive} per user; until then the whole app runs {@code INDIA}.
- *
- * <p>Extending to a new market = add a branch to {@link #symbol()},
- * {@link #format(long)} and {@link #amountPattern()}. No other file changes.
+ * Money parsing and formatting for the active market — the one place currency
+ * symbol + digit grouping live, so the aggregation logic stays market-agnostic.
+ * Reads {@link RegionProfile#active()}: symbol ($/£/€/₹) and grouping (Western
+ * 1,234,567 vs Indian 12,34,567). Adding a market = one enum constant there.
  */
 public final class MoneyFormat {
 
     private MoneyFormat() {}
 
-    public enum Profile { INDIA }
+    // Amount written with a currency cue ($/£/€/₹/Rs/INR/USD…) OR with grouping
+    // commas — so a bare id fragment ("015") or a year ("2026") is not mistaken
+    // for an amount. Group 1 = the integer digit run (grouping commas allowed);
+    // any decimal part is ignored (we deal in whole units).
+    private static final Pattern AMOUNT = Pattern.compile(
+            "(?i)(?:(?:₹|£|\\$|€|\\brs\\.?\\s*|\\binr\\s*|\\busd\\s*|\\bgbp\\s*|\\beur\\s*)([0-9][0-9,]*)"
+          + "|([0-9]{1,3}(?:,[0-9]{2,3})+))(?:\\.[0-9]+)?");
 
-    // Single switch point. Volatile: onboarding may flip it once at startup.
-    private static volatile Profile active = Profile.INDIA;
+    /** Currency symbol for the active market. */
+    public static String symbol() { return RegionProfile.active().symbol(); }
 
-    public static void setActive(Profile p) { if (p != null) active = p; }
-    public static Profile active() { return active; }
+    /** Format a whole-unit amount with the active market's symbol + grouping,
+     *  e.g. {@code 188000 → "₹1,88,000"} (IN) or {@code "$188,000"} (US). */
+    public static String format(long amount) { return symbol() + group(amount); }
 
-    // India: ₹15,000 / Rs. 15,000 / Rs 1,88,000 / a lone grouped run like
-    // "1,88,000". Group 1 = the digit run (with optional grouping commas).
-    // Requires either a currency cue OR a grouping comma so a bare id fragment
-    // like "015" or a year "2026" isn't mistaken for an amount.
-    private static final Pattern INR_AMOUNT = Pattern.compile(
-            "(?i)(?:(?:₹|\\brs\\.?\\s*|\\binr\\s*)([0-9][0-9,]*)|([0-9]{1,2}(?:,[0-9]{2,3})+))");
-
-    /** Currency symbol for the active profile. */
-    public static String symbol() {
-        return switch (active) { case INDIA -> "₹"; };
-    }
-
-    /** Format a whole-unit amount with the active profile's grouping + symbol,
-     *  e.g. {@code 188000 -> "₹1,88,000"} for INDIA. */
-    public static String format(long amount) {
-        return switch (active) { case INDIA -> symbol() + indianGroup(amount); };
+    /** Group digits per the active market (Indian for IN, Western otherwise). */
+    public static String group(long amount) {
+        return RegionProfile.active().grouping() == RegionProfile.Grouping.INDIAN
+                ? indianGroup(amount) : westernGroup(amount);
     }
 
     /** The first currency amount in {@code text} as a whole-unit long, or
-     *  {@code null} if none. Grouping separators are stripped before parsing. */
+     *  {@code null} if none. Grouping separators are stripped; a decimal part is
+     *  dropped. A pure numeric field (e.g. an LLM-returned "15000" or a ledger
+     *  Amount cell) is accepted directly. */
     public static Long parse(String text) {
         if (text == null) return null;
-        // A pure numeric field (e.g. an LLM-returned "15000" or a ledger Amount
-        // cell) has no cue/comma — accept it directly.
         String t = text.trim();
-        if (t.matches("[0-9]{1,12}")) {
+        if (t.matches("[0-9]{1,15}")) {
             try { return Long.parseLong(t); } catch (NumberFormatException e) { return null; }
         }
-        Matcher m = amountPattern().matcher(text);
+        Matcher m = AMOUNT.matcher(text);
         if (!m.find()) return null;
         String digits = (m.group(1) != null ? m.group(1) : m.group(2)).replace(",", "");
         if (digits.isEmpty()) return null;
@@ -63,16 +55,18 @@ public final class MoneyFormat {
     }
 
     /** True when {@code text} contains at least one currency amount. */
-    public static boolean hasAmount(String text) {
-        return parse(text) != null;
+    public static boolean hasAmount(String text) { return parse(text) != null; }
+
+    // ── Grouping styles (both exposed so currency-specific rendering — e.g. a
+    //    document stated in ₹ regardless of the user's market — can pick one) ──
+
+    /** Western grouping: 1,234,567. */
+    public static String westernGroup(long n) {
+        return String.format(Locale.US, "%,d", n);
     }
 
-    private static Pattern amountPattern() {
-        return switch (active) { case INDIA -> INR_AMOUNT; };
-    }
-
-    // Indian digit grouping: last three digits, then two at a time (1,88,000).
-    static String indianGroup(long n) {
+    /** Indian grouping: last three digits, then two at a time — 12,34,567. */
+    public static String indianGroup(long n) {
         boolean neg = n < 0;
         String s = Long.toString(Math.abs(n));
         if (s.length() <= 3) return neg ? "-" + s : s;

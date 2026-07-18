@@ -312,6 +312,48 @@ public final class IndexMetadataStore implements AutoCloseable {
                 )
                 """);
 
+            // ── Generic aggregation layer (replaces the fee-specific cache) ──────
+            // The set of aggregation CATEGORIES the app has learned to extract
+            // (grows as new "count/list-everything" questions appear). Keeping it
+            // small and coarse keeps the match-or-new step reliable.
+            stmt.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS agg_category (
+                    name        TEXT PRIMARY KEY,   -- canonical id, e.g. "client_fee_owed"
+                    label       TEXT NOT NULL,      -- human phrase, e.g. "money a client owes me"
+                    field_spec  TEXT NOT NULL,      -- what the per-doc extractor pulls (LLM instruction)
+                    filter_terms TEXT,              -- cheap content keywords; blank = no keyword filter (scan all)
+                    created_at  TEXT NOT NULL
+                )
+                """);
+            // Per-(document, category) extracted facts, keyed by content hash so a
+            // doc is read at most once per category per version. Accumulates —
+            // asking a NEW category never clears another's rows.
+            stmt.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS doc_facts (
+                    absolute_path TEXT NOT NULL,
+                    category      TEXT NOT NULL,
+                    content_hash  TEXT NOT NULL,
+                    facts_json    TEXT NOT NULL,     -- extracted DocFact records (may be [])
+                    extracted_at  TEXT NOT NULL,
+                    PRIMARY KEY (absolute_path, category)
+                )
+                """);
+            stmt.executeUpdate("CREATE INDEX IF NOT EXISTS idx_doc_facts_cat ON doc_facts(category)");
+
+            // One universal "fact sheet" per document — everything worth knowing,
+            // extracted ONCE (LLM reads each doc a single time, ever) and reused to
+            // answer every corpus-wide question. content_hash carries a version
+            // suffix so a prompt change re-extracts; keyed by path (one row/doc).
+            stmt.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS doc_sheet (
+                    absolute_path TEXT NOT NULL,
+                    content_hash  TEXT NOT NULL,     -- content hash + "#" + sheet version
+                    sheet_json    TEXT NOT NULL,     -- the universal fact sheet
+                    extracted_at  TEXT NOT NULL,
+                    PRIMARY KEY (absolute_path)
+                )
+                """);
+
             // Lightweight migration: pre-existing DBs from before token tracking
             // won't have the column. Adding it is idempotent — SQLite throws
             // "duplicate column" if it already exists, which we swallow.
@@ -959,6 +1001,108 @@ public final class IndexMetadataStore implements AutoCloseable {
     }
 
     // -------------------------------------------------------------------------
+    // Generic aggregation: category registry + per-(doc,category) facts cache
+    // -------------------------------------------------------------------------
+
+    /** A learned aggregation category (what to extract + how to cheaply filter). */
+    public record AggCategory(String name, String label, String fieldSpec, String filterTerms) {}
+
+    /** All learned categories (the small list the match-or-new step compares against). */
+    public synchronized List<AggCategory> listCategories() {
+        List<AggCategory> out = new ArrayList<>();
+        String sql = "SELECT name, label, field_spec, filter_terms FROM agg_category ORDER BY created_at";
+        try (PreparedStatement ps = connection.prepareStatement(sql); ResultSet rs = ps.executeQuery()) {
+            while (rs.next())
+                out.add(new AggCategory(rs.getString("name"), rs.getString("label"),
+                        rs.getString("field_spec"), rs.getString("filter_terms")));
+        } catch (SQLException e) {
+            log.warn("Failed to list categories: {}", e.getMessage());
+        }
+        return out;
+    }
+
+    /** Registers (or updates) a category. Idempotent on {@code name}. */
+    public synchronized void putCategory(String name, String label, String fieldSpec, String filterTerms) {
+        String sql = """
+            INSERT INTO agg_category (name, label, field_spec, filter_terms, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+              label = excluded.label, field_spec = excluded.field_spec, filter_terms = excluded.filter_terms
+            """;
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, name); ps.setString(2, label); ps.setString(3, fieldSpec);
+            ps.setString(4, filterTerms == null ? "" : filterTerms); ps.setString(5, Instant.now().toString());
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            log.warn("Failed to put category '{}': {}", name, e.getMessage());
+        }
+    }
+
+    /** Cached facts for (doc, category) IF stored at exactly {@code contentHash};
+     *  empty when absent or stale (so a changed doc is re-extracted). */
+    public synchronized Optional<String> getDocFacts(String absolutePath, String category, String contentHash) {
+        String sql = "SELECT facts_json FROM doc_facts WHERE absolute_path = ? AND category = ? AND content_hash = ?";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, absolutePath); ps.setString(2, category); ps.setString(3, contentHash);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? Optional.of(rs.getString("facts_json")) : Optional.empty();
+            }
+        } catch (SQLException e) {
+            log.warn("Failed to read doc_facts for '{}'/{}: {}", absolutePath, category, e.getMessage());
+            return Optional.empty();
+        }
+    }
+
+    /** Inserts/replaces the extracted facts for one (doc, category). */
+    public synchronized void putDocFacts(String absolutePath, String category, String contentHash, String factsJson) {
+        String sql = """
+            INSERT INTO doc_facts (absolute_path, category, content_hash, facts_json, extracted_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(absolute_path, category) DO UPDATE SET
+              content_hash = excluded.content_hash, facts_json = excluded.facts_json, extracted_at = excluded.extracted_at
+            """;
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, absolutePath); ps.setString(2, category); ps.setString(3, contentHash);
+            ps.setString(4, factsJson); ps.setString(5, Instant.now().toString());
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            log.warn("Failed to put doc_facts for '{}'/{}: {}", absolutePath, category, e.getMessage());
+        }
+    }
+
+    /** The cached universal fact sheet for one doc, only if it matches this hash
+     *  (content + sheet version). Empty when absent or stale — caller re-extracts. */
+    public synchronized Optional<String> getSheet(String absolutePath, String contentHash) {
+        String sql = "SELECT sheet_json FROM doc_sheet WHERE absolute_path = ? AND content_hash = ?";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, absolutePath); ps.setString(2, contentHash);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? Optional.of(rs.getString("sheet_json")) : Optional.empty();
+            }
+        } catch (SQLException e) {
+            log.warn("Failed to read doc_sheet for '{}': {}", absolutePath, e.getMessage());
+            return Optional.empty();
+        }
+    }
+
+    /** Inserts/replaces the universal fact sheet for one doc. */
+    public synchronized void putSheet(String absolutePath, String contentHash, String sheetJson) {
+        String sql = """
+            INSERT INTO doc_sheet (absolute_path, content_hash, sheet_json, extracted_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(absolute_path) DO UPDATE SET
+              content_hash = excluded.content_hash, sheet_json = excluded.sheet_json, extracted_at = excluded.extracted_at
+            """;
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, absolutePath); ps.setString(2, contentHash);
+            ps.setString(3, sheetJson); ps.setString(4, Instant.now().toString());
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            log.warn("Failed to put doc_sheet for '{}': {}", absolutePath, e.getMessage());
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // File-level vector cache (for reorg / clustering)
     // -------------------------------------------------------------------------
 
@@ -1597,6 +1741,22 @@ public final class IndexMetadataStore implements AutoCloseable {
             }
         } catch (SQLException e) { throw new MetadataStoreException("Failed to list identifiers", e); }
         return new ArrayList<>(byId.values());
+    }
+
+    /** For each client id, how many of their documents are still indexed. A client
+     *  whose files were all deleted returns 0 ("no docs left") even if a stale
+     *  mapping lingers — the roster uses this to stop showing gone clients. */
+    public synchronized Map<String, Integer> clientLiveDocCounts() {
+        Map<String, Integer> out = new java.util.HashMap<>();
+        String sql = "SELECT fc.client_id, COUNT(*) c FROM file_client fc "
+                   + "JOIN file_index fi ON fc.absolute_path = fi.absolute_path "
+                   + "WHERE fi.status = 'INDEXED' GROUP BY fc.client_id";
+        try (PreparedStatement ps = connection.prepareStatement(sql); ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) out.put(rs.getString("client_id"), rs.getInt("c"));
+        } catch (SQLException e) {
+            log.warn("clientLiveDocCounts failed: {}", e.getMessage());
+        }
+        return out;
     }
 
     public synchronized int countClients() {

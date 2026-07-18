@@ -1,0 +1,531 @@
+package com.localfilebrain.aggregate;
+
+import com.localfilebrain.model.MoneyFormat;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Executes a {@link SheetQuery} deterministically over the fact sheets — the same
+ * input always yields the same answer. No LLM here: it filters the structured
+ * fields the sheets already hold (money amounts, parties, documents, dates), then
+ * counts / sums / lists / picks the max. Generic across question types; money is
+ * just one of four {@code select} kinds.
+ */
+public final class SheetAggregator {
+
+    private static final Logger log = LoggerFactory.getLogger(SheetAggregator.class);
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    public record Result(String text, List<String> sources) {}
+
+    // ── parsed view of one sheet ─────────────────────────────────────────────
+    private record Party(String name, String role, String side) {}
+    private record Amount(double value, String status, String label) {}
+    private record Dated(String label, String date, boolean deadline) {}
+    private static final class Doc {
+        String fileName, docType, title, gist;
+        boolean isPersonal;
+        List<Party> parties = new ArrayList<>();
+        List<Amount> amounts = new ArrayList<>();
+        List<Dated> dates = new ArrayList<>();
+        String counterparty = "";   // the non-owner party (client/customer/payer)
+    }
+
+    public Result run(SheetQuery q, List<SheetExtractor.Sheet> sheets) {
+        return run(q, sheets, java.util.List.of());
+    }
+
+    /**
+     * @param ownerNames the owner's own identities (their name + business, from a
+     *   one-time setting). Anything matching these is the owner and is never a
+     *   client or a vendor. When empty, the owner is guessed heuristically (whoever
+     *   bills 2+ different parties) — reliable for a practice, ambiguous for a lone
+     *   consumer, which is exactly why a configured identity is preferred.
+     */
+    public Result run(SheetQuery q, List<SheetExtractor.Sheet> sheets, java.util.Collection<String> ownerNames) {
+        List<Doc> docs = new ArrayList<>();
+        for (SheetExtractor.Sheet s : sheets) {
+            Doc d = parse(s.json(), s.fileName());
+            if (d != null) docs.add(d);
+        }
+        if (docs.isEmpty()) return null;
+
+        Set<String> ownerKeys = new java.util.HashSet<>();
+        for (String o : ownerNames) if (o != null && !o.isBlank()) ownerKeys.add(normName(o));
+        if (ownerKeys.isEmpty()) {
+            String guess = detectOwner(docs);
+            if (!guess.isBlank()) ownerKeys.add(normName(guess));
+        }
+
+        String ownerFirm = detectOwnerFirm(docs);
+        for (Doc d : docs) d.counterparty = counterpartyOf(d, ownerFirm);
+
+        return switch (q.select()) {
+            case AMOUNTS   -> amounts(q, docs, ownerKeys);
+            case PARTIES   -> parties(q, docs, ownerKeys);
+            case DOCUMENTS -> documents(q, docs);
+            case DATES     -> dates(q, docs);
+        };
+    }
+
+    private static boolean isOwner(String name, Set<String> ownerKeys) {
+        return name != null && !name.isBlank() && ownerKeys.contains(normName(name));
+    }
+
+    // ── AMOUNTS: money owed / paid, grouped by client ────────────────────────
+    private Result amounts(SheetQuery q, List<Doc> docs, Set<String> ownerKeys) {
+        // One owed/paid figure per client, netting partial payments and excluding
+        // fully-settled invoices. Grouped by a NORMALISED client name so an invoice
+        // ("Blue Ridge Landscaping LLC") and its follow-up note ("Blue Ridge
+        // Landscaping") land together, and so does a separate payment confirmation.
+        // Direction: "owed_to_me" (the user's receivables) counts only groups with a
+        // real client/customer party; "i_owe" / unset counts every bill, including
+        // the user's own personal bills. This is what keeps the engine generic — the
+        // is_personal flag no longer gates money, the question's direction does.
+        boolean owedToMe = q.scope() != null && q.scope().contains("owed_to_me");
+        Map<String, List<Doc>> byClient = new LinkedHashMap<>();
+        Map<String, String> display = new LinkedHashMap<>();
+        Set<String> clientKeys = new java.util.HashSet<>();
+        for (Doc d : docs) {
+            // is_personal is too fuzzy to gate money (a clinic's patient invoice gets
+            // mislabeled "personal"). Direction + side + owner-exclusion do the gating:
+            // a receivable is only counted for a group that has a real client party
+            // (clientKeys below), which already excludes the owner's own vet/gym bills.
+            String cp = counterpartyForScope(d, owedToMe, ownerKeys);
+            String key = normName(cp);
+            if (key.isBlank()) continue;
+            if (d.amounts.isEmpty() && !isPaymentDoc(d)) continue;
+            byClient.computeIfAbsent(key, k -> new ArrayList<>()).add(d);
+            display.merge(key, cp, (a, b) -> b.length() > a.length() ? b : a);
+            if (hasClientParty(d, ownerKeys)) clientKeys.add(key);
+        }
+
+        boolean wantPaid = q.status().contains("paid") && !q.status().contains("un");
+        List<String[]> rows = new ArrayList<>();               // {client, formattedAmount, rawAmount}
+        List<String> sources = new ArrayList<>();
+        long total = 0;
+
+        for (Map.Entry<String, List<Doc>> e : byClient.entrySet()) {
+            if (owedToMe && !clientKeys.contains(e.getKey())) continue;   // receivables only
+            List<Doc> group = e.getValue();
+            double gross = grossOwed(group);       // largest single owed amount (for the paid check)
+            double sumPlain = 0;                    // sum of separate unpaid bills for this party
+            Double balance = null;                  // an explicit remaining balance overrides the sum
+            boolean paidFull = false;
+            for (Doc d : group) {
+                if (isPaymentDoc(d)) paidFull = true;
+                for (Amount a : d.amounts) {
+                    if (a.value <= 0) continue;
+                    String st = lc(a.status), lb = lc(a.label);
+                    if (isSettled(st)) {
+                        // A settled line clears the bill only if it's actually a
+                        // payment of it — not a deposit, advance, credit or refund
+                        // that merely happens to equal the amount.
+                        boolean isPayment = (lb.contains("payment") || lb.contains("paid")
+                                || lb.contains("total") || lb.contains("balance") || lb.contains("amount"))
+                                && !lb.contains("deposit") && !lb.contains("advance")
+                                && !lb.contains("credit") && !lb.contains("refund");
+                        if (isPayment && a.value >= gross * 0.9) paidFull = true;
+                        continue;
+                    }
+                    if (!isOwedCandidate(st, d)) continue;
+                    boolean balanceish = lb.contains("remaining") || lb.contains("balance") || lb.contains("outstanding");
+                    if (balanceish) {
+                        balance = balance == null ? a.value : Math.min(balance, a.value);  // the net still owed
+                    } else if (!st.contains("partial")) {
+                        sumPlain += a.value;         // a separate unpaid bill → add it
+                    }
+                }
+            }
+            // An explicitly stated balance due is the truth — trust it over a possibly
+            // mislabeled "paid" charge line (you can't be paid in full while a balance
+            // is still due). Otherwise: fully settled → 0, else sum the separate bills.
+            long owed;
+            if (balance != null && balance > 0) owed = Math.round(balance);
+            else owed = paidFull ? 0 : Math.round(sumPlain);
+
+            boolean include = wantPaid ? paidFull : owed > 0;   // status filter
+            if (!include) continue;
+            long shown = wantPaid ? Math.round(gross) : owed;
+            rows.add(new String[]{display.get(e.getKey()), MoneyFormat.format(shown), String.valueOf(shown)});
+            total += shown;
+            for (Doc d : group) if (!sources.contains(d.fileName)) sources.add(d.fileName);
+        }
+        rows.sort((a, b) -> Long.compare(Long.parseLong(b[2]), Long.parseLong(a[2])));
+        return renderRows(q, rows, total, sources);
+    }
+
+    /** The largest genuine "owed" amount on a bill in the group (ignores partial
+     *  lines and settled payments), used as the gross to net against. */
+    private double grossOwed(List<Doc> group) {
+        double g = 0;
+        for (Doc d : group) for (Amount a : d.amounts) {
+            if (a.value <= 0) continue;
+            String st = lc(a.status);
+            if (isSettled(st) || st.contains("partial")) continue;
+            if (isOwedCandidate(st, d)) g = Math.max(g, a.value);
+        }
+        return g;
+    }
+
+    // An amount counts as money owed only when its status is a definite debt, or it
+    // sits on an actual bill/invoice and isn't settled. This keeps rate cards and
+    // retainer schedules (an engagement letter's "quarterly fee", status unknown)
+    // out of what's currently owed.
+    private static boolean isOwedCandidate(String status, Doc d) {
+        if (isRateDoc(d)) return false;   // an agreement's fee is a rate, not a current due
+        return isDefiniteOwed(status) || (isBill(d) && !isSettled(status));
+    }
+    // A rate/terms document states a RATE, not money currently owed — an engagement
+    // letter, a listing, a quote/estimate. NOT a lease or generic "agreement": those
+    // carry real dues (a lease's monthly rent). Kept narrow so a real due isn't lost.
+    private static boolean isRateDoc(Doc d) {
+        String t = lc(d.docType);
+        return t.contains("engagement") || t.contains("listing") || t.contains("proposal")
+                || t.contains("quote") || t.contains("estimate") || t.contains("rate card");
+    }
+    private static boolean isDefiniteOwed(String st) {
+        st = lc(st);
+        return st.contains("unpaid") || st.contains("not paid") || st.contains("owe")
+                || st.contains("outstanding") || st.contains("overdue") || st.contains("pending")
+                || st.contains("partial") || st.contains("payable") || st.contains("due")
+                || st.contains("balance");
+    }
+    private static boolean isSettled(String st) {
+        st = lc(st);
+        // NB: "unpaid" contains "paid" — must not read as settled.
+        return (st.contains("paid") && !st.contains("unpaid") && !st.contains("not paid"))
+                || st.contains("settled") || st.contains("received") || st.contains("cleared");
+    }
+    private static boolean isBill(Doc d) {
+        String t = lc(d.docType);
+        return t.contains("invoice") || t.contains("bill") || t.contains("statement");
+    }
+    // The two sides of any billing relationship — profession-neutral. CLIENT_ROLES
+    // = the party the owner serves/bills (a client, patient, tenant, member…);
+    // PROVIDER_ROLES = the party that bills the owner (a vendor, landlord, biller…).
+    private static final Set<String> CLIENT_ROLES = Set.of("client", "customer", "patient",
+            "tenant", "member", "student", "guest", "policyholder", "insured", "buyer",
+            "seller", "payer", "debtor", "resident", "subscriber", "borrower", "bill to", "bill-to");
+    private static final Set<String> PROVIDER_ROLES = Set.of("provider", "biller", "issuer",
+            "vendor", "landlord", "merchant", "lender", "creditor", "supplier",
+            "bank", "insurer", "employer", "practice", "clinic", "firm");
+
+    private static boolean roleIn(String role, Set<String> set) {
+        String r = lc(role);
+        for (String w : set) if (r.contains(w)) return true;
+        return false;
+    }
+
+    // Root of genericness: the model tags each party's SIDE — "recipient" (the party
+    // the owner serves / who owes) or "issuer" (the party that bills the owner). Code
+    // reads the side, so a novel profession's role word ("congregant", "policyholder")
+    // still works. The role-word lists are only a fallback for that field being blank.
+    // Client-side = the party that OWES (a debtor: client/patient/tenant who must pay).
+    // Provider-side = the party that is OWED (a creditor: biller/vendor/landlord).
+    // Reads the money-direction side first; "issuer/recipient" kept for old sheets.
+    private static boolean isClientSide(Party p) {
+        String s = lc(p.side());
+        if (s.contains("owes") || s.contains("debtor") || s.contains("recipient")
+                || s.contains("client") || s.contains("billed") || s.contains("customer")) return true;
+        if (s.contains("owed") || s.contains("creditor") || s.contains("issuer")
+                || s.contains("provider") || s.contains("biller")) return false;
+        return roleIn(p.role(), CLIENT_ROLES);
+    }
+    private static boolean isProviderSide(Party p) {
+        String s = lc(p.side());
+        if (s.contains("owed") || s.contains("creditor") || s.contains("issuer")
+                || s.contains("provider") || s.contains("biller")) return true;
+        if (s.contains("owes") || s.contains("debtor") || s.contains("recipient")
+                || s.contains("client") || s.contains("billed")) return false;
+        return roleIn(p.role(), PROVIDER_ROLES);
+    }
+
+    /**
+     * The owner of the collection = the party that BILLS 2+ DIFFERENT counterparties
+     * (a practice/firm running its book of clients). A vendor bills only the owner, a
+     * client is billed — neither qualifies. Empty when no one bills many (a consumer's
+     * corpus), which is correct: a consumer has no receivables. Distinguishes the
+     * doctor's own clinic from an ordinary vendor without a keyword list.
+     */
+    private static String detectOwner(List<Doc> docs) {
+        Map<String, Set<String>> billed = new LinkedHashMap<>();
+        Map<String, String> display = new LinkedHashMap<>();
+        for (Doc d : docs) {
+            List<String> providers = new ArrayList<>(), others = new ArrayList<>();
+            for (Party p : d.parties) {
+                if (p.name() == null || p.name().isBlank()) continue;
+                if (isProviderSide(p)) providers.add(p.name().trim());
+                else others.add(p.name().trim());
+            }
+            for (String pr : providers) {
+                display.putIfAbsent(normName(pr), pr);
+                for (String o : others)
+                    if (!normName(pr).equals(normName(o)))
+                        billed.computeIfAbsent(normName(pr), k -> new java.util.HashSet<>()).add(normName(o));
+            }
+        }
+        return billed.entrySet().stream().filter(e -> e.getValue().size() >= 2)
+                .max(java.util.Comparator.comparingInt(e -> e.getValue().size()))
+                .map(e -> display.get(e.getKey())).orElse("");
+    }
+
+    private static boolean sameName(String a, String b) {
+        return !a.isBlank() && !b.isBlank() && normName(a).equals(normName(b));
+    }
+    private static boolean namedIn(Doc d, Set<String> ownerKeys) {
+        for (Party p : d.parties) if (isOwner(p.name(), ownerKeys)) return true;
+        return false;
+    }
+    private static boolean ownerIsProvider(Doc d, Set<String> ownerKeys) {
+        for (Party p : d.parties)
+            if (isOwner(p.name(), ownerKeys) && isProviderSide(p)) return true;
+        return false;
+    }
+
+    /** A client/customer/patient/… party for this doc, other than the owner. */
+    private static boolean hasClientParty(Doc d, Set<String> ownerKeys) {
+        for (Party p : d.parties) {
+            if (p.name() == null || p.name().isBlank() || isOwner(p.name(), ownerKeys)) continue;
+            if (isClientSide(p)) return true;
+        }
+        return false;
+    }
+
+    /** The party on the other side of the money for grouping, owner excluded:
+     *  "owed to me" → the client the owner bills; "I owe" → the biller. */
+    private static String counterpartyForScope(Doc d, boolean owedToMe, Set<String> ownerKeys) {
+        if (owedToMe) {
+            for (Party p : d.parties) {
+                String n = nm(p);
+                if (n.isBlank() || isOwner(n, ownerKeys)) continue;
+                if (isClientSide(p)) return n;
+            }
+            // A payment/receipt from a client where the owner isn't named: take the
+            // non-owner party. But if the owner IS named here (a bill TO the owner),
+            // this is a payable, not a receivable → no client counterparty.
+            if (ownerKeys.isEmpty() || !namedIn(d, ownerKeys))
+                for (Party p : d.parties) { String n = nm(p); if (!n.isBlank() && !isOwner(n, ownerKeys)) return n; }
+            return "";
+        }
+        // "I owe": skip anything the owner issued (those are receivables).
+        if (!ownerKeys.isEmpty() && ownerIsProvider(d, ownerKeys)) return "";
+        for (Party p : d.parties) {
+            String n = nm(p);
+            if (n.isBlank() || isOwner(n, ownerKeys)) continue;
+            if (isProviderSide(p)) return n;
+        }
+        // Fallback: a non-owner party that is NOT a debtor. Never pick a client-side
+        // party here — that would turn a receivable (a client who owes me) into a
+        // payable (me owing them).
+        for (Party p : d.parties) {
+            String n = nm(p);
+            if (!n.isBlank() && !isOwner(n, ownerKeys) && !isClientSide(p)) return n;
+        }
+        return "";
+    }
+    private static String nm(Party p) { return p.name() == null ? "" : p.name().trim(); }
+    private static String lc(String s) { return s == null ? "" : s.toLowerCase().trim(); }
+
+    /** Normalised client key for grouping: lowercased, common company suffixes and
+     *  punctuation stripped, so name variants of the same client merge. */
+    private static String normName(String name) {
+        if (name == null) return "";
+        String s = name.toLowerCase().replaceAll("[.,]", " ");
+        s = s.replaceAll("\\b(llc|inc|llp|ltd|co|corp|corporation|company|group|the)\\b", " ");
+        return s.replaceAll("\\s+", " ").trim();
+    }
+
+    // ── PARTIES: clients / customers ─────────────────────────────────────────
+    private Result parties(SheetQuery q, List<Doc> docs, Set<String> ownerKeys) {
+        // "How many clients/patients/tenants" → count the parties the owner serves
+        // (client-side roles), owner excluded. "How many vendors" → provider-side.
+        // Personal docs and the owner's own service providers aren't counted.
+        boolean wantProviders = roleIn(q.role(), PROVIDER_ROLES);
+        Map<String, String> byKey = new LinkedHashMap<>();
+        List<String> sources = new ArrayList<>();
+        for (Doc d : docs) {
+            // No is_personal gate — a client is identified by SIDE + not being the
+            // owner (a clinic's patient invoice is often mislabeled personal). The
+            // owner (their name AND business) is excluded, so a regulatory notice's
+            // "licensee" — the owner himself under another name — isn't a client.
+            boolean added = false;
+            for (Party p : d.parties) {
+                if (p.name() == null || p.name().isBlank() || isOwner(p.name(), ownerKeys)) continue;
+                if (wantProviders ? isProviderSide(p) : isClientSide(p)) { addName(byKey, p.name().trim()); added = true; }
+            }
+            if (added) sources.add(d.fileName);
+        }
+        List<String[]> rows = new ArrayList<>();
+        for (String n : byKey.values()) rows.add(new String[]{n, "", "0"});
+        return renderRows(q, rows, 0, sources);
+    }
+
+    private static void addName(Map<String, String> byKey, String name) {
+        String key = normName(name);
+        if (key.isBlank()) return;
+        byKey.merge(key, name, (a, b) -> b.length() > a.length() ? b : a);
+    }
+
+    // ── DOCUMENTS: filter by personal / type ─────────────────────────────────
+    private Result documents(SheetQuery q, List<Doc> docs) {
+        List<String[]> rows = new ArrayList<>();
+        List<String> sources = new ArrayList<>();
+        for (Doc d : docs) {
+            if (q.isPersonal() != null && d.isPersonal != q.isPersonal()) continue;
+            if (!q.docType().isBlank() && !d.docType.toLowerCase().contains(q.docType())) continue;
+            String label = d.title == null || d.title.isBlank() ? d.fileName : d.title;
+            rows.add(new String[]{label, "", "0"});
+            sources.add(d.fileName);
+        }
+        return renderRows(q, rows, 0, sources);
+    }
+
+    // ── DATES: deadlines within an optional range ────────────────────────────
+    private Result dates(SheetQuery q, List<Doc> docs) {
+        List<String[]> rows = new ArrayList<>();
+        List<String> sources = new ArrayList<>();
+        for (Doc d : docs) for (Dated dt : d.dates) {
+            if (dt.date() == null || dt.date().isBlank()) continue;
+            if (q.obligationsOnly() && !dt.deadline()) continue;   // deadlines, not record dates
+            if (!q.dateFrom().isBlank() && dt.date().compareTo(q.dateFrom()) < 0) continue;
+            if (!q.dateTo().isBlank() && dt.date().compareTo(q.dateTo()) > 0) continue;
+            String label = (d.title == null || d.title.isBlank() ? d.fileName : d.title)
+                    + " — " + dt.label() + " " + dt.date();
+            rows.add(new String[]{label, "", "0"});
+            if (!sources.contains(d.fileName)) sources.add(d.fileName);
+        }
+        return renderRows(q, rows, 0, sources);
+    }
+
+    // ── render per operation ─────────────────────────────────────────────────
+    private Result renderRows(SheetQuery q, List<String[]> rows, long total, List<String> sources) {
+        if (rows.isEmpty()) {
+            // A concrete aggregate that simply found nothing is a real answer ("none"),
+            // not a failure — don't hand it to the LLM. Only a vague op (NONE) defers.
+            if (q.op() == SheetQuery.Op.NONE) return null;
+            return new Result(emptyMessage(q), List.of());
+        }
+        StringBuilder sb = new StringBuilder();
+        switch (q.op()) {
+            case COUNT -> {
+                sb.append(rows.size()).append(':');
+                List<String> names = new ArrayList<>();
+                for (String[] r : rows) names.add(r[0]);
+                sb.append(' ').append(String.join(", ", names));
+            }
+            case MAX, MIN -> {
+                String[] pick = rows.get(q.op() == SheetQuery.Op.MAX ? 0 : rows.size() - 1);
+                sb.append("**").append(pick[0]).append("**");
+                if (!pick[1].isBlank()) sb.append(" — ").append(pick[1]);
+            }
+            case SUM -> {
+                sb.append(rows.size()).append(rows.size() == 1 ? " item:" : " items:");
+                for (String[] r : rows) sb.append("\n- **").append(r[0]).append("**")
+                        .append(r[1].isBlank() ? "" : " — " + r[1]);
+                sb.append("\n\nTotal: ").append(MoneyFormat.format(total));
+            }
+            default -> {   // LIST (and NONE)
+                sb.append(rows.size()).append(rows.size() == 1 ? " item:" : " items:");
+                for (String[] r : rows) sb.append("\n- **").append(r[0]).append("**")
+                        .append(r[1].isBlank() ? "" : " — " + r[1]);
+            }
+        }
+        return new Result(sb.toString(), sources);
+    }
+
+    /** A natural "found nothing" answer for a concrete aggregate. */
+    private static String emptyMessage(SheetQuery q) {
+        return switch (q.select()) {
+            case AMOUNTS -> (q.status().contains("paid") && !q.status().contains("un"))
+                    ? "None of them are marked paid yet."
+                    : "Nothing outstanding — you're all settled up.";
+            case DATES -> q.obligationsOnly()
+                    ? "No deadlines in that period." : "No dates found in that period.";
+            case DOCUMENTS -> "No matching documents found.";
+            case PARTIES -> "None found.";
+        };
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+    private static boolean isPaymentDoc(Doc d) {
+        String t = d.docType == null ? "" : d.docType.toLowerCase();
+        return t.contains("payment") || t.contains("confirmation") || t.contains("receipt of payment");
+    }
+
+    /** The owner's own firm = the org that RECURS as the provider/biller across
+     *  documents (e.g. a CPA who issues many invoices). When no provider repeats —
+     *  a student whose bills come from many different billers — there is no owner
+     *  firm, so the biller on each doc becomes its counterparty. */
+    private static String detectOwnerFirm(List<Doc> docs) {
+        Map<String, Integer> tally = new LinkedHashMap<>();
+        for (Doc d : docs) for (Party p : d.parties) {
+            String r = p.role() == null ? "" : p.role().toLowerCase();
+            if ((r.contains("provider") || r.contains("biller") || r.contains("issuer")) && p.name() != null && !p.name().isBlank())
+                tally.merge(p.name().trim(), 1, Integer::sum);
+        }
+        return tally.entrySet().stream().max(Map.Entry.comparingByValue())
+                .filter(e -> e.getValue() >= 2)     // must recur to be the owner firm
+                .map(Map.Entry::getKey).orElse("");
+    }
+
+    /** The party a document is really about for grouping: the first named party that
+     *  isn't the owner firm (works even when the role label is wrong). */
+    private static String counterpartyOf(Doc d, String ownerFirm) {
+        for (Party p : d.parties) {
+            String name = p.name() == null ? "" : p.name().trim();
+            if (name.isBlank()) continue;
+            if (!name.equalsIgnoreCase(ownerFirm)) return name;
+        }
+        return "";
+    }
+
+    private Doc parse(String json, String fileName) {
+        try {
+            JsonNode n = mapper.readTree(json);
+            Doc d = new Doc();
+            d.fileName = fileName;
+            d.docType = n.path("doc_type").asText("");
+            d.title = n.path("title").asText("");
+            d.gist = n.path("gist").asText("");
+            d.isPersonal = n.path("is_personal").asBoolean(false);
+            for (String f : new String[]{"orgs", "people"}) {
+                JsonNode arr = n.get(f);
+                if (arr != null && arr.isArray()) for (JsonNode p : arr)
+                    d.parties.add(new Party(p.path("name").asText(""), p.path("role").asText(""),
+                            p.path("side").asText("")));
+            }
+            // If every named party shares the SAME side, the tags are unreliable (on a
+            // bill someone must owe and someone must be owed) — drop them so role decides.
+            Set<String> sides = new java.util.HashSet<>();
+            for (Party p : d.parties) { String sd = lc(p.side()); if (!sd.isBlank()) sides.add(sd); }
+            if (sides.size() == 1 && d.parties.size() > 1) {
+                List<Party> cleaned = new ArrayList<>();
+                for (Party p : d.parties) cleaned.add(new Party(p.name(), p.role(), ""));
+                d.parties = cleaned;
+            }
+            JsonNode am = n.get("amounts");
+            if (am != null && am.isArray()) for (JsonNode a : am) {
+                if (!a.path("value").isNumber()) continue;
+                d.amounts.add(new Amount(a.path("value").asDouble(), a.path("status").asText(""), a.path("label").asText("")));
+            }
+            JsonNode dt = n.get("dates");
+            if (dt != null && dt.isArray()) for (JsonNode x : dt)
+                d.dates.add(new Dated(x.path("label").asText(""), x.path("date").asText(""),
+                        x.path("deadline").asBoolean(false)));
+            return d;
+        } catch (Exception e) {
+            log.warn("Could not parse sheet for '{}': {}", fileName, e.getMessage());
+            return null;
+        }
+    }
+}

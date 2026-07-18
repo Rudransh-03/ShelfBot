@@ -313,6 +313,19 @@ public final class QueryEngine {
     // Cross-document fee-receivable aggregator (gather → extract → dedup → sum).
     // Null-safe when metadataStore is null (degrades to no fee path).
     private final FeeReceivables      feeEngine;
+    // Generic aggregator (planner + fact extractor) — the replacement for the
+    // fee-specific path. Runs alongside the old routing during migration: it
+    // handles "count/total/list-everything" questions, everything else falls
+    // through to the existing flow. Null in metadataStore-less test constructors.
+    private final com.localfilebrain.aggregate.QueryPlanner      queryPlanner;
+    private final com.localfilebrain.aggregate.AggregationService aggService;
+    // Extract-once fact sheets: each doc is read by the LLM a single time, and every
+    // corpus-wide question is answered from the cheap sheets (not by re-reading docs).
+    private final com.localfilebrain.aggregate.SheetExtractor     sheetExtractor;
+    private final com.localfilebrain.aggregate.SheetPlanner       sheetPlanner;
+    private final com.localfilebrain.aggregate.SheetAggregator    sheetAggregator;
+    private final com.localfilebrain.aggregate.SheetAnswerer      sheetAnswerer;   // fuzzy fallback only
+    private final java.util.List<String>                          ownerNames;      // who "you" are (config)
 
     public QueryEngine(AppConfig config) {
         this(config, null, null, new AuthTokenStore());
@@ -369,6 +382,17 @@ public final class QueryEngine {
         this.llmClient = new GPT4oMiniClient(config, tokenStore);
         this.history   = new ConversationHistory(HISTORY_SIZE);
         this.feeEngine = new FeeReceivables(metadataStore, vectorStore, llmClient);
+        this.queryPlanner = metadataStore == null ? null
+                : new com.localfilebrain.aggregate.QueryPlanner(llmClient, metadataStore);
+        this.aggService = metadataStore == null ? null
+                : new com.localfilebrain.aggregate.AggregationService(llmClient, metadataStore, vectorStore);
+        this.sheetExtractor = metadataStore == null ? null
+                : new com.localfilebrain.aggregate.SheetExtractor(llmClient, metadataStore, vectorStore);
+        this.sheetPlanner = new com.localfilebrain.aggregate.SheetPlanner(llmClient);
+        this.sheetAggregator = new com.localfilebrain.aggregate.SheetAggregator();
+        this.ownerNames = config.getOwnerNames();
+        this.sheetAnswerer = new com.localfilebrain.aggregate.SheetAnswerer(llmClient);
+        if (metadataStore != null) com.localfilebrain.aggregate.BaseCategories.seed(metadataStore);
     }
 
     public void close() {
@@ -462,6 +486,12 @@ public final class QueryEngine {
         // code then computes. No keyword gates decide intent, so no phrasing is
         // silently missed. LOOKUP/COMPARE fall through (null) to semantic search
         // using the classifier's self-contained rewrite of the message.
+        // NEW generic aggregator (runs before the old routing during migration):
+        // a "count/total/list-everything" question is answered completely from
+        // every matching doc, not a top-k guess. Non-aggregate → falls through.
+        QueryResult agg = tryAggregate(trimmed, allowedPaths, onToken);
+        if (agg != null) return agg;
+
         String retrievalQuery = trimmed;
         if (metadataStore != null) {
             Routed routed = routeByIntent(trimmed, allowedPaths, onToken);
@@ -560,6 +590,9 @@ public final class QueryEngine {
             QueryResult scopedResult = answerFromFileScope(trimmed, scoped.get(), null);
             if (scopedResult != null) return scopedResult; // null → file had no chunks; fall through
         }
+
+        QueryResult agg = tryAggregate(trimmed, allowedPaths, null);
+        if (agg != null) return agg;
 
         // ONE context-aware classification decides intent (see streaming variant):
         // the model understands the message with full history; code computes.
@@ -1193,6 +1226,10 @@ public final class QueryEngine {
                           topic ("summarize the visa checklist", "what's in the
                           lease", "show me the compliance notice") is LOOKUP — it
                           refers to the user's own files, never an outside task.
+                          A yes/no or EXISTENCE question about something that could be
+                          in the files ("do I have a lease?", "did I get a scholarship?",
+                          "is there a W-2 in here?") is LOOKUP — retrieve and answer
+                          yes/no with the detail. NEVER mark these UNCLEAR.
               CHITCHAT  - greeting/thanks/smalltalk. Put a brief, friendly reply in
                           "reply".
               UNCLEAR   - use ONLY for a message with no actionable entity: a bare
@@ -1339,13 +1376,11 @@ public final class QueryEngine {
             log.info("Intent: {}", ci.intent());
         }
         switch (ci.intent()) {
-            case ROSTER -> { return new Routed(answerClientRoster(question, onToken), effective); }
-            case FEE_RECEIVABLES -> {
-                // Model decided the WHAT (fee question, which client, paid/unpaid);
-                // code does the counting. Null → no fee data in scope, fall through.
-                QueryResult fee = answerFeeReceivables(effective, ci.scope(), ci.status(), allowedPaths, onToken);
-                return new Routed(fee, effective);
-            }
+            // Client-roster and fee questions are now answered by the single
+            // fact-sheet aggregator (the old per-engine paths are retired), so one
+            // system handles every corpus-wide question. Null → fall through to RAG.
+            case ROSTER -> { return new Routed(answerViaSheets(question, allowedPaths, onToken), effective); }
+            case FEE_RECEIVABLES -> { return new Routed(answerViaSheets(effective, allowedPaths, onToken), effective); }
             case OVERVIEW -> { return new Routed(answerCorpusOverview(question, allowedPaths, onToken), effective); }
             case COUNT, LIST -> {
                 // "which notices need a response AND BY WHEN?" is not a bare
@@ -1720,18 +1755,33 @@ public final class QueryEngine {
     // registry so it's consistent with the UI.
     private QueryResult answerClientRoster(String question, java.util.function.Consumer<String> onToken) {
         List<com.localfilebrain.ingestion.IndexMetadataStore.Client> clients = metadataStore.listClients();
+        // Only count clients who still have indexed documents — one whose files
+        // were all deleted is "no docs left", not a live client (fixes stale
+        // roster showing clients whose documents are long gone).
+        java.util.Map<String, Integer> counts = metadataStore.clientLiveDocCounts();
+        List<String> active = new ArrayList<>();
+        int archived = 0;
+        for (var c : clients) {
+            if (counts.getOrDefault(c.id(), 0) > 0) active.add(c.name());
+            else archived++;
+        }
+        active.sort(String.CASE_INSENSITIVE_ORDER);
+
         String answer;
-        if (clients.isEmpty()) {
-            answer = "You don't have any clients set up yet. Rudo can suggest clients from your "
-                   + "files, or you can add them yourself in Settings.";
+        if (active.isEmpty()) {
+            answer = archived > 0
+                ? "None of your clients have any documents left — their files were removed. "
+                + "Add their docs back, or set up clients in Settings."
+                : "You don't have any clients set up yet. Rudo can suggest clients from your "
+                + "files, or you can add them yourself in Settings.";
         } else {
-            List<String> names = new ArrayList<>();
-            for (var c : clients) names.add(c.name());
-            names.sort(String.CASE_INSENSITIVE_ORDER);
             StringBuilder sb = new StringBuilder();
-            sb.append("You have ").append(clients.size())
-              .append(clients.size() == 1 ? " client in your list:" : " clients in your list:");
-            for (String n : names) sb.append("\n- ").append(n);
+            sb.append("You have ").append(active.size())
+              .append(active.size() == 1 ? " client:" : " clients:");
+            for (String n : active) sb.append("\n- ").append(n);
+            if (archived > 0)
+                sb.append("\n\n(").append(archived).append(archived == 1 ? " other name has" : " other names have")
+                  .append(" no documents left — likely removed.)");
             answer = sb.toString();
         }
         if (onToken != null) onToken.accept(answer);
@@ -1745,6 +1795,101 @@ public final class QueryEngine {
     /** True when the question asks for a summed total, not just a list. */
     static boolean wantsTotal(String q) {
         return q != null && TOTAL_Q.matcher(q).find();
+    }
+
+    // ── Generic aggregator entry point ───────────────────────────────────────
+    // Plan the message (one LLM call, full conversation) and, if it's a
+    // count/total/list-everything question, answer it completely from every
+    // matching doc via the AggregationService. Returns null for a normal question
+    // (→ existing routing) or when there's nothing to aggregate (→ RAG).
+    private QueryResult tryAggregate(String question, java.util.Set<String> allowedPaths,
+                                     java.util.function.Consumer<String> onToken) {
+        if (sheetPlanner == null || sheetExtractor == null || sheetAggregator == null) return null;
+        com.localfilebrain.aggregate.SheetQuery q = sheetPlanner.plan(question, plannerContext());
+        if (!q.aggregate()) return null;
+        return runSheetAggregate(q, question, allowedPaths, onToken);
+    }
+
+    /** Force the sheet path for a question an old intent (roster / fees) used to own,
+     *  so a single system answers every corpus-wide question. */
+    private QueryResult answerViaSheets(String question, java.util.Set<String> allowedPaths,
+                                        java.util.function.Consumer<String> onToken) {
+        if (sheetPlanner == null || sheetExtractor == null || sheetAggregator == null) return null;
+        com.localfilebrain.aggregate.SheetQuery q = sheetPlanner.plan(question, plannerContext());
+        return runSheetAggregate(q, question, allowedPaths, onToken);
+    }
+
+    /** Answer a corpus-wide question from the extract-once fact sheets. The first such
+     *  question pays the one-time batched read; afterwards it's all cache hits. The
+     *  SheetAggregator does the filter/sum/count DETERMINISTICALLY (same answer every
+     *  time); only if it can't compute the answer do we fall back to the LLM answerer.
+     *  Null → nothing to say, fall through to RAG. */
+    private QueryResult runSheetAggregate(com.localfilebrain.aggregate.SheetQuery q, String question,
+                                          java.util.Set<String> allowedPaths,
+                                          java.util.function.Consumer<String> onToken) {
+        // A "list every document, no filter" plan is almost always a mis-classified
+        // single-item lookup ("am I owed on the Pine St sale?"). Decline it so the
+        // normal retrieval / corpus-overview path answers properly. A genuine "list my
+        // personal docs / my invoices" carries a filter and is unaffected. Guarded
+        // here so both entry points (planner + forced roster/fee) are covered.
+        if (q.select() == com.localfilebrain.aggregate.SheetQuery.Select.DOCUMENTS
+                && q.isPersonal() == null && q.docType().isBlank()
+                && q.dateFrom().isBlank() && q.dateTo().isBlank()) return null;
+
+        String qtext = q.rewrite() == null || q.rewrite().isBlank() ? question : q.rewrite();
+
+        List<com.localfilebrain.aggregate.SheetExtractor.Sheet> sheets = sheetExtractor.ensureSheets(allowedPaths);
+        if (sheets.isEmpty()) return null;                         // nothing indexed → let RAG try
+
+        String text; List<String> sourceNames;
+        com.localfilebrain.aggregate.SheetAggregator.Result det = sheetAggregator.run(q, sheets, ownerNames);
+        if (det != null && !det.text().isBlank()) {
+            text = det.text(); sourceNames = det.sources();
+            log.info("Intent: AGGREGATE (sheets={}, select={}, op={}) — deterministic", sheets.size(), q.select(), q.op());
+        } else {
+            // Deterministic path had nothing structured to compute → fuzzy LLM read.
+            com.localfilebrain.aggregate.SheetAnswerer.Answer ans =
+                    sheetAnswerer.answer(qtext, sheets, plannerContext(), mapOp(q.op()), q.status());
+            if (ans == null || ans.text().isBlank()) return null;
+            text = ans.text(); sourceNames = ans.sources();
+            log.info("Intent: AGGREGATE (sheets={}) — LLM fallback", sheets.size());
+        }
+
+        // Map the cited filenames back to real paths for source chips.
+        java.util.Map<String, String> nameToPath = new java.util.HashMap<>();
+        for (com.localfilebrain.aggregate.SheetExtractor.Sheet s : sheets) nameToPath.put(s.fileName(), s.path());
+        List<Source> chips = new ArrayList<>();
+        for (String name : sourceNames) {
+            String p = nameToPath.get(name);
+            if (p != null) chips.add(new Source(name, p, List.of(), List.of()));
+        }
+        if (onToken != null) onToken.accept(text);
+        history.add(qtext, text);
+        return QueryResult.found(text, chips);
+    }
+
+    /** Map the generic sheet op to the LLM-answerer's op (fuzzy fallback only). */
+    private static com.localfilebrain.aggregate.QueryPlan.Op mapOp(com.localfilebrain.aggregate.SheetQuery.Op op) {
+        return switch (op) {
+            case SUM -> com.localfilebrain.aggregate.QueryPlan.Op.TOTAL;
+            case MAX -> com.localfilebrain.aggregate.QueryPlan.Op.WHO_MOST;
+            case COUNT -> com.localfilebrain.aggregate.QueryPlan.Op.COUNT;
+            case LIST -> com.localfilebrain.aggregate.QueryPlan.Op.LIST;
+            default -> com.localfilebrain.aggregate.QueryPlan.Op.NONE;
+        };
+    }
+
+    /** Recent turns as plain text, for the planner to resolve follow-ups. */
+    private String plannerContext() {
+        List<ConversationHistory.Exchange> all = history.getAll();
+        if (all.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        for (int i = Math.max(0, all.size() - 3); i < all.size(); i++) {
+            ConversationHistory.Exchange e = all.get(i);
+            sb.append("user: ").append(truncateAt(e.question(), 200)).append('\n')
+              .append("assistant: ").append(truncateAt(e.answer(), 300)).append('\n');
+        }
+        return sb.toString();
     }
 
     // ── Fee receivables (cross-document, replaces the single-tracker crutch) ──
@@ -2604,33 +2749,18 @@ public final class QueryEngine {
     }
 
     /**
-     * Renders an amount in its own currency: Indian digit grouping for rupees
-     * (and for currency-less amounts — the product's home market), Western
-     * grouping otherwise; symbols attach directly (₹1,500 / $1,500), alphabetic
-     * codes get a space (USD 1,500). Never converts between currencies.
+     * Renders an amount in its OWN stated currency (grouping follows the currency:
+     * Indian for rupees, Western otherwise); when no currency is stated, falls back
+     * to the user's active market grouping. Symbols attach directly (₹1,500 /
+     * $1,500), alphabetic codes get a space (USD 1,500). Never converts currencies.
      */
     static String money(String currency, long v) {
         String cur = currency == null ? "" : currency.strip();
-        boolean rupee = cur.isEmpty() || cur.equals("₹")
-                || cur.matches("(?i)rs\\.?|inr|rupees?");
-        String num = rupee ? indianGroup(v) : String.format(java.util.Locale.US, "%,d", v);
-        if (cur.isEmpty()) return num; // no currency stated → bare number
+        if (cur.isEmpty()) return MoneyFormat.group(v);   // no currency stated → market grouping, bare number
+        boolean rupee = cur.equals("₹") || cur.matches("(?i)rs\\.?|inr|rupees?");
+        String num = rupee ? MoneyFormat.indianGroup(v) : MoneyFormat.westernGroup(v);
         boolean wordy = cur.chars().anyMatch(Character::isLetter); // Rs. / USD / INR
         return wordy ? cur + " " + num : cur + num;                // vs ₹ / $ / €
-    }
-
-    /** Formats a whole-rupee amount with Indian digit grouping (e.g. 2066600 → 20,66,600). */
-    static String indianGroup(long n) {
-        boolean neg = n < 0;
-        String s = Long.toString(Math.abs(n));
-        if (s.length() <= 3) return (neg ? "-" : "") + s;
-        String last3 = s.substring(s.length() - 3);
-        String rest  = s.substring(0, s.length() - 3);
-        StringBuilder sb = new StringBuilder();
-        int i = rest.length();
-        while (i > 2) { sb.insert(0, "," + rest.substring(i - 2, i)); i -= 2; }
-        sb.insert(0, rest.substring(0, i));
-        return (neg ? "-" : "") + sb + "," + last3;
     }
 
     /** Assembles the per-file inventory (names for all, content excerpts for a sample). */

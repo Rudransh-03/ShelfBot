@@ -40,6 +40,7 @@ export default function WelcomeModal() {
   const [open, setOpen]       = useState(false)
   const [step, setStep]       = useState(0)
   const [folders, setFolders] = useState([])
+  const [region, setRegion]   = useState('IN')
   const [busy, setBusy]       = useState(false)
 
   // Decide whether to show. We wait for the backend to be reachable so the
@@ -101,6 +102,7 @@ export default function WelcomeModal() {
     setBusy(true)
     try {
       await api.saveConfig(folders)
+      try { await api.saveRegion(region) } catch { /* non-fatal; can set later in Settings */ }
       close(true)
       // Kick indexing off so the user immediately sees the progress bar
       // instead of an empty Library view.
@@ -152,6 +154,17 @@ export default function WelcomeModal() {
                 ? 'We’ve added your usual document folders. Remove any you don’t want, or add more — you can change this anytime in Settings.'
                 : 'Add the folders whose files you want Rudo to read (and their subfolders). You can change this anytime in Settings.'}
             </p>
+
+            <div className="welcome-region">
+              <label className="form-lbl" htmlFor="welcome-region">Your region</label>
+              <select id="welcome-region" className="region-select"
+                      value={region} onChange={e => setRegion(e.target.value)}>
+                <option value="US">United States ($)</option>
+                <option value="UK">United Kingdom (£)</option>
+                <option value="EU">Ireland / Euro (€)</option>
+                <option value="IN">India (₹)</option>
+              </select>
+            </div>
 
             {folders.length === 0 ? (
               <div className="welcome-empty">No folders chosen yet</div>

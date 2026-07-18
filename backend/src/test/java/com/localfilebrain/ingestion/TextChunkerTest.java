@@ -2,13 +2,11 @@ package com.localfilebrain.ingestion;
 
 import com.localfilebrain.config.AppConfig;
 import com.localfilebrain.model.DocumentChunk;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
-import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -24,45 +22,20 @@ class TextChunkerTest {
     private TextChunker chunker;
     private Path dummyFile;
 
-    private Path   configPath;
-    private byte[] originalConfig; // null when file did not exist before test
-
     @BeforeEach
     void setUp() throws IOException {
-        configPath = Path.of(System.getProperty("user.dir")).resolve("config.properties");
-
-        // Save original content so we can restore it in tearDown
-        originalConfig = Files.exists(configPath) ? Files.readAllBytes(configPath) : null;
-
+        // Build config straight from properties — no config FILE. AppConfig.load()
+        // now prefers the OS data-dir config (post-migration), so writing to the
+        // working dir would be ignored; fromProperties keeps this test isolated.
         Properties props = new Properties();
-        if (originalConfig != null) {
-            // Start from the existing properties so we don't lose any keys
-            try (var in = Files.newInputStream(configPath)) {
-                props.load(in);
-            }
-        }
-        // Override only what this test needs
         props.setProperty("files.root.path", tempDir.toString());
         props.setProperty("chunk.size.chars", "200");
         props.setProperty("chunk.overlap.chars", "40");
 
-        try (OutputStream out = Files.newOutputStream(configPath)) {
-            props.store(out, null);
-        }
-
-        AppConfig config = AppConfig.load();
+        AppConfig config = AppConfig.fromProperties(props);
         chunker   = new TextChunker(config);
         dummyFile = tempDir.resolve("test.txt");
         Files.writeString(dummyFile, "placeholder");
-    }
-
-    @AfterEach
-    void tearDown() throws IOException {
-        if (originalConfig != null) {
-            Files.write(configPath, originalConfig);   // restore original file
-        } else {
-            Files.deleteIfExists(configPath);          // file didn't exist before; remove it
-        }
     }
 
     // -------------------------------------------------------------------------

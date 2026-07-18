@@ -73,12 +73,13 @@ class AnalyticsHelpersTest {
 
     @Test
     void indianGroupingIsCorrect() {
-        assertEquals("20,66,600", QueryEngine.indianGroup(2066600));
-        assertEquals("7,08,000",  QueryEngine.indianGroup(708000));
-        assertEquals("10,62,000", QueryEngine.indianGroup(1062000));
-        assertEquals("25,000",    QueryEngine.indianGroup(25000));
-        assertEquals("500",       QueryEngine.indianGroup(500));
-        assertEquals("0",         QueryEngine.indianGroup(0));
+        // Indian grouping now lives in MoneyFormat (the market seam).
+        assertEquals("20,66,600", com.localfilebrain.model.MoneyFormat.indianGroup(2066600));
+        assertEquals("7,08,000",  com.localfilebrain.model.MoneyFormat.indianGroup(708000));
+        assertEquals("10,62,000", com.localfilebrain.model.MoneyFormat.indianGroup(1062000));
+        assertEquals("25,000",    com.localfilebrain.model.MoneyFormat.indianGroup(25000));
+        assertEquals("500",       com.localfilebrain.model.MoneyFormat.indianGroup(500));
+        assertEquals("0",         com.localfilebrain.model.MoneyFormat.indianGroup(0));
     }
 
 }

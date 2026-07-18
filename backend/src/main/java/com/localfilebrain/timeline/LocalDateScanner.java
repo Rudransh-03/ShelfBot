@@ -393,12 +393,20 @@ public final class LocalDateScanner {
     }
 
     private static LocalDate fromNumeric(Matcher m) {
-        int a = Integer.parseInt(m.group(1)); // day (DD/MM, Indian)
-        int b = Integer.parseInt(m.group(2)); // month
+        int a = Integer.parseInt(m.group(1));
+        int b = Integer.parseInt(m.group(2));
         int yr = Integer.parseInt(m.group(3));
-        try { return dateInBounds(yr, b, a); }              // DD/MM/YYYY
+        // Day/month order follows the user's market: US reads MM/DD first, the
+        // UK/EU/India read DD/MM first. The other order is the fallback — a value
+        // >12 in either position forces the correct reading (dateInBounds throws
+        // on an invalid month), so unambiguous dates parse regardless of market.
+        boolean mdy = com.localfilebrain.config.RegionProfile.active().dateOrder()
+                == com.localfilebrain.config.RegionProfile.DateOrder.MDY;
+        int firstMon  = mdy ? a : b, firstDay  = mdy ? b : a;   // primary reading
+        int secondMon = mdy ? b : a, secondDay = mdy ? a : b;   // fallback reading
+        try { return dateInBounds(yr, firstMon, firstDay); }
         catch (Exception e) {
-            try { return dateInBounds(yr, a, b); }          // fall back to MM/DD/YYYY
+            try { return dateInBounds(yr, secondMon, secondDay); }
             catch (Exception e2) { return null; }
         }
     }

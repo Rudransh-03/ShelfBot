@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.localfilebrain.attention.AttentionBuilder;
 import com.localfilebrain.auth.AuthTokenStore;
 import com.localfilebrain.config.AppConfig;
+import com.localfilebrain.config.RegionProfile;
 import com.localfilebrain.deadline.DeadlineScanService;
 import com.localfilebrain.embedding.EmbeddingClient;
 import com.localfilebrain.chat.ChatStore;
@@ -685,6 +686,7 @@ public final class ApiServer {
                 sendJson(ex, 200, map(
                     "rootPath",        rootPath,
                     "rootPaths",       rootPaths,
+                    "region",          config.getRegion().code(),
                     "vectorIndexPath", config.getVectorIndexPath().toAbsolutePath().toString(),
                     "metadataDbPath",  config.getMetadataDbPath().toAbsolutePath().toString()
                 ));
@@ -715,22 +717,30 @@ public final class ApiServer {
                 cleaned.add(singlePath.trim());
             }
 
-            if (cleaned.isEmpty()) {
-                sendError(ex, 400, "rootPath or rootPaths is required");
+            // Region is a standalone setting — a request may carry only the region
+            // (from the Settings dropdown / onboarding), only paths, or both.
+            String region = req.get("region") instanceof String r && !r.isBlank()
+                    ? RegionProfile.of(r).code() : null;   // normalise (US/UK/EU/IN)
+
+            if (cleaned.isEmpty() && region == null) {
+                sendError(ex, 400, "rootPath, rootPaths, or region is required");
                 return;
             }
 
-            updateConfigRootPaths(cleaned);
+            if (!cleaned.isEmpty()) updateConfigRootPaths(cleaned);
+            if (region != null)     updateConfigProperty("user.region", region);
 
-            // Reload config so future status calls reflect the new paths
+            // Reload config so future calls reflect the change (this also re-syncs
+            // the active market via RegionProfile.setActive inside AppConfig.load).
             this.config = AppConfig.load();
             // Reset QueryEngine so it re-initialises with the updated config on next query
             this.queryEngine = null;
 
             sendJson(ex, 200, map(
                 "updated",   true,
-                "rootPath",  cleaned.get(0),
-                "rootPaths", cleaned
+                "rootPath",  cleaned.isEmpty() ? "" : cleaned.get(0),
+                "rootPaths", cleaned,
+                "region",    config.getRegion().code()
             ));
         } catch (Exception e) {
             log.error("Config update failed", e);
@@ -1859,6 +1869,20 @@ public final class ApiServer {
             props.setProperty("files.root.paths", String.join(",", newPaths));
             props.remove("files.root.path");
         }
+        try (OutputStream out = Files.newOutputStream(configFile)) {
+            props.store(out, "ShelfBot configuration — updated by UI");
+        }
+    }
+
+    /** Sets a single key in {@code config.properties}, preserving the rest. */
+    private void updateConfigProperty(String key, String value) throws IOException {
+        Path configFile = config.getConfigFilePath();
+        Files.createDirectories(configFile.toAbsolutePath().getParent());
+        Properties props = new Properties();
+        if (Files.exists(configFile)) {
+            try (InputStream in = Files.newInputStream(configFile)) { props.load(in); }
+        }
+        props.setProperty(key, value);
         try (OutputStream out = Files.newOutputStream(configFile)) {
             props.store(out, "ShelfBot configuration — updated by UI");
         }

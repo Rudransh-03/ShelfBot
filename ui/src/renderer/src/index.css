@@ -2435,6 +2435,20 @@ input:focus-visible {
   color: var(--text-2);
   letter-spacing: 0.003em;
 }
+.region-select {
+  appearance: none;
+  max-width: 320px;
+  padding: 9px 12px;
+  font: inherit;
+  font-size: 13.5px;
+  color: var(--text-1);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm, 8px);
+  cursor: pointer;
+}
+.region-select:focus { outline: none; border-color: var(--border-focus); }
+.welcome-region { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 18px; }
 .form-hint {
   font-size: 11.5px;
   color: var(--text-3);

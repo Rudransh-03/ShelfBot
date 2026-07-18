@@ -133,6 +133,12 @@ export class ApiClient {
     return this._r('/api/config', { method: 'POST', body: JSON.stringify(body) })
   }
 
+  /** Persists the user's market/region (US | UK | EU | IN) — drives currency,
+   *  number grouping and date interpretation. Takes effect on the next query. */
+  saveRegion(region) {
+    return this._r('/api/config', { method: 'POST', body: JSON.stringify({ region }) })
+  }
+
   /** Returns indexed files sorted by size desc. Each carries an auto `docType`. */
   listFiles()       { return this._r('/api/files') }
 

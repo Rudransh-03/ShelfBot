@@ -66,7 +66,21 @@ public final class AppConfig {
                 throw new ConfigurationException("Failed to read classpath config", e);
             }
         }
-        return new AppConfig(props, dataPaths);
+        AppConfig config = new AppConfig(props, dataPaths);
+        // Sync the active market so currency/date formatting matches the user's
+        // region — on every load, so a settings change takes effect on reload.
+        RegionProfile.setActive(config.getRegion());
+        return config;
+    }
+
+    /**
+     * Builds a config directly from explicit properties, bypassing file
+     * resolution — for tests, so they don't depend on WHERE config.properties
+     * lives (which moved to the OS data dir). Uses the resolved data paths but
+     * never reads/writes a config file.
+     */
+    public static AppConfig fromProperties(Properties props) {
+        return new AppConfig(props, UserDataPaths.resolve());
     }
 
     // -------------------------------------------------------------------------
@@ -193,6 +207,23 @@ public final class AppConfig {
 
     public int getChunkSizeChars() {
         return getInt("chunk.size.chars", 1800);
+    }
+
+    /** The user's market/jurisdiction ("US"/"UK"/"EU"/"IN"), captured at
+     *  onboarding. Drives currency, digit grouping and date order (and, later,
+     *  jurisdiction context for extraction). Defaults to IN. */
+    public RegionProfile getRegion() {
+        return RegionProfile.of(getOrDefault("user.region", "IN"));
+    }
+
+    /** The owner's own identities (their name and business, comma-separated) so the
+     *  aggregator knows who "you" are — anything matching is never a client or vendor.
+     *  Empty by default; the aggregator then guesses the owner heuristically. */
+    public java.util.List<String> getOwnerNames() {
+        String v = getOrDefault("user.owner.names", "");
+        java.util.List<String> out = new java.util.ArrayList<>();
+        for (String s : v.split(",")) if (!s.isBlank()) out.add(s.trim());
+        return out;
     }
 
     public int getChunkOverlapChars() {

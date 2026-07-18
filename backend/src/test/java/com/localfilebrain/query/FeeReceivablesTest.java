@@ -36,6 +36,22 @@ class FeeReceivablesTest {
     }
 
     @Test
+    void partialBalanceRowBeatsBareInvoiceInDedup() {
+        // Same invoice in two docs: an email states the real PARTIAL balance
+        // ($3,000), the invoice PDF shows only the gross with no payment status.
+        // The PARTIAL row must win so the client is reported as owing $3,000, not
+        // the invoice's face value with unknown status.
+        var partial = new FeeReceivables.FeeRow("Blue Ridge", "LS-2041", 4200, 3000,
+                Status.PARTIAL, "email.pdf", "/e", "", "");
+        var invoice = new FeeReceivables.FeeRow("Blue Ridge", "LS-2041", 4200, 0,
+                Status.UNKNOWN, "invoice.pdf", "/i", "", "");
+        assertTrue(FeeReceivables.rowRank(partial) > FeeReceivables.rowRank(invoice));
+        // PENDING (full owed) also beats a bare UNKNOWN invoice.
+        var pending = new FeeReceivables.FeeRow("X", "N-1", 900, 900, Status.PENDING, "s", "/s", "", "");
+        assertTrue(FeeReceivables.rowRank(pending) > FeeReceivables.rowRank(invoice));
+    }
+
+    @Test
     void settledOrProspectOwesNothing() {
         assertEquals(0, FeeReceivables.owedFor(Status.PAID, 53100, 0));
         assertEquals(0, FeeReceivables.owedFor(Status.RECEIVED, 25000, 0));

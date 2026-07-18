@@ -234,6 +234,7 @@ export default function Settings({ active, onGoLibrary }) {
   const [rootPaths,       setRootPaths]       = useState([])
   const [vectorIndexPath, setVectorIndexPath] = useState('—')
   const [dirty,           setDirty]           = useState(false)
+  const [region,          setRegion]          = useState('IN')
 
   const embeddingModel = stats?.embeddingModel ?? 'unknown'
   const embeddingIsLocal = embeddingModel.startsWith('local:')
@@ -253,10 +254,17 @@ export default function Settings({ active, onGoLibrary }) {
           : (cfg.rootPath ? [cfg.rootPath] : [])
         setRootPaths(paths)
         setVectorIndexPath(cfg.vectorIndexPath ?? '—')
+        setRegion(cfg.region ?? 'IN')
         setDirty(false)
       })
       .catch(() => {})
   }, [active, connected, api])
+
+  const changeRegion = async (r) => {
+    setRegion(r)
+    try { await api.saveRegion(r); toast('Region updated', 's') }
+    catch (e) { toast(e.message, 'e') }
+  }
 
   const addFolder = async () => {
     const E = window.electron
@@ -311,6 +319,25 @@ export default function Settings({ active, onGoLibrary }) {
       <div className="view-divider" />
 
       <div className="settings-body">
+        {/* Region / market */}
+        <div className="scard">
+          <div className="scard-title">Region</div>
+          <div className="scard-sub">
+            Sets your currency, number format and how dates are read
+            (US reads 05/06 as May 6; others as 5 June).
+          </div>
+          <div className="form-group">
+            <label className="form-lbl" htmlFor="region-select">Market</label>
+            <select id="region-select" className="region-select"
+                    value={region} onChange={e => changeRegion(e.target.value)}>
+              <option value="US">United States ($)</option>
+              <option value="UK">United Kingdom (£)</option>
+              <option value="EU">Ireland / Euro (€)</option>
+              <option value="IN">India (₹)</option>
+            </select>
+          </div>
+        </div>
+
         {/* Indexed folders */}
         <div className="scard">
           <div className="scard-title">Indexed folders</div>

@@ -93,7 +93,13 @@ public final class SheetPlanner {
               {"aggregate":true,"select":"dates","operation":"list","date_from":"2026-07-01","date_to":"2026-07-31","obligations_only":true}
             "did I get any scholarship?" → {"aggregate":false}
             "am I owed anything on the Pine St sale?" → {"aggregate":false}
+            "when is my credit card payment due?" → {"aggregate":false}
+            "when is the rent due?" → {"aggregate":false}
             "what does the Blue Ridge invoice say?" → {"aggregate":false}
+
+            "when is <a specific bill/document> due/renew/expire" is a LOOKUP about one
+            thing → aggregate:false. Only "what deadlines / what's due (this period)"
+            across everything is the dates aggregate.
 
             A question about ONE named thing (a specific property, invoice, person,
             sale) is aggregate:false — it's a lookup, not a corpus-wide roll-up.

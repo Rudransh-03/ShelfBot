@@ -1229,7 +1229,11 @@ public final class QueryEngine {
                           A yes/no or EXISTENCE question about something that could be
                           in the files ("do I have a lease?", "did I get a scholarship?",
                           "is there a W-2 in here?") is LOOKUP — retrieve and answer
-                          yes/no with the detail. NEVER mark these UNCLEAR.
+                          yes/no with the detail. NEVER mark these UNCLEAR. Likewise a
+                          "WHEN is <X> due/renew/expire" or "HOW MUCH is <X>" question
+                          about a specific bill, document, or topic ("when is my credit
+                          card due?", "how much is my phone bill?") is LOOKUP — retrieve
+                          and answer with the date/amount. NEVER UNCLEAR.
               CHITCHAT  - greeting/thanks/smalltalk. Put a brief, friendly reply in
                           "reply".
               UNCLEAR   - use ONLY for a message with no actionable entity: a bare
@@ -1573,9 +1577,12 @@ public final class QueryEngine {
 
     /** Words that mark a question as being about pending/dated action items. */
     private static final Pattern ACTION_FLAVORED = Pattern.compile(
-            "(?i)\\b(due|overdue|pending|deadline|deadlines|chase|follow\\s*up|respond|response|reply|"
-          + "notices?|renew\\w*|expir\\w*|urgent|action|payable|owed?|remind\\w*|"
-          + "this\\s+week|next\\s+week|this\\s+month|today|tomorrow|soon|upcoming)\\b");
+            // NB: only the PROACTIVE / attention words. No bare "due" or "owe" — those
+            // fire on specific lookups ("when is my credit card due", "what does X
+            // owe") and dragged an unrelated deadline block onto the answer.
+            "(?i)\\b(overdue|chase|follow\\s*up|respond|response|reply|"
+          + "notices?|renew\\w*|expir\\w*|urgent|action\\s+items?|remind\\w*|"
+          + "upcoming|need(?:s)?\\s+(?:my\\s+)?attention)\\b");
 
     static boolean isActionFlavored(String question) {
         return question != null && ACTION_FLAVORED.matcher(question).find();

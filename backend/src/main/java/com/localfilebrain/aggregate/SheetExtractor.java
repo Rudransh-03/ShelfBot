@@ -43,7 +43,9 @@ public final class SheetExtractor {
     // s4 = per-date deadline flag (obligation vs record date).
     // s5 = per-party side (issuer/recipient) + bill amount reconciliation.
     // s6 = side reframed to owes/owed (money direction) + missing-biller repair.
-    public static final String VERSION = "s6";
+    // s7 = amount status constrained to a fixed enum (owed/paid/partial/refund/
+    // estimate) so the aggregator never has to guess free-text status wording.
+    public static final String VERSION = "s7";
 
     // Docs per LLM call. Each doc ~a few thousand tokens; a handful per call stays
     // well within context while amortising the fixed prompt overhead. Kept small so
@@ -89,7 +91,13 @@ public final class SheetExtractor {
                   // patient → patient=owes, clinic=owed. A tenant's rent → tenant=owes,
                   // landlord=owed. Always decide by who ends up paying vs receiving.
               "dates":  [{"label":..., "date":"yyyy-MM-dd","deadline":true|false}],   // every meaningful date. deadline=true ONLY if it is a future obligation the owner must meet (a due/payment date, filing, renewal, expiry, appointment, hearing, exam); false for a record date (issued, paid, created, start).
-              "amounts":[{"label":..., "value": number, "currency":"USD/…", "status":"paid|unpaid|partial|owed|refund|estimate|unknown"}],
+              "amounts":[{"label":..., "value": number, "currency":"USD/…", "status":"owed|paid|partial|refund|estimate"}],
+                  // status MUST be exactly one of these words — never a synonym:
+                  //   owed    = money still owed (unpaid, due, outstanding, overdue, not paid),
+                  //   paid    = fully paid / settled / received,
+                  //   partial = partly paid, a balance still remains,
+                  //   refund  = a refund or credit coming back (not a debt),
+                  //   estimate= a projected or future amount, not a current bill.
               "topics": [ ... ],                          // a few keywords for what it's about
               "key_facts":[{"label":..., "value":...}]    // anything else important: ids, account/invoice numbers, quantities, terms, statuses, results
 

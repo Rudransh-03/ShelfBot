@@ -81,6 +81,16 @@ public final class SheetAggregator {
         return name != null && !name.isBlank() && ownerKeys.contains(normName(name));
     }
 
+    // Placeholder names an extractor falls back to instead of a real party — never a
+    // real client or vendor, so they must not be counted or grouped on.
+    private static final Set<String> GENERIC_NAMES = Set.of("owner", "client", "clients",
+            "customer", "customers", "tenant", "patient", "member", "me", "self", "n a",
+            "na", "unnamed", "unknown", "account holder", "cardholder", "policyholder",
+            "user", "borrower", "the client", "a client", "recipient", "payer");
+    private static boolean isGenericName(String name) {
+        return name == null || GENERIC_NAMES.contains(normName(name));
+    }
+
     // ── AMOUNTS: money owed / paid, grouped by client ────────────────────────
     private Result amounts(SheetQuery q, List<Doc> docs, Set<String> ownerKeys) {
         // One owed/paid figure per client, netting partial payments and excluding
@@ -188,6 +198,19 @@ public final class SheetAggregator {
     // A rate/terms document states a RATE, not money currently owed — an engagement
     // letter, a listing, a quote/estimate. NOT a lease or generic "agreement": those
     // carry real dues (a lease's monthly rent). Kept narrow so a real due isn't lost.
+    // A date label that plainly names a future obligation to meet/attend — a safety
+    // net for when the model's per-date deadline flag misses one. Excludes record
+    // words (issued/paid) by only matching obligation words.
+    private static boolean isObligationLabel(String label) {
+        String l = lc(label);
+        // No bare "payment" — it also matches "payment received" (a record). A real
+        // payment deadline reads "payment due", caught by "due".
+        return l.contains("due") || l.contains("deadline") || l.contains("exam")
+                || l.contains("final") || l.contains("test") || l.contains("quiz")
+                || l.contains("hearing") || l.contains("appointment") || l.contains("renew")
+                || l.contains("expir") || l.contains("filing");
+    }
+
     private static boolean isRateDoc(Doc d) {
         String t = lc(d.docType);
         return t.contains("engagement") || t.contains("listing") || t.contains("proposal")
@@ -307,7 +330,7 @@ public final class SheetAggregator {
         if (owedToMe) {
             for (Party p : d.parties) {
                 String n = nm(p);
-                if (n.isBlank() || isOwner(n, ownerKeys)) continue;
+                if (n.isBlank() || isOwner(n, ownerKeys) || isGenericName(n)) continue;
                 if (isClientSide(p)) return n;
             }
             // A payment/receipt from a client where the owner isn't named: take the
@@ -351,6 +374,7 @@ public final class SheetAggregator {
         // (client-side roles), owner excluded. "How many vendors" → provider-side.
         // Personal docs and the owner's own service providers aren't counted.
         boolean wantProviders = roleIn(q.role(), PROVIDER_ROLES);
+        Set<String> want = wantProviders ? PROVIDER_ROLES : CLIENT_ROLES;
         Map<String, String> byKey = new LinkedHashMap<>();
         List<String> sources = new ArrayList<>();
         for (Doc d : docs) {
@@ -360,8 +384,12 @@ public final class SheetAggregator {
             // "licensee" — the owner himself under another name — isn't a client.
             boolean added = false;
             for (Party p : d.parties) {
-                if (p.name() == null || p.name().isBlank() || isOwner(p.name(), ownerKeys)) continue;
-                if (wantProviders ? isProviderSide(p) : isClientSide(p)) { addName(byKey, p.name().trim()); added = true; }
+                if (p.name() == null || p.name().isBlank()
+                        || isOwner(p.name(), ownerKeys) || isGenericName(p.name())) continue;
+                // Count by ROLE (a "client"/"patient"/"seller" is one regardless of a
+                // possibly-wrong money-side tag), or by an unambiguous side.
+                boolean match = roleIn(p.role(), want) || (wantProviders ? isProviderSide(p) : isClientSide(p));
+                if (match) { addName(byKey, p.name().trim()); added = true; }
             }
             if (added) sources.add(d.fileName);
         }
@@ -396,7 +424,10 @@ public final class SheetAggregator {
         List<String> sources = new ArrayList<>();
         for (Doc d : docs) for (Dated dt : d.dates) {
             if (dt.date() == null || dt.date().isBlank()) continue;
-            if (q.obligationsOnly() && !dt.deadline()) continue;   // deadlines, not record dates
+            // Deadlines only: trust the model's flag, but also honour a label that
+            // plainly names an obligation (exam, hearing, due, renewal…) the flag
+            // sometimes misses — never a record date (issued/paid).
+            if (q.obligationsOnly() && !dt.deadline() && !isObligationLabel(dt.label())) continue;
             if (!q.dateFrom().isBlank() && dt.date().compareTo(q.dateFrom()) < 0) continue;
             if (!q.dateTo().isBlank() && dt.date().compareTo(q.dateTo()) > 0) continue;
             String label = (d.title == null || d.title.isBlank() ? d.fileName : d.title)
@@ -504,11 +535,17 @@ public final class SheetAggregator {
                     d.parties.add(new Party(p.path("name").asText(""), p.path("role").asText(""),
                             p.path("side").asText("")));
             }
-            // If every named party shares the SAME side, the tags are unreliable (on a
-            // bill someone must owe and someone must be owed) — drop them so role decides.
-            Set<String> sides = new java.util.HashSet<>();
-            for (Party p : d.parties) { String sd = lc(p.side()); if (!sd.isBlank()) sides.add(sd); }
-            if (sides.size() == 1 && d.parties.size() > 1) {
+            // If every party with a MONEY side shares the same one (impossible — on a
+            // bill someone owes and someone is owed), the tags are unreliable → drop
+            // them so role decides. Only owes/owed count; "other"/blank noise ignored.
+            Set<String> money = new java.util.HashSet<>();
+            int moneySided = 0;
+            for (Party p : d.parties) {
+                String sd = lc(p.side());
+                if (sd.contains("owed")) { money.add("owed"); moneySided++; }
+                else if (sd.contains("owes")) { money.add("owes"); moneySided++; }
+            }
+            if (money.size() == 1 && moneySided > 1) {
                 List<Party> cleaned = new ArrayList<>();
                 for (Party p : d.parties) cleaned.add(new Party(p.name(), p.role(), ""));
                 d.parties = cleaned;

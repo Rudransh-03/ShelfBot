@@ -77,7 +77,7 @@ class SheetAggregatorTest {
     private final SheetAggregator agg = new SheetAggregator();
 
     private static SheetQuery amounts(SheetQuery.Op op, String status, String scope) {
-        return new SheetQuery(true, "", SheetQuery.Select.AMOUNTS, op, status, "", null, "", "", "", scope, false);
+        return new SheetQuery(true, "", SheetQuery.Select.AMOUNTS, op, status, "", null, "", "", "", scope, false, "");
     }
 
     // ── Student corpus: bills the user OWES (a different domain / direction) ──────
@@ -206,7 +206,7 @@ class SheetAggregatorTest {
     @Test
     void clinicCountsPatientsNotVendors() {
         SheetQuery q = new SheetQuery(true, "", SheetQuery.Select.PARTIES, SheetQuery.Op.COUNT,
-                "", "patient", null, "", "", "", "", false);
+                "", "patient", null, "", "", "", "", false, "");
         SheetAggregator.Result r = agg.run(q, clinicCorpus());
         assertNotNull(r);
         assertTrue(r.text().startsWith("2"), "was: " + r.text());          // Sam + Nina
@@ -337,7 +337,7 @@ class SheetAggregatorTest {
                  "dates":[{"label":"filed on","date":"2026-06-30","deadline":false},
                           {"label":"hearing","date":"2026-07-25","deadline":true}]}"""));
         SheetQuery deadlines = new SheetQuery(true, "", SheetQuery.Select.DATES, SheetQuery.Op.LIST,
-                "", "", null, "", "2026-07-01", "2026-07-31", "", true);   // obligationsOnly
+                "", "", null, "", "2026-07-01", "2026-07-31", "", true, "");   // obligationsOnly
         SheetAggregator.Result r = agg.run(deadlines, mixed);
         assertNotNull(r);
         assertTrue(r.text().contains("filing due") && r.text().contains("final exam")
@@ -352,7 +352,7 @@ class SheetAggregatorTest {
         List<SheetExtractor.Sheet> one = List.of(sheet("x.pdf", """
             {"doc_type":"invoice","dates":[{"label":"due","date":"2026-12-01","deadline":true}]}"""));
         SheetQuery q = new SheetQuery(true, "", SheetQuery.Select.DATES, SheetQuery.Op.LIST,
-                "", "", null, "", "2026-07-01", "2026-07-31", "", true);   // July → nothing
+                "", "", null, "", "2026-07-01", "2026-07-31", "", true, "");   // July → nothing
         SheetAggregator.Result r = agg.run(q, one);
         assertNotNull(r, "empty result wrongly returned null → would fall to LLM");
         assertTrue(r.text().toLowerCase().contains("no deadlines"), "was: " + r.text());
@@ -361,7 +361,7 @@ class SheetAggregatorTest {
     @Test
     void listPersonalDocumentsOnly() {
         SheetQuery q = new SheetQuery(true, "", SheetQuery.Select.DOCUMENTS, SheetQuery.Op.LIST,
-                "", "", true, "", "", "", "", false);
+                "", "", true, "", "", "", "", false, "");
         SheetAggregator.Result r = agg.run(q, corpus());
         assertNotNull(r);
         assertTrue(r.text().toLowerCase().contains("vet") || r.text().contains("312") || r.sources().contains("vet_bill.pdf"));

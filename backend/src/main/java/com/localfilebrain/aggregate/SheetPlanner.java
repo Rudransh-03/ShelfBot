@@ -29,10 +29,12 @@ public final class SheetPlanner {
              "select":"amounts|parties|documents|dates",
              "operation":"sum|count|list|max|min|none",
              "status":"unpaid|paid|partial|owed|",
-             "role":"client|customer|",
+             "role":"client|customer|vendor|supplier|provider|",
              "is_personal":true|false|null,
              "doc_type":"","date_from":"","date_to":"",
-             "scope":"owed_to_me|i_owe|","obligations_only":true|false}
+             "scope":"owed_to_me|i_owe|","obligations_only":true|false,
+             "category":""}   // utility/rent/insurance/subscription/loan/medical/… when the
+                              // question is about ONE spending category, else ""
 
             "aggregate" is true when answering needs the WHOLE collection: totals,
             counts, "list all X", "who owes the most", "how many clients", "which are
@@ -51,8 +53,12 @@ public final class SheetPlanner {
                              fees, receivables, "who owes me").
                            – "i_owe" when it's money the USER owes (their bills, "how
                              much do I owe", "who do I need to pay").
-            • parties  → people or organisations (how many/which clients, customers).
-                         set "role" and use operation count / list.
+            • parties  → the ROSTER: "how many / list my clients / patients / vendors".
+                         set "role": "client"/"customer" for the people the user SERVES
+                         (also patients, tenants, sellers); "vendor"/"provider" for the
+                         people the user PAYS. use count / list. BUT a question about who
+                         OWES / is overdue / hasn't paid / still owes is about MONEY —
+                         use "amounts" (with status), NOT parties.
             • documents→ the documents themselves (how many docs, list personal ones,
                          list invoices). set "is_personal" and/or "doc_type"; use
                          count / list.
@@ -79,14 +85,28 @@ public final class SheetPlanner {
               {"aggregate":true,"select":"amounts","operation":"max","status":"unpaid","scope":"owed_to_me"}
             "which clients have already paid?" →
               {"aggregate":true,"select":"amounts","operation":"list","status":"paid","scope":"owed_to_me"}
+            "which clients are overdue / still owe me?" →
+              {"aggregate":true,"select":"amounts","operation":"list","status":"unpaid","scope":"owed_to_me"}
             "how much money do I owe in total?" →
               {"aggregate":true,"select":"amounts","operation":"sum","status":"unpaid","scope":"i_owe"}
             "who do I need to pay?" →
               {"aggregate":true,"select":"amounts","operation":"list","status":"unpaid","scope":"i_owe"}
+            "list all my bills" (the things I owe) →
+              {"aggregate":true,"select":"amounts","operation":"list","status":"unpaid","scope":"i_owe"}
+            "total of my utility bills" →
+              {"aggregate":true,"select":"amounts","operation":"sum","status":"unpaid","scope":"i_owe","category":"utility"}
+            "how much do I owe on my credit card?" →
+              {"aggregate":true,"select":"amounts","operation":"sum","status":"unpaid","scope":"i_owe","category":"credit_card"}
+
+            When the question names a spending category — utilities, rent, mortgage,
+            insurance, subscriptions, loan, credit card (→ credit_card), medical,
+            tuition — set "category" to it (single word, snake_case).
             "what's my biggest bill?" →
               {"aggregate":true,"select":"amounts","operation":"max","status":"unpaid","scope":"i_owe"}
             "how many clients do I have?" →
               {"aggregate":true,"select":"parties","operation":"count","role":"client"}
+            "list my vendors / who are my suppliers?" →
+              {"aggregate":true,"select":"parties","operation":"list","role":"vendor"}
             "list all my personal documents" →
               {"aggregate":true,"select":"documents","operation":"list","is_personal":true}
             "what deadlines do I have this month?" →
@@ -151,7 +171,8 @@ public final class SheetPlanner {
                     n.path("date_from").asText("").trim(),
                     n.path("date_to").asText("").trim(),
                     n.path("scope").asText("").trim().toLowerCase(),
-                    n.path("obligations_only").asBoolean(false));
+                    n.path("obligations_only").asBoolean(false),
+                    n.path("category").asText("").trim().toLowerCase());
         } catch (Exception e) {
             return SheetQuery.passthrough("");
         }

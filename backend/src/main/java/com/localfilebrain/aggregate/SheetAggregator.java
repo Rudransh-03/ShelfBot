@@ -32,7 +32,7 @@ public final class SheetAggregator {
     private record Amount(double value, String status, String label) {}
     private record Dated(String label, String date, boolean deadline) {}
     private static final class Doc {
-        String fileName, docType, title, gist;
+        String fileName, docType, title, gist, category = "";
         boolean isPersonal;
         List<Party> parties = new ArrayList<>();
         List<Amount> amounts = new ArrayList<>();
@@ -106,6 +106,7 @@ public final class SheetAggregator {
         Map<String, String> display = new LinkedHashMap<>();
         Set<String> clientKeys = new java.util.HashSet<>();
         for (Doc d : docs) {
+            if (!categoryMatch(d, q.category())) continue;    // "utility bills" etc.
             // is_personal is too fuzzy to gate money (a clinic's patient invoice gets
             // mislabeled "personal"). Direction + side + owner-exclusion do the gating:
             // a receivable is only counted for a group that has a real client party
@@ -209,6 +210,14 @@ public final class SheetAggregator {
                 || l.contains("final") || l.contains("test") || l.contains("quiz")
                 || l.contains("hearing") || l.contains("appointment") || l.contains("renew")
                 || l.contains("expir") || l.contains("filing");
+    }
+
+    /** True when the doc matches the requested spending category (or none requested).
+     *  Matches on the model's category tag, falling back to doc_type/title wording. */
+    private static boolean categoryMatch(Doc d, String category) {
+        if (category == null || category.isBlank()) return true;
+        String c = lc(category);
+        return lc(d.category).contains(c) || lc(d.docType).contains(c) || lc(d.title).contains(c);
     }
 
     private static boolean isRateDoc(Doc d) {
@@ -411,6 +420,7 @@ public final class SheetAggregator {
         for (Doc d : docs) {
             if (q.isPersonal() != null && d.isPersonal != q.isPersonal()) continue;
             if (!q.docType().isBlank() && !d.docType.toLowerCase().contains(q.docType())) continue;
+            if (!categoryMatch(d, q.category())) continue;
             String label = d.title == null || d.title.isBlank() ? d.fileName : d.title;
             rows.add(new String[]{label, "", "0"});
             sources.add(d.fileName);
@@ -526,6 +536,7 @@ public final class SheetAggregator {
             Doc d = new Doc();
             d.fileName = fileName;
             d.docType = n.path("doc_type").asText("");
+            d.category = n.path("category").asText("");
             d.title = n.path("title").asText("");
             d.gist = n.path("gist").asText("");
             d.isPersonal = n.path("is_personal").asBoolean(false);

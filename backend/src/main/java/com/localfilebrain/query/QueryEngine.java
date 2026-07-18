@@ -1445,6 +1445,12 @@ public final class QueryEngine {
             "document", "documents", "copy", "final", "draft", "scan", "scanned",
             "file", "files", "untitled", "image", "screenshot", "test", "amount",
             "total", "detail", "details", "info", "information", "thing", "things",
+            // generic money words — appear across many docs, so they're not a
+            // distinctive lexical signal ("phone bill" must not hard-match the electric
+            // *bill* and discard the semantically-right mobile statement). NB: keep
+            // "invoice"/"statement"/"receipt" — those doc-types ARE a useful signal.
+            "bill", "bills", "payment", "payments", "fees", "paid", "unpaid",
+            "balance", "account", "accounts", "cost", "price", "charge", "charges",
             // interrogatives / function words (>=4 chars; shorter ones never tokenize)
             "what", "when", "where", "which", "whom", "whose", "there", "here",
             "your", "yours", "mine", "have", "with", "from", "into", "about",

@@ -45,7 +45,8 @@ public final class SheetExtractor {
     // s6 = side reframed to owes/owed (money direction) + missing-biller repair.
     // s7 = amount status constrained to a fixed enum (owed/paid/partial/refund/
     // estimate) so the aggregator never has to guess free-text status wording.
-    public static final String VERSION = "s7";
+    // s8 = per-doc money category (utility/rent/insurance/…) for sub-group totals.
+    public static final String VERSION = "s8";
 
     // Docs per LLM call. Each doc ~a few thousand tokens; a handful per call stays
     // well within context while amortising the fixed prompt overhead. Kept small so
@@ -73,6 +74,11 @@ public final class SheetExtractor {
             Return ONLY a JSON object with these keys (omit a key only if truly nothing
             applies; never invent data):
               "doc_type": short kind of document (invoice, bank statement, syllabus, lease, ID, medical bill, tax form, email, ...),
+              "category": the money/spending category, ONE word from: utility, rent,
+                  mortgage, insurance, subscription, loan, credit_card, tax, medical,
+                  tuition, salary, groceries, transport, legal, professional_fees,
+                  commission, or other. Pick the closest (a phone/electric/water/gas/
+                  internet bill = utility). "" if no money is involved.
               "title": a human title for it,
               "gist": one plain sentence on what it is / says,
               "is_personal": true or false — TRUE only if the document is the owner's
@@ -249,16 +255,20 @@ public final class SheetExtractor {
      * focused question is far more reliable than the big summary) and patch it in.
      */
     private JsonNode repairMissingClient(JsonNode sheet, FileRecord r, String content) {
-        boolean billing = isBilling(sheet), hasClient = hasClientParty(sheet);
+        // Fire on a bill/invoice OR a balance note (an email/statement stating a
+        // remaining balance owed) that lacks a client party — the party name is often
+        // dropped from such notes, which then can't be linked to the client's invoice.
+        boolean billing = isBilling(sheet) || hasBalanceNote(sheet);
+        boolean hasClient = hasClientParty(sheet);
         boolean hasContent = content != null && !content.isBlank();
         if (billing && !hasClient)
-            log.info("Sheet check '{}': billing doc missing client (content={} chars) → repairing",
-                    r.getFileName(), hasContent ? content.length() : 0);
+            log.info("Sheet check '{}': bill/balance note missing client → repairing", r.getFileName());
         if (!billing || hasClient || !hasContent) return sheet;
         try {
-            String sys = "Read the document. Reply with ONLY the name of the party being "
-                    + "billed — the client or customer who owes the money. If there is no "
-                    + "such party, reply exactly NONE. No other words.";
+            String sys = "Read the document. Which CLIENT or CUSTOMER does it concern — the "
+                    + "person or company whose invoice, account, or outstanding balance this "
+                    + "is about (even if the note is between staff and only mentions them in "
+                    + "passing)? Reply with ONLY that name, or exactly NONE. No other words.";
             String usr = "----- DOCUMENT [" + PromptSanitizer.nonce() + "] "
                     + PromptSanitizer.safeLabel(r.getFileName()) + " -----\n" + content;
             String name = llm.oneShot(sys, usr, 40, 0.0);
@@ -270,10 +280,10 @@ public final class SheetExtractor {
             ArrayNode orgs = s.has("orgs") && s.get("orgs").isArray()
                     ? (ArrayNode) s.get("orgs") : mapper.createArrayNode();
             ObjectNode client = mapper.createObjectNode();
-            client.put("name", name); client.put("role", "client");
+            client.put("name", name); client.put("role", "client"); client.put("side", "owes");
             orgs.add(client);
             s.set("orgs", orgs);
-            log.info("Sheet repair: added billed client '{}' to '{}'", name, r.getFileName());
+            log.info("Sheet repair: added client '{}' to '{}'", name, r.getFileName());
             return s;
         } catch (Exception e) {
             log.warn("Client repair failed for '{}': {}", r.getFileName(), e.getMessage());
@@ -413,6 +423,22 @@ public final class SheetExtractor {
     private static boolean isBilling(JsonNode sheet) {
         String t = sheet.path("doc_type").asText("").toLowerCase();
         return t.contains("invoice") || t.contains("bill") || t.contains("receipt") || t.contains("statement");
+    }
+
+    /** True when a doc states a remaining/outstanding balance owed — a "balance note"
+     *  (e.g. a follow-up email) whose client name is often dropped. */
+    private static boolean hasBalanceNote(JsonNode sheet) {
+        JsonNode amounts = sheet.get("amounts");
+        if (amounts == null || !amounts.isArray()) return false;
+        for (JsonNode a : amounts) {
+            String lb = a.path("label").asText("").toLowerCase();
+            String st = a.path("status").asText("").toLowerCase();
+            boolean owed = st.contains("owe") || st.contains("unpaid") || st.contains("due")
+                    || st.contains("outstanding") || st.contains("partial");
+            if (owed && (lb.contains("balance") || lb.contains("remaining") || lb.contains("outstanding")))
+                return true;
+        }
+        return false;
     }
 
     private static boolean hasClientParty(JsonNode sheet) {

@@ -310,9 +310,6 @@ public final class QueryEngine {
     private volatile ConversationHistory history;
     private final boolean             ownsVectorStore;
     private final boolean             ownsEmbeddingClient;
-    // Cross-document fee-receivable aggregator (gather → extract → dedup → sum).
-    // Null-safe when metadataStore is null (degrades to no fee path).
-    private final FeeReceivables      feeEngine;
     // Generic aggregator (planner + fact extractor) — the replacement for the
     // fee-specific path. Runs alongside the old routing during migration: it
     // handles "count/total/list-everything" questions, everything else falls
@@ -381,7 +378,6 @@ public final class QueryEngine {
         }
         this.llmClient = new GPT4oMiniClient(config, tokenStore);
         this.history   = new ConversationHistory(HISTORY_SIZE);
-        this.feeEngine = new FeeReceivables(metadataStore, vectorStore, llmClient);
         this.queryPlanner = metadataStore == null ? null
                 : new com.localfilebrain.aggregate.QueryPlanner(llmClient, metadataStore);
         this.aggService = metadataStore == null ? null
@@ -1802,14 +1798,6 @@ public final class QueryEngine {
         return QueryResult.found(answer, List.of());
     }
 
-    private static final Pattern TOTAL_Q = Pattern.compile(
-            "(?i)\\b(total|totals|sum|altogether|combined|in all|how much|overall|aggregate)\\b");
-
-    /** True when the question asks for a summed total, not just a list. */
-    static boolean wantsTotal(String q) {
-        return q != null && TOTAL_Q.matcher(q).find();
-    }
-
     // ── Generic aggregator entry point ───────────────────────────────────────
     // Plan the message (one LLM call, full conversation) and, if it's a
     // count/total/list-everything question, answer it completely from every
@@ -1903,142 +1891,6 @@ public final class QueryEngine {
               .append("assistant: ").append(truncateAt(e.answer(), 300)).append('\n');
         }
         return sb.toString();
-    }
-
-    // ── Fee receivables (cross-document, replaces the single-tracker crutch) ──
-    // The MODEL (intent classifier, with full conversation) decides this is a fee
-    // question and resolves the parameters: scope = "all" or a client name,
-    // status = unpaid/paid. This method just COMPUTES on those: FeeReceivables
-    // gathers/dedups/sums every fee document, and we filter + render. No keyword
-    // gate decides intent here, so any phrasing — including elliptical follow-ups
-    // the model resolved ("what about Zenlite?") — lands correctly.
-    private QueryResult answerFeeReceivables(String question, String scope, String status,
-                                             java.util.Set<String> allowedPaths,
-                                             java.util.function.Consumer<String> onToken) {
-        List<FeeReceivables.FeeRow> all = feeEngine.gather(allowedPaths);
-        if (all.isEmpty()) return null;                   // no fee data at all → let RAG try
-
-        boolean paid = "paid".equalsIgnoreCase(status);
-
-        // Per-client scope: the model named a single client → filter to their rows.
-        // If we hold no fee rows for that name, fall through (null) so normal
-        // retrieval can try, rather than falsely reporting "nothing owed".
-        String targetKey = scope == null || scope.isBlank() || scope.equalsIgnoreCase("all")
-                ? null : FeeReceivables.normClient(scope);
-        String targetName = null;
-        if (targetKey != null && !targetKey.isEmpty()) {
-            List<FeeReceivables.FeeRow> scoped = new ArrayList<>();
-            for (FeeReceivables.FeeRow r : all)
-                if (FeeReceivables.normClient(r.client()).equals(targetKey)) { scoped.add(r); if (targetName == null) targetName = r.client(); }
-            if (scoped.isEmpty()) return null;
-            return answerFeeForClient(question, targetName, scoped, paid, onToken);
-        }
-
-        List<FeeReceivables.FeeRow> hits = new ArrayList<>();
-        for (FeeReceivables.FeeRow r : all) {
-            if (paid) {
-                if (r.status() == FeeReceivables.Status.PAID
-                        || r.status() == FeeReceivables.Status.RECEIVED) hits.add(r);
-            } else if (r.owed() > 0) {
-                hits.add(r);
-            }
-        }
-        hits.sort((a, b) -> Long.compare(b.owed() != 0 ? b.owed() : b.amount(),
-                                         a.owed() != 0 ? a.owed() : a.amount()));
-
-        StringBuilder sb = new StringBuilder();
-        long total = 0;
-        List<Source> chips = new ArrayList<>();
-        java.util.Set<String> seenSrc = new java.util.HashSet<>();
-
-        if (paid) {
-            if (hits.isEmpty()) { sb.append("None of your client fees are marked paid yet."); }
-            else {
-                sb.append(hits.size() == 1 ? "1 client fee is paid:" : hits.size() + " client fees are paid:");
-                for (FeeReceivables.FeeRow r : hits) {
-                    sb.append("\n- **").append(clientLabel(r)).append("**");
-                    if (r.amount() > 0) sb.append(" — ").append(MoneyFormat.format(r.amount()));
-                    addSrc(chips, seenSrc, r);
-                }
-            }
-        } else {
-            if (hits.isEmpty()) {
-                sb.append("Good news — no client fees are outstanding. Everything you've billed has been paid.");
-            } else {
-                sb.append(hits.size() == 1 ? "1 client still owes you:" : hits.size() + " clients still owe you:");
-                for (FeeReceivables.FeeRow r : hits) {
-                    total += r.owed();
-                    sb.append("\n- **").append(clientLabel(r)).append("** — ").append(MoneyFormat.format(r.owed()));
-                    if (r.amount() > r.owed() && r.owed() > 0)
-                        sb.append(" (partly paid — of ").append(MoneyFormat.format(r.amount())).append(")");
-                    addSrc(chips, seenSrc, r);
-                }
-                if (hits.size() > 1 || wantsTotal(question))
-                    sb.append("\n\nTotal outstanding: ").append(MoneyFormat.format(total));
-            }
-        }
-        appendConflicts(sb, hits);
-
-        String answer = sb.toString();
-        if (onToken != null) onToken.accept(answer);
-        history.add(question, answer);
-        return QueryResult.found(answer, chips);
-    }
-
-    /** Appends a reconcile note for any row where an invoice and the tracker
-     *  disagree on the same invoice's amount (surfaced, not silently resolved). */
-    private static void appendConflicts(StringBuilder sb, List<FeeReceivables.FeeRow> rows) {
-        java.util.LinkedHashSet<String> notes = new java.util.LinkedHashSet<>();
-        for (FeeReceivables.FeeRow r : rows)
-            if (r.conflict() != null && !r.conflict().isBlank()) notes.add(r.conflict());
-        for (String n : notes) sb.append("\n\nNote: ").append(n).append(" — worth reconciling.");
-    }
-
-    /** One client's fee position, from their already-filtered rows. */
-    private QueryResult answerFeeForClient(String question, String clientName,
-                                           List<FeeReceivables.FeeRow> rows, boolean paid,
-                                           java.util.function.Consumer<String> onToken) {
-        long owed = 0;
-        List<Source> chips = new ArrayList<>();
-        java.util.Set<String> seen = new java.util.HashSet<>();
-        List<FeeReceivables.FeeRow> owedRows = new ArrayList<>();
-        for (FeeReceivables.FeeRow r : rows) {
-            if (r.owed() > 0) { owed += r.owed(); owedRows.add(r); addSrc(chips, seen, r); }
-            else addSrc(chips, seen, r);
-        }
-        StringBuilder sb = new StringBuilder();
-        if (owed > 0) {
-            sb.append("**").append(clientName).append("** owes you ").append(MoneyFormat.format(owed));
-            if (owedRows.size() > 1) {
-                sb.append(":");
-                for (FeeReceivables.FeeRow r : owedRows) {
-                    sb.append("\n- ").append(MoneyFormat.format(r.owed()));
-                    if (!r.invoiceId().isBlank()) sb.append(" (").append(r.invoiceId()).append(")");
-                }
-            } else {
-                FeeReceivables.FeeRow r = owedRows.get(0);
-                if (r.amount() > r.owed())
-                    sb.append(" (partly paid — of ").append(MoneyFormat.format(r.amount())).append(")");
-                sb.append(".");
-            }
-        } else {
-            sb.append("**").append(clientName)
-              .append("** has no outstanding fees — everything you've billed them has been paid.");
-        }
-        appendConflicts(sb, rows);
-        String answer = sb.toString();
-        if (onToken != null) onToken.accept(answer);
-        history.add(question, answer);
-        return QueryResult.found(answer, chips);
-    }
-
-    private static String clientLabel(FeeReceivables.FeeRow r) {
-        return r.client() == null || r.client().isBlank() ? "(unnamed)" : r.client();
-    }
-
-    private static void addSrc(List<Source> chips, java.util.Set<String> seen, FeeReceivables.FeeRow r) {
-        if (r.sourcePath() != null && seen.add(r.sourcePath()))
-            chips.add(new Source(r.sourceName(), r.sourcePath(), List.of(), List.of()));
     }
 
     // ── Subject-qualifier filter (deterministic) ─────────────────────────────

@@ -161,6 +161,91 @@ public final class SheetExtractor {
         return out;
     }
 
+    // Amount roles the model may assign — a small, fixed menu so the aggregator reads a
+    // canonical value instead of scanning free-text labels. "other" is the safe default
+    // that lets a genuinely novel case degrade gracefully.
+    private static final String ROLE_MENU =
+        "charge (a bill/fee owed), payment (money paid against a charge), deposit (a "
+      + "partial/upfront payment, balance remains), balance (the amount still owed after "
+      + "payments), refund (money returned/credited), estimate (a projected/future "
+      + "amount, not a current bill), or other";
+
+    /**
+     * Lazily tag each amount's ROLE for the AMBIGUOUS docs only — those with several
+     * amounts including a settled one, where "is this a payment / a deposit / the
+     * balance" actually matters. One LLM call per such doc EVER: the roles are written
+     * back into the cached sheet, so it's a one-time cost on the handful of tricky
+     * bills. Unambiguous docs (a single amount, or nothing settled) are untouched and
+     * the aggregator reads their status alone. This replaces the aggregator's brittle
+     * label-keyword guessing with a model-decided canonical tag.
+     */
+    public List<Sheet> ensureAmountRoles(List<Sheet> sheets) {
+        if (llm == null) return sheets;
+        List<Sheet> out = new ArrayList<>();
+        int tagged = 0;
+        for (Sheet s : sheets) {
+            Sheet enriched = s;
+            try {
+                JsonNode sheet = mapper.readTree(s.json());
+                if (needsRoles(sheet)) {
+                    JsonNode roled = tagRoles(sheet, s.fileName());
+                    if (roled != null) {
+                        String json = mapper.writeValueAsString(roled);
+                        meta.updateSheetJson(s.path(), json);      // persist so it's paid once
+                        enriched = new Sheet(s.path(), s.fileName(), json);
+                        tagged++;
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("Amount-role tagging failed for '{}': {}", s.fileName(), e.getMessage());
+            }
+            out.add(enriched);
+        }
+        if (tagged > 0) log.info("Amount roles: tagged {} ambiguous doc(s) (cached)", tagged);
+        return out;
+    }
+
+    /** A doc worth tagging: 2+ amounts, at least one settled, and not already tagged —
+     *  i.e. a bill where payment/deposit/balance disambiguation changes the answer. */
+    private static boolean needsRoles(JsonNode sheet) {
+        JsonNode amounts = sheet.get("amounts");
+        if (amounts == null || !amounts.isArray() || amounts.size() < 2) return false;
+        boolean settled = false, allTagged = true;
+        for (JsonNode a : amounts) {
+            String st = a.path("status").asText("").toLowerCase();
+            if ((st.contains("paid") && !st.contains("unpaid")) || st.contains("partial")
+                    || st.contains("settled") || st.contains("received")) settled = true;
+            if (a.path("role").asText("").isBlank()) allTagged = false;
+        }
+        return settled && !allTagged;
+    }
+
+    /** Ask the model to tag each amount's role from the fixed menu; return the sheet
+     *  with a "role" added to every amount. Null on any failure (caller keeps original). */
+    private JsonNode tagRoles(JsonNode sheet, String fileName) {
+        ArrayNode amounts = (ArrayNode) sheet.get("amounts");
+        StringBuilder list = new StringBuilder();
+        for (int i = 0; i < amounts.size(); i++) {
+            JsonNode a = amounts.get(i);
+            list.append(i).append(": \"").append(a.path("label").asText("")).append("\" ")
+                .append(a.path("value").asDouble()).append(" [").append(a.path("status").asText("")).append("]\n");
+        }
+        String sys = "You label the money amounts on ONE document. For EACH amount pick the "
+                + "single best ROLE from: " + ROLE_MENU + ". Reply ONLY with a JSON array of "
+                + "strings — one role per amount, in the same order. No other words.";
+        String usr = "Document: " + PromptSanitizer.safeLabel(fileName) + "\nAmounts:\n" + list;
+        try {
+            JsonNode arr = mapper.readTree(cleanArray(llm.oneShot(sys, usr, 120, 0.0)));
+            if (arr == null || !arr.isArray() || arr.size() != amounts.size()) return null;
+            for (int i = 0; i < amounts.size(); i++)
+                ((ObjectNode) amounts.get(i)).put("role", arr.get(i).asText("other").trim().toLowerCase());
+            return sheet;
+        } catch (Exception e) {
+            log.warn("Role tag call failed for '{}': {}", fileName, e.getMessage());
+            return null;
+        }
+    }
+
     /**
      * Extract a batch, but never let a transient failure (e.g. a 502) silently
      * drop documents: whatever the first call misses is retried once as a group,

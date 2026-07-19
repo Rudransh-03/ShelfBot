@@ -1102,6 +1102,18 @@ public final class IndexMetadataStore implements AutoCloseable {
         }
     }
 
+    /** Enriches an existing sheet's JSON in place (same doc, same content hash) —
+     *  used to persist lazily-added fields like amount roles without re-extracting. */
+    public synchronized void updateSheetJson(String absolutePath, String sheetJson) {
+        String sql = "UPDATE doc_sheet SET sheet_json = ? WHERE absolute_path = ?";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, sheetJson); ps.setString(2, absolutePath);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            log.warn("Failed to update doc_sheet for '{}': {}", absolutePath, e.getMessage());
+        }
+    }
+
     // -------------------------------------------------------------------------
     // File-level vector cache (for reorg / clustering)
     // -------------------------------------------------------------------------

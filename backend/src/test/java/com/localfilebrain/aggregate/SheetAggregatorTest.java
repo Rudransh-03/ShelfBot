@@ -367,4 +367,101 @@ class SheetAggregatorTest {
         assertTrue(r.text().toLowerCase().contains("vet") || r.text().contains("312") || r.sources().contains("vet_bill.pdf"));
         assertFalse(r.text().contains("Invoice"));   // business invoices excluded
     }
+
+    @Test
+    void ownerDoubleListedStillCountsThePayable() {
+        // Regression (realtor MLS): a dues bill lists the owner twice — as the billed
+        // client AND, spuriously, a "member/owed" party. The stray provider-side dup
+        // must not hide the payable from an "i owe" total.
+        List<SheetExtractor.Sheet> s = List.of(
+            sheet("mls.pdf", """
+                {"doc_type":"dues statement","is_personal":false,
+                 "orgs":[{"name":"Metro MLS","role":"provider","side":"owed"},
+                         {"name":"Alex Chen","role":"client","side":"owes"},
+                         {"name":"Alex Chen","role":"member","side":"owed"}],
+                 "amounts":[{"label":"annual dues","value":180,"status":"owed"}]}"""),
+            sheet("desk.pdf", """
+                {"doc_type":"invoice","is_personal":false,
+                 "orgs":[{"name":"Keller Realty","role":"provider","side":"owed"},
+                         {"name":"Alex Chen","role":"client","side":"owes"}],
+                 "amounts":[{"label":"desk fee","value":500,"status":"owed"}]}"""));
+        SheetAggregator.Result r = agg.run(amounts(SheetQuery.Op.SUM, "unpaid", "i_owe"), s, List.of("Alex Chen"));
+        assertNotNull(r);
+        assertTrue(r.text().contains("Metro MLS") && r.text().contains("180"), "MLS payable dropped: " + r.text());
+        assertTrue(r.text().contains("680"), "expected 500+180=680: " + r.text());
+    }
+
+    @Test
+    void paidLineWithUnusualLabelIsRecognized() {
+        // Regression (realtor Oak St): the paid commission is labeled "Agent Net
+        // Commission" — none of the payment/paid/total keywords — but status is paid,
+        // so a "which are paid" list must surface it (was returning none, then $0).
+        List<SheetExtractor.Sheet> s = List.of(sheet("closing.pdf", """
+            {"doc_type":"closing statement","is_personal":false,
+             "orgs":[{"name":"Chen Realty","role":"provider","side":"owed"}],
+             "people":[{"name":"John Kim","role":"client","side":"owes"}],
+             "amounts":[{"label":"Gross Commission","value":12000,"status":"paid"},
+                        {"label":"Agent Net Commission","value":8400,"status":"paid"}]}"""));
+        SheetAggregator.Result r = agg.run(amounts(SheetQuery.Op.LIST, "paid", "owed_to_me"), s, List.of("Chen Realty"));
+        assertNotNull(r);
+        assertTrue(r.text().contains("John Kim"), "paid commission not surfaced: " + r.text());
+        assertFalse(r.text().contains("$0"), "paid amount shown as zero: " + r.text());
+    }
+
+    @Test
+    void amountRoleOverridesMisleadingLabel() {
+        // The de-brittling fix: the paid line's label ("total paid so far") WOULD trip
+        // the keyword clearing rule, but its model role is "deposit" — a partial. Role
+        // wins, so the charge is NOT cleared and the client still owes the full amount.
+        List<SheetExtractor.Sheet> s = List.of(sheet("job.pdf", """
+            {"doc_type":"invoice","is_personal":false,
+             "orgs":[{"name":"Me Studio","role":"provider","side":"owed"},
+                     {"name":"Acme Co","role":"client","side":"owes"}],
+             "amounts":[{"label":"project fee","value":1000,"status":"owed","role":"charge"},
+                        {"label":"total paid so far","value":950,"status":"paid","role":"deposit"}]}"""));
+        SheetAggregator.Result r = agg.run(amounts(SheetQuery.Op.SUM, "unpaid", "owed_to_me"), s, List.of("Me Studio"));
+        assertNotNull(r);
+        assertTrue(r.text().contains("Acme") && r.text().contains("1,000"),
+                "deposit (mislabeled 'total') wrongly cleared the charge: " + r.text());
+    }
+
+    @Test
+    void amountRolePaymentRecognizedRegardlessOfLabel() {
+        // "Agent Net Commission" has no payment/paid keyword, but role=payment marks
+        // it a real payment — so a fully-paid client surfaces on the paid list.
+        List<SheetExtractor.Sheet> s = List.of(sheet("closing.pdf", """
+            {"doc_type":"closing statement","is_personal":false,
+             "orgs":[{"name":"Chen Realty","role":"provider","side":"owed"}],
+             "people":[{"name":"John Kim","role":"client","side":"owes"}],
+             "amounts":[{"label":"Gross Commission","value":12000,"status":"paid","role":"payment"},
+                        {"label":"Agent Net Commission","value":8400,"status":"paid","role":"payment"}]}"""));
+        SheetAggregator.Result r = agg.run(amounts(SheetQuery.Op.LIST, "paid", "owed_to_me"), s, List.of("Chen Realty"));
+        assertNotNull(r);
+        assertTrue(r.text().contains("John Kim") && !r.text().contains("$0"),
+                "role=payment not recognized: " + r.text());
+    }
+
+    @Test
+    void unknownCategoryPassesNarrowingFilter() {
+        // The paid commission was filed as category "other" (the model was unsure). A
+        // category=commission query must NOT drop it — unknown is not "not this". A doc
+        // firmly tagged a DIFFERENT category (rent) is still correctly excluded.
+        List<SheetExtractor.Sheet> s = List.of(
+            sheet("closing.pdf", """
+                {"doc_type":"closing statement","is_personal":false,"category":"other",
+                 "orgs":[{"name":"Chen Realty","role":"provider","side":"owed"}],
+                 "people":[{"name":"John Kim","role":"client","side":"owes"}],
+                 "amounts":[{"label":"commission","value":8400,"status":"paid","role":"payment"}]}"""),
+            sheet("rent.pdf", """
+                {"doc_type":"lease","is_personal":false,"category":"rent",
+                 "orgs":[{"name":"Chen Realty","role":"provider","side":"owed"},
+                         {"name":"Zed Corp","role":"client","side":"owes"}],
+                 "amounts":[{"label":"rent","value":500,"status":"paid","role":"payment"}]}"""));
+        SheetQuery q = new SheetQuery(true, "", SheetQuery.Select.AMOUNTS, SheetQuery.Op.LIST,
+                "paid", "", null, "", "", "", "owed_to_me", false, "commission");
+        SheetAggregator.Result r = agg.run(q, s, List.of("Chen Realty"));
+        assertNotNull(r);
+        assertTrue(r.text().contains("John Kim"), "unknown-category commission dropped: " + r.text());
+        assertFalse(r.text().contains("Zed"), "firm-category rent doc leaked into commission filter: " + r.text());
+    }
 }

@@ -29,7 +29,10 @@ public final class SheetAggregator {
 
     // ── parsed view of one sheet ─────────────────────────────────────────────
     private record Party(String name, String role, String side) {}
-    private record Amount(double value, String status, String label) {}
+    // role = the model's canonical tag for what this amount IS (charge|payment|
+    // deposit|balance|refund|estimate|other), filled lazily for ambiguous docs. Blank
+    // when untagged → the aggregator falls back to label keywords.
+    private record Amount(double value, String status, String label, String role) {}
     private record Dated(String label, String date, boolean deadline) {}
     private static final class Doc {
         String fileName, docType, title, gist, category = "";
@@ -131,25 +134,44 @@ public final class SheetAggregator {
             double gross = grossOwed(group);       // largest single owed amount (for the paid check)
             double sumPlain = 0;                    // sum of separate unpaid bills for this party
             Double balance = null;                  // an explicit remaining balance overrides the sum
-            boolean paidFull = false;
+            boolean paidFull = false;               // an owed bill has been fully cleared
+            boolean hasSettled = false;             // a real payment was received (for the paid list)
+            double maxPaid = 0;                     // largest settled payment (shown for a paid item)
             for (Doc d : group) {
-                if (isPaymentDoc(d)) paidFull = true;
+                if (isPaymentDoc(d)) { paidFull = true; hasSettled = true; }
                 for (Amount a : d.amounts) {
                     if (a.value <= 0) continue;
-                    String st = lc(a.status), lb = lc(a.label);
+                    String st = lc(a.status), lb = lc(a.label), role = lc(a.role());
                     if (isSettled(st)) {
-                        // A settled line clears the bill only if it's actually a
-                        // payment of it — not a deposit, advance, credit or refund
-                        // that merely happens to equal the amount.
-                        boolean isPayment = (lb.contains("payment") || lb.contains("paid")
-                                || lb.contains("total") || lb.contains("balance") || lb.contains("amount"))
-                                && !lb.contains("deposit") && !lb.contains("advance")
-                                && !lb.contains("credit") && !lb.contains("refund");
-                        if (isPayment && a.value >= gross * 0.9) paidFull = true;
+                        // A settled line that isn't a deposit/advance/credit/refund/
+                        // partial is money actually received: record it for the
+                        // "which are paid" list regardless of its wording (an oddly
+                        // named "Agent Net Commission", status paid, still counts).
+                        // But CLEARING an owed bill stays conservative — only a line
+                        // that READS like a clearing payment AND covers the owed gross
+                        // settles it, so a separate paid recurring invoice does not
+                        // wipe out the still-unpaid ones in the same group.
+                        boolean notPartial = !lb.contains("deposit") && !lb.contains("advance")
+                                && !lb.contains("credit") && !lb.contains("refund")
+                                && !lb.contains("partial");
+                        if (notPartial) {
+                            hasSettled = true;
+                            maxPaid = Math.max(maxPaid, a.value);
+                            // A clearing payment settles the bill. Prefer the model's
+                            // role (payment vs a paid-charge/deposit); fall back to
+                            // label keywords only when the amount is untagged.
+                            boolean clearing = !role.isBlank() ? role.equals("payment")
+                                    : (lb.contains("payment") || lb.contains("paid")
+                                       || lb.contains("total") || lb.contains("balance") || lb.contains("amount"));
+                            if (clearing && a.value >= gross * 0.9) paidFull = true;
+                        }
                         continue;
                     }
                     if (!isOwedCandidate(st, d)) continue;
-                    boolean balanceish = lb.contains("remaining") || lb.contains("balance") || lb.contains("outstanding");
+                    // The remaining balance overrides the summed charges. Prefer the
+                    // model's role; fall back to label keywords when untagged.
+                    boolean balanceish = !role.isBlank() ? role.equals("balance")
+                            : (lb.contains("remaining") || lb.contains("balance") || lb.contains("outstanding"));
                     if (balanceish) {
                         balance = balance == null ? a.value : Math.min(balance, a.value);  // the net still owed
                     } else if (!st.contains("partial")) {
@@ -164,9 +186,11 @@ public final class SheetAggregator {
             if (balance != null && balance > 0) owed = Math.round(balance);
             else owed = paidFull ? 0 : Math.round(sumPlain);
 
-            boolean include = wantPaid ? paidFull : owed > 0;   // status filter
+            // "which are paid" = a real payment was received AND nothing is still
+            // owed (a group with unpaid recurring invoices isn't "paid" yet).
+            boolean include = wantPaid ? (hasSettled && owed == 0) : owed > 0;
             if (!include) continue;
-            long shown = wantPaid ? Math.round(gross) : owed;
+            long shown = wantPaid ? Math.round(Math.max(gross, maxPaid)) : owed;
             rows.add(new String[]{display.get(e.getKey()), MoneyFormat.format(shown), String.valueOf(shown)});
             total += shown;
             for (Doc d : group) if (!sources.contains(d.fileName)) sources.add(d.fileName);
@@ -212,12 +236,15 @@ public final class SheetAggregator {
                 || l.contains("expir") || l.contains("filing");
     }
 
-    /** True when the doc matches the requested spending category (or none requested).
-     *  Matches on the model's category tag, falling back to doc_type/title wording. */
+    /** True when the doc matches the requested category (or none requested). Compares
+     *  the model's category tag (both sides drawn from the same fixed set). A doc the
+     *  model couldn't categorise ("other"/blank) is UNKNOWN — not "not this" — so a
+     *  narrowing filter must NOT silently drop it (that hid a paid commission the model
+     *  had filed as "other"). Only a doc firmly tagged a DIFFERENT category is excluded. */
     private static boolean categoryMatch(Doc d, String category) {
         if (category == null || category.isBlank()) return true;
-        String c = lc(category);
-        return lc(d.category).contains(c) || lc(d.docType).contains(c) || lc(d.title).contains(c);
+        String dc = lc(d.category), c = lc(category);
+        return dc.isBlank() || dc.equals("other") || dc.equals(c) || dc.contains(c) || c.contains(dc);
     }
 
     private static boolean isRateDoc(Doc d) {
@@ -323,6 +350,13 @@ public final class SheetAggregator {
             if (isOwner(p.name(), ownerKeys) && isProviderSide(p)) return true;
         return false;
     }
+    /** The owner appears as a client/owes (billed) party on this doc — meaning it's a
+     *  payable of theirs, even if a stray duplicate also tags them provider-side. */
+    private static boolean ownerIsClient(Doc d, Set<String> ownerKeys) {
+        for (Party p : d.parties)
+            if (isOwner(p.name(), ownerKeys) && isClientSide(p)) return true;
+        return false;
+    }
 
     /** A client/customer/patient/… party for this doc, other than the owner. */
     private static boolean hasClientParty(Doc d, Set<String> ownerKeys) {
@@ -349,8 +383,12 @@ public final class SheetAggregator {
                 for (Party p : d.parties) { String n = nm(p); if (!n.isBlank() && !isOwner(n, ownerKeys)) return n; }
             return "";
         }
-        // "I owe": skip anything the owner issued (those are receivables).
-        if (!ownerKeys.isEmpty() && ownerIsProvider(d, ownerKeys)) return "";
+        // "I owe": skip anything the owner ISSUED (those are receivables) — but only
+        // when the owner isn't ALSO billed on the same doc. A stray duplicate that
+        // tags the owner provider-side (e.g. "member/owed" on a dues bill they owe)
+        // must not hide a real payable, so an owner that appears as a client/owes
+        // party keeps the doc in scope.
+        if (!ownerKeys.isEmpty() && ownerIsProvider(d, ownerKeys) && !ownerIsClient(d, ownerKeys)) return "";
         for (Party p : d.parties) {
             String n = nm(p);
             if (n.isBlank() || isOwner(n, ownerKeys)) continue;
@@ -564,7 +602,8 @@ public final class SheetAggregator {
             JsonNode am = n.get("amounts");
             if (am != null && am.isArray()) for (JsonNode a : am) {
                 if (!a.path("value").isNumber()) continue;
-                d.amounts.add(new Amount(a.path("value").asDouble(), a.path("status").asText(""), a.path("label").asText("")));
+                d.amounts.add(new Amount(a.path("value").asDouble(), a.path("status").asText(""),
+                        a.path("label").asText(""), a.path("role").asText("")));
             }
             JsonNode dt = n.get("dates");
             if (dt != null && dt.isArray()) for (JsonNode x : dt)

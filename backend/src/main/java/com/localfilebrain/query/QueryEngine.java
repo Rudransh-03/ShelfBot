@@ -1182,7 +1182,7 @@ public final class QueryEngine {
                                     String operation, String status, String role,
                                     Boolean isPersonal, String docType, String dateFrom,
                                     String dateTo, String scope, boolean obligationsOnly,
-                                    String category) {
+                                    String category, java.util.List<String> parts) {
 
         /** Map the aggregate fields onto a {@link com.localfilebrain.aggregate.SheetQuery}
          *  (only valid when {@link #aggregate} is true). */
@@ -1220,7 +1220,7 @@ public final class QueryEngine {
             statements, receipts, salary slips, IDs, etc.). You may be given the
             recent conversation for context, then the user's new message. Decide how
             to handle the message and reply with ONLY a compact JSON object:
-            {"intent":"<INTENT>","subject":"<kind of document, or empty>","reply":"<text or empty>","rewrite":"<text or empty>","aggregate":true|false,"select":"amounts|parties|documents|dates","operation":"sum|count|list|max|min|none","status":"unpaid|paid|partial|owed|all|","role":"client|customer|vendor|supplier|provider|","is_personal":true|false|null,"doc_type":"","date_from":"","date_to":"","scope":"owed_to_me|i_owe|","obligations_only":true|false,"category":""}
+            {"intent":"<INTENT>","subject":"<kind of document, or empty>","reply":"<text or empty>","rewrite":"<text or empty>","aggregate":true|false,"select":"amounts|parties|documents|dates","operation":"sum|count|list|max|min|none","status":"unpaid|paid|partial|owed|all|","role":"client|customer|vendor|supplier|provider|","is_personal":true|false|null,"doc_type":"","date_from":"","date_to":"","scope":"owed_to_me|i_owe|","obligations_only":true|false,"category":"","parts":[]}
 
             You are given TODAY'S DATE, then (optionally) the recent conversation,
             then the user's new message.
@@ -1239,6 +1239,13 @@ public final class QueryEngine {
             miss it?" after discussing Sharma Bakery's licence expiry becomes "what
             happens if Sharma Bakery misses the food licence renewal deadline?").
             Leave "" when the message already stands on its own.
+
+            "parts": if the message asks for TWO OR MORE genuinely DIFFERENT things
+            (e.g. "how many clients do I have AND who owes me the most?", or "list my
+            unpaid bills and when is rent due"), set "parts" to the list of
+            self-contained sub-questions, each answerable on its own ("how many clients
+            do I have?", "who owes me the most?"). Leave it [] for a single ask — a
+            count-and-total of the SAME kind is ONE amounts question, not two parts.
 
             STEP 1 — set "aggregate". It is TRUE when answering needs the WHOLE
             collection rolled up: totals, counts, "list all X", "who owes the most",
@@ -1449,7 +1456,7 @@ public final class QueryEngine {
 
     /** The classifier fallback used on any parse/LLM failure. */
     static final ClassifiedIntent DEFAULT_LOOKUP = new ClassifiedIntent(Intent.LOOKUP,
-            "", "", "", false, "", "", "", "", null, "", "", "", "", false, "");
+            "", "", "", false, "", "", "", "", null, "", "", "", "", false, "", java.util.List.of());
 
     /** Parse the classifier's JSON into a routing decision. Pure (no LLM), so a
      *  routing harness can drive it with live model output and it is unit-testable
@@ -1491,6 +1498,11 @@ public final class QueryEngine {
             JsonNode ip = n.get("is_personal");
             if (ip != null && ip.isBoolean()) isPersonal = ip.booleanValue();
 
+            java.util.List<String> parts = new java.util.ArrayList<>();
+            JsonNode pn = n.get("parts");
+            if (pn != null && pn.isArray())
+                for (JsonNode p : pn) { String s = p.asText("").trim(); if (!s.isBlank()) parts.add(s); }
+
             return new ClassifiedIntent(intent,
                     n.path("subject").asText("").trim(),
                     n.path("reply").asText("").trim(),
@@ -1504,7 +1516,8 @@ public final class QueryEngine {
                     n.path("date_to").asText("").trim(),
                     n.path("scope").asText("").trim().toLowerCase(),
                     n.path("obligations_only").asBoolean(false),
-                    n.path("category").asText("").trim().toLowerCase());
+                    n.path("category").asText("").trim().toLowerCase(),
+                    parts);
         } catch (Exception e) {
             return DEFAULT_LOOKUP;
         }
@@ -1587,6 +1600,48 @@ public final class QueryEngine {
         return collection && intent;
     }
 
+    // Prevents a sub-question of a compound from itself re-triggering compound
+    // handling (no nested decomposition / recursion loop). Per-thread since queries
+    // run concurrently.
+    private final ThreadLocal<Boolean> inCompound = ThreadLocal.withInitial(() -> false);
+
+    /** Answer a compound message by running each self-contained part through the full
+     *  pipeline and concatenating the results (deduping sources). Returns null when the
+     *  parts don't hold up as ≥2 distinct sub-questions, so the caller routes normally. */
+    private QueryResult answerCompound(String whole, java.util.List<String> parts,
+                                       java.util.Set<String> allowedPaths,
+                                       java.util.function.Consumer<String> onToken) {
+        if (inCompound.get()) return null;                       // no nested compound
+        List<String> subs = new ArrayList<>();
+        for (String p : parts) {
+            if (p == null) continue;
+            String s = p.trim();
+            if (s.isBlank() || s.equalsIgnoreCase(whole.trim())) continue;
+            if (!subs.contains(s)) subs.add(s);
+            if (subs.size() == 4) break;                         // cap
+        }
+        if (subs.size() < 2) return null;                        // not really compound
+        StringBuilder text = new StringBuilder();
+        List<Source> sources = new ArrayList<>();
+        java.util.Set<String> seenSrc = new java.util.HashSet<>();
+        inCompound.set(true);
+        try {
+            for (int i = 0; i < subs.size(); i++) {
+                if (i > 0 && onToken != null) onToken.accept("\n\n");
+                QueryResult r = (onToken != null)
+                        ? queryStreamInternal(subs.get(i), onToken, allowedPaths)
+                        : queryInternal(subs.get(i), allowedPaths);
+                if (r == null || r.answer() == null || r.answer().isBlank()) continue;
+                if (text.length() > 0) text.append("\n\n");
+                text.append(r.answer());
+                for (Source s : r.sourceFiles()) if (seenSrc.add(s.absolutePath())) sources.add(s);
+            }
+        } finally {
+            inCompound.set(false);
+        }
+        return text.length() == 0 ? null : QueryResult.found(text.toString(), sources);
+    }
+
     private Routed routeByIntent(String question, java.util.Set<String> allowedPaths,
                                  java.util.function.Consumer<String> onToken) {
         // Hard guarantee for clear whole-collection overview asks — no classifier
@@ -1605,6 +1660,13 @@ public final class QueryEngine {
             log.info("Intent: {} (follow-up rewritten for retrieval: \"{}\")", ci.intent(), ci.rewrite());
         } else {
             log.info("Intent: {}", ci.intent());
+        }
+        // Compound: the message asks for MULTIPLE distinct things ("how many clients
+        // AND who owes the most?"). Answer each self-contained part through the full
+        // pipeline and combine, so neither ask is silently dropped.
+        if (ci.parts().size() > 1) {
+            QueryResult combined = answerCompound(question, ci.parts(), allowedPaths, onToken);
+            if (combined != null) { log.info("Intent: COMPOUND ({} parts)", ci.parts().size()); return new Routed(combined, effective); }
         }
         // Corpus-wide roll-up (money owed/paid, roster, doc inventory, deadlines) →
         // deterministic fact-sheet aggregate. Same precedence the old two-call flow

@@ -127,6 +127,10 @@ class MergedRouterHarnessTest {
         l.add(c("what commission am I owed in total?",         "SHEETS:amounts/owed_to_me*"));
         l.add(c("who still owes me commission?",               "SHEETS:amounts/owed_to_me*"));
         l.add(boundary("which sale was the largest?",          "MAX"));   // sale amount → analytics or sheets
+        // Superlative over the user's OWN bills/receivables = amounts aggregate, NOT
+        // the entity analytics MAX; "earned/total so far" = amounts (status all).
+        l.add(c("what's my most expensive bill?",              "SHEETS:amounts/i_owe*"));
+        l.add(c("how much have I earned in commissions so far?", "SHEETS:amounts/owed_to_me*"));
         // ── Student: OWES tuition/rent, scholarship is a credit not a debt ──
         l.add(c("how much do I owe in total?",                 "SHEETS:amounts/i_owe*"));
         l.add(c("how much tuition do I owe?",                  "SHEETS:amounts/i_owe*"));

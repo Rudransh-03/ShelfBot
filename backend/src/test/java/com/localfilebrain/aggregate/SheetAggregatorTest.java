@@ -464,4 +464,45 @@ class SheetAggregatorTest {
         assertTrue(r.text().contains("John Kim"), "unknown-category commission dropped: " + r.text());
         assertFalse(r.text().contains("Zed"), "firm-category rent doc leaked into commission filter: " + r.text());
     }
+
+    @Test
+    void paidListIncludesPartialPayerLabelled() {
+        // "have any patients paid me?" must surface a PARTIAL payer, explicitly marked:
+        // Nina paid $200 of a $600 procedure, $400 balance still owed.
+        List<SheetExtractor.Sheet> s = List.of(sheet("nina.pdf", """
+            {"doc_type":"statement","is_personal":false,
+             "orgs":[{"name":"Rao Clinic","role":"provider","side":"owed"}],
+             "people":[{"name":"Nina Patel","role":"patient","side":"owes"}],
+             "amounts":[{"label":"procedure","value":600,"status":"paid","role":"charge"},
+                        {"label":"payment","value":200,"status":"paid","role":"payment"},
+                        {"label":"balance due","value":400,"status":"owed","role":"balance"}]}"""));
+        SheetAggregator.Result r = agg.run(amounts(SheetQuery.Op.LIST, "paid", "owed_to_me"), s, List.of("Rao Clinic"));
+        assertNotNull(r);
+        assertTrue(r.text().contains("Nina Patel"), "partial payer not surfaced: " + r.text());
+        assertTrue(r.text().toLowerCase().contains("partial"), "partial not called out: " + r.text());
+        assertTrue(r.text().contains("200") && r.text().contains("400"), "paid/owed breakdown missing: " + r.text());
+    }
+
+    @Test
+    void statusAllSumsPaidPlusOwed() {
+        // "how much have I earned so far" = total billed regardless of paid vs unpaid:
+        // an owed invoice PLUS a paid one, both counted.
+        List<SheetExtractor.Sheet> s = List.of(
+            sheet("owed.pdf", """
+                {"doc_type":"invoice","is_personal":false,
+                 "orgs":[{"name":"Me Co","role":"provider","side":"owed"},
+                         {"name":"Maria","role":"client","side":"owes"}],
+                 "amounts":[{"label":"commission","value":9000,"status":"owed","role":"charge"}]}"""),
+            sheet("paid.pdf", """
+                {"doc_type":"closing statement","is_personal":false,
+                 "orgs":[{"name":"Me Co","role":"provider","side":"owed"}],
+                 "people":[{"name":"John","role":"client","side":"owes"}],
+                 "amounts":[{"label":"commission","value":8400,"status":"paid","role":"payment"}]}"""));
+        SheetQuery q = new SheetQuery(true, "", SheetQuery.Select.AMOUNTS, SheetQuery.Op.SUM,
+                "all", "", null, "", "", "", "owed_to_me", false, "");
+        SheetAggregator.Result r = agg.run(q, s, List.of("Me Co"));
+        assertNotNull(r);
+        assertTrue(r.text().contains("17,400"), "total earned (paid+owed) wrong: " + r.text());
+        assertTrue(r.text().contains("Maria") && r.text().contains("John"), "missing a party: " + r.text());
+    }
 }

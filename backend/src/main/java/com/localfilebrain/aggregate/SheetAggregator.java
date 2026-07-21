@@ -123,7 +123,11 @@ public final class SheetAggregator {
             if (hasClientParty(d, ownerKeys)) clientKeys.add(key);
         }
 
-        boolean wantPaid = q.status().contains("paid") && !q.status().contains("un");
+        boolean wantAll  = q.status().equals("all");   // total earned/billed = paid + owed
+        // "paid" OR "partial" → the paid path (a partial payer HAS paid something); the
+        // partial ones are labelled. "unpaid" stays the outstanding path.
+        boolean wantPaid = !wantAll && (q.status().contains("paid") || q.status().contains("partial"))
+                && !q.status().contains("un");
         List<String[]> rows = new ArrayList<>();               // {client, formattedAmount, rawAmount}
         List<String> sources = new ArrayList<>();
         long total = 0;
@@ -131,35 +135,37 @@ public final class SheetAggregator {
         for (Map.Entry<String, List<Doc>> e : byClient.entrySet()) {
             if (owedToMe && !clientKeys.contains(e.getKey())) continue;   // receivables only
             List<Doc> group = e.getValue();
-            double gross = grossOwed(group);       // largest single owed amount (for the paid check)
+            double gross = grossOwed(group);       // largest single owed amount (for the clearing check)
             double sumPlain = 0;                    // sum of separate unpaid bills for this party
+            double maxFace = 0, sumFace = 0;        // bill face values: max (one debt) / sum (separate bills)
             Double balance = null;                  // an explicit remaining balance overrides the sum
             boolean paidFull = false;               // an owed bill has been fully cleared
-            boolean hasSettled = false;             // a real payment was received (for the paid list)
-            double maxPaid = 0;                     // largest settled payment (shown for a paid item)
             for (Doc d : group) {
-                if (isPaymentDoc(d)) { paidFull = true; hasSettled = true; }
+                // A doc's FACE value = its largest non-refund amount (what the bill is
+                // for). We total these to get what was BILLED. A payment-confirmation
+                // doc is not a new bill, so it doesn't add to the summed face.
+                double docFace = 0;
+                for (Amount a : d.amounts) {
+                    if (a.value <= 0) continue;
+                    String role = lc(a.role()), lb = lc(a.label);
+                    boolean refundish = role.equals("refund") || lb.contains("refund") || lb.contains("credit");
+                    if (!refundish) docFace = Math.max(docFace, a.value);
+                }
+                maxFace = Math.max(maxFace, docFace);
+                if (!isPaymentDoc(d)) sumFace += docFace;
+                if (isPaymentDoc(d)) paidFull = true;
                 for (Amount a : d.amounts) {
                     if (a.value <= 0) continue;
                     String st = lc(a.status), lb = lc(a.label), role = lc(a.role());
                     if (isSettled(st)) {
-                        // A settled line that isn't a deposit/advance/credit/refund/
-                        // partial is money actually received: record it for the
-                        // "which are paid" list regardless of its wording (an oddly
-                        // named "Agent Net Commission", status paid, still counts).
-                        // But CLEARING an owed bill stays conservative — only a line
-                        // that READS like a clearing payment AND covers the owed gross
-                        // settles it, so a separate paid recurring invoice does not
-                        // wipe out the still-unpaid ones in the same group.
                         boolean notPartial = !lb.contains("deposit") && !lb.contains("advance")
                                 && !lb.contains("credit") && !lb.contains("refund")
                                 && !lb.contains("partial");
                         if (notPartial) {
-                            hasSettled = true;
-                            maxPaid = Math.max(maxPaid, a.value);
-                            // A clearing payment settles the bill. Prefer the model's
-                            // role (payment vs a paid-charge/deposit); fall back to
-                            // label keywords only when the amount is untagged.
+                            // CLEARING an owed bill stays conservative — only a line that
+                            // reads/roles as a payment AND covers the owed gross settles
+                            // it, so a separate paid recurring invoice doesn't wipe out
+                            // the still-unpaid ones. Prefer the model's role over labels.
                             boolean clearing = !role.isBlank() ? role.equals("payment")
                                     : (lb.contains("payment") || lb.contains("paid")
                                        || lb.contains("total") || lb.contains("balance") || lb.contains("amount"));
@@ -179,19 +185,35 @@ public final class SheetAggregator {
                     }
                 }
             }
-            // An explicitly stated balance due is the truth — trust it over a possibly
-            // mislabeled "paid" charge line (you can't be paid in full while a balance
-            // is still due). Otherwise: fully settled → 0, else sum the separate bills.
+            // Still OWED: an explicit balance is the truth (you can't be paid in full
+            // while a balance is due); else fully settled → 0, else sum the bills.
             long owed;
             if (balance != null && balance > 0) owed = Math.round(balance);
             else owed = paidFull ? 0 : Math.round(sumPlain);
+            // Total BILLED: with an explicit balance the docs describe ONE debt (an
+            // invoice + its follow-up) → take the largest face; otherwise they're
+            // separate bills → sum their faces. PAID so far = billed − still owed, which
+            // sidesteps a charge that was mislabeled "paid" (we never trust that figure).
+            long billed = Math.max(owed, Math.round(balance != null ? maxFace : sumFace));
+            long paid = billed - owed;
 
-            // "which are paid" = a real payment was received AND nothing is still
-            // owed (a group with unpaid recurring invoices isn't "paid" yet).
-            boolean include = wantPaid ? (hasSettled && owed == 0) : owed > 0;
+            long shown; String amtStr; boolean include;
+            if (wantAll) {                       // total billed = what's paid PLUS still owed
+                shown = billed; include = billed > 0;
+                amtStr = MoneyFormat.format(billed);
+            } else if (wantPaid) {               // paid at all — in full, or partial (called out)
+                include = paid > 0;
+                if (owed > 0) {                  // partially paid — state it explicitly
+                    shown = paid;
+                    amtStr = MoneyFormat.format(paid) + " paid, " + MoneyFormat.format(owed) + " still owed (partial)";
+                } else {                         // paid in full
+                    shown = billed; amtStr = MoneyFormat.format(billed);
+                }
+            } else {                             // unpaid / outstanding
+                include = owed > 0; shown = owed; amtStr = MoneyFormat.format(owed);
+            }
             if (!include) continue;
-            long shown = wantPaid ? Math.round(Math.max(gross, maxPaid)) : owed;
-            rows.add(new String[]{display.get(e.getKey()), MoneyFormat.format(shown), String.valueOf(shown)});
+            rows.add(new String[]{display.get(e.getKey()), amtStr, String.valueOf(shown)});
             total += shown;
             for (Doc d : group) if (!sources.contains(d.fileName)) sources.add(d.fileName);
         }

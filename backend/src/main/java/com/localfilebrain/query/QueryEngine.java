@@ -1183,7 +1183,7 @@ public final class QueryEngine {
             statements, receipts, salary slips, IDs, etc.). You may be given the
             recent conversation for context, then the user's new message. Decide how
             to handle the message and reply with ONLY a compact JSON object:
-            {"intent":"<INTENT>","subject":"<kind of document, or empty>","reply":"<text or empty>","rewrite":"<text or empty>","aggregate":true|false,"select":"amounts|parties|documents|dates","operation":"sum|count|list|max|min|none","status":"unpaid|paid|partial|owed|","role":"client|customer|vendor|supplier|provider|","is_personal":true|false|null,"doc_type":"","date_from":"","date_to":"","scope":"owed_to_me|i_owe|","obligations_only":true|false,"category":""}
+            {"intent":"<INTENT>","subject":"<kind of document, or empty>","reply":"<text or empty>","rewrite":"<text or empty>","aggregate":true|false,"select":"amounts|parties|documents|dates","operation":"sum|count|list|max|min|none","status":"unpaid|paid|partial|owed|all|","role":"client|customer|vendor|supplier|provider|","is_personal":true|false|null,"doc_type":"","date_from":"","date_to":"","scope":"owed_to_me|i_owe|","obligations_only":true|false,"category":""}
 
             You are given TODAY'S DATE, then (optionally) the recent conversation,
             then the user's new message.
@@ -1193,7 +1193,7 @@ public final class QueryEngine {
             plural phrase (e.g. "invoices", "Rohan Mehta invoices", "Sharma Bakery
             GST returns", "rent receipts"). Dropping the qualifier is an error —
             "total of Rohan Mehta's invoices" has subject "Rohan Mehta invoices",
-            NOT "invoices". Fill it for COUNT/LIST/SUM/MAX/MIN; leave it "" otherwise.
+            NOT "invoices". Fill it for COUNT/LIST; leave it "" otherwise.
 
             "rewrite": if the message only makes sense with the conversation (it uses
             pronouns like "it/they/that", or is an elliptical follow-up like "and the
@@ -1228,7 +1228,12 @@ public final class QueryEngine {
                           owes (their bills, "how much do I owe", "who do I pay").
                           This REPLACES fee-receivables: "who owes me", "unpaid fees",
                           "who hasn't paid" are amounts + scope owed_to_me; be
-                          negation-aware ("who hasn't paid" = status unpaid). Set
+                          negation-aware ("who hasn't paid" = status unpaid). Status
+                          "all" (sums paid AND still-owed) is ONLY for total EARNED /
+                          billed / revenue / "how much have I made". The words owed /
+                          unpaid / outstanding / "still owe" / "am I owed" are status
+                          UNPAID even with "total"/"in total" ("how much am I owed in
+                          total" = unpaid, not all). Set
                           "category" (utility/rent/insurance/subscription/loan/
                           credit_card/medical/tuition/…) for ONE spending category —
                           this holds even when phrased singular ("how much do I owe
@@ -1264,13 +1269,15 @@ public final class QueryEngine {
                           whole-collection count is the DOCUMENTS aggregate instead.
               LIST      - list or find WHICH documents of a kind. e.g. "list my
                           contracts", "which documents mention Acme".
-              SUM       - a TOTAL of money on a specific KIND or a named party's
-                          documents. e.g. "total of all my invoices", "how much rent
-                          did I pay in total", "total of Rohan's invoices". (Money by
-                          who-owes-whom across everyone is the amounts aggregate.)
-              MAX       - the single largest/highest BY MONEY AMOUNT.
-              MIN       - the single smallest/lowest BY MONEY AMOUNT.
               COMPARE   - compare specific documents. e.g. "compare the GST returns".
+              // NOTE: there is NO separate money-total / biggest / smallest intent.
+              // EVERY money question — a total, "who owes the most/least", "biggest /
+              // most expensive / cheapest bill or fee", "how much have I earned / total
+              // revenue", "total of all my invoices" — is the AMOUNTS aggregate in
+              // STEP 1 (aggregate:true, select amounts, operation sum/max/min, with a
+              // scope), because that is the one engine that nets and groups money
+              // correctly. Only a total scoped to ONE specific named party/item ("total
+              // of Rohan's invoices") is aggregate:false (a lookup).
               LOOKUP    - any other question answered from the content of one or a few
                           specific files. THIS IS THE DEFAULT — use it when unsure.
                           A question about a specific PERSON, COMPANY, or ENTITY by
@@ -1328,9 +1335,9 @@ public final class QueryEngine {
               the previous ASSISTANT answer to infer the topic (e.g. "Orchid owes you
               ₹55,000" means the thread is unpaid client fees).
             - When unsure between a special intent and LOOKUP, choose LOOKUP.
-            - A message asking for BOTH the count and the total of the same kind
-              ("how many invoices do I have and what's their total?") is SUM — the
-              SUM answer already reports the count alongside the total.
+            - A message asking for a money TOTAL alongside a count ("how many invoices
+              and what's their total?") is the AMOUNTS aggregate (operation sum) — the
+              money engine reports the count alongside the total.
             - A named person, company, or entity is almost always in the user's files:
               route "who is <name>" / "what is <name>" / "tell me about <name>" to
               LOOKUP, never UNCLEAR.
@@ -1360,8 +1367,19 @@ public final class QueryEngine {
               {"intent":"DOCUMENTS","aggregate":true,"select":"documents","operation":"count","doc_type":"invoice"}
             "what deadlines do I have this month?" →
               {"intent":"DATES","aggregate":true,"select":"dates","operation":"list","date_from":"2026-07-01","date_to":"2026-07-31","obligations_only":true}
-            "total of all my invoices" → {"intent":"SUM","aggregate":false,"subject":"invoices"}
-            "total of Rohan's invoices" → {"intent":"SUM","aggregate":false,"subject":"Rohan invoices"}
+            "what's my most expensive bill?" →
+              {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"max","status":"unpaid","scope":"i_owe"}
+            "how much have I earned in commissions so far?" (EARNED → all) →
+              {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"sum","status":"all","scope":"owed_to_me"}
+            "how much commission am I owed in total?" (OWED → unpaid, NOT all) →
+              {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"sum","status":"unpaid","scope":"owed_to_me"}
+            "how much am I owed in total?" (OWED → unpaid) →
+              {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"sum","status":"unpaid","scope":"owed_to_me"}
+            "total of all my invoices" (my whole receivables) →
+              {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"sum","status":"all","scope":"owed_to_me"}
+            "who owes me and what's the total?" →
+              {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"sum","status":"unpaid","scope":"owed_to_me"}
+            "total of Rohan's invoices" (ONE named client) → {"intent":"LOOKUP","aggregate":false}
             "summarize my documents" → {"intent":"OVERVIEW","aggregate":false}
             "did I get any scholarship?" → {"intent":"LOOKUP","aggregate":false}
             "is the Blue Ridge invoice paid?" → {"intent":"LOOKUP","aggregate":false}
@@ -1403,6 +1421,24 @@ public final class QueryEngine {
             try { intent = Intent.valueOf(n.path("intent").asText("LOOKUP").trim().toUpperCase()); }
             catch (IllegalArgumentException badEnum) { intent = Intent.LOOKUP; }
 
+            // ── ONE money engine ──────────────────────────────────────────────
+            // Money aggregation is ONLY ever AMOUNTS (it nets, groups by party and
+            // excludes paid — the analytics path does none of that). If the model still
+            // emits a SUM/MAX/MIN money intent, fold it into AMOUNTS with the matching
+            // operation so money can never fall to the inferior analytics engine. A
+            // total scoped to ONE named entity (aggregate:false with a subject) is a
+            // lookup and is left untouched.
+            String operation = n.path("operation").asText("").trim().toLowerCase();
+            if (intent == Intent.SUM || intent == Intent.MAX || intent == Intent.MIN) {
+                boolean singleEntity = !n.path("aggregate").asBoolean(false)
+                        && !n.path("subject").asText("").trim().isBlank();
+                if (!singleEntity) {
+                    if (operation.isBlank())
+                        operation = intent == Intent.MAX ? "max" : (intent == Intent.MIN ? "min" : "sum");
+                    intent = Intent.AMOUNTS;
+                }
+            }
+
             // Aggregate when the model says so OR the chosen intent is itself a sheet
             // kind — robust to it filling one signal but not the other. Then snap the
             // intent/select pair to agree, so routing sees a consistent decision.
@@ -1419,8 +1455,7 @@ public final class QueryEngine {
                     n.path("subject").asText("").trim(),
                     n.path("reply").asText("").trim(),
                     n.path("rewrite").asText("").trim(),
-                    aggregate, select,
-                    n.path("operation").asText("").trim().toLowerCase(),
+                    aggregate, select, operation,
                     n.path("status").asText("").trim().toLowerCase(),
                     n.path("role").asText("").trim().toLowerCase(),
                     isPersonal,

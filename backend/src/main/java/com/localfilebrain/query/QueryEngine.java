@@ -465,7 +465,18 @@ public final class QueryEngine {
         // half page brief of /Users/.../foo.pdf" don't reliably hit the
         // doc's content chunks, but the user clearly meant that one file.
         // Active client scope has no documents → nothing to search.
-        if (allowedPaths != null && allowedPaths.isEmpty()) return notFound(trimmed, onToken);
+        if (allowedPaths != null && allowedPaths.isEmpty()) {
+            // Client scope resolved to ZERO docs — usually a polluted/duplicate
+            // registry entry ("TechNova" with no membership) the resolver picked. Don't
+            // dead-end a lookup for a doc that plainly exists: if the question NAMES an
+            // indexed file, answer from that one file (no leak — only the named file is
+            // read). Otherwise there genuinely is nothing in scope.
+            for (String named : entityNamedFiles(trimmed, null)) {
+                QueryResult r = answerFromFileScope(trimmed, named, onToken);
+                if (r != null) return r;
+            }
+            return notFound(trimmed, onToken);
+        }
 
         java.util.Optional<String> scoped = detectFileScope(trimmed, allowedPaths);
         if (scoped.isPresent()) {
@@ -491,13 +502,27 @@ public final class QueryEngine {
         float[]       queryVector = embeddings.get(0);
 
         List<SearchResult> matches = vectorStore.query(queryVector, TOP_K, allowedPaths);
-        if (matches.isEmpty() || matches.get(0).distance() > RELEVANCE_THRESHOLD) {
+
+        // Filename-anchored retrieval: if the question NAMES a file (shares a
+        // distinctive, non-doc-type token with a filename — "the TechNova invoice"),
+        // that file IS the answer even when vector similarity ranked its chunks past
+        // the threshold (a live miss: "what does the TechNova invoice say" never
+        // retrieved its own invoice, while "Delgado" did). This is purely additive:
+        // unnamed lookups behave exactly as before.
+        List<String> namedFiles = entityNamedFiles(retrievalQuery, allowedPaths);
+        if (namedFiles.isEmpty() && (matches.isEmpty() || matches.get(0).distance() > RELEVANCE_THRESHOLD)) {
             return notFound(trimmed, onToken);
         }
 
         List<SearchResult> withinThreshold = matches.stream()
                 .filter(m -> m.distance() <= RELEVANCE_THRESHOLD)
-                .collect(Collectors.toList());
+                .collect(Collectors.toCollection(ArrayList::new));
+        for (String path : namedFiles) {                   // guarantee the named file is present
+            if (withinThreshold.stream().anyMatch(m -> path.equals(m.sourceFilePath()))) continue;
+            List<SearchResult> fc = vectorStore.getChunksForFile(path);
+            for (int i = 0; i < Math.min(fc.size(), MAX_CHUNKS_PER_FILE); i++) withinThreshold.add(fc.get(i));
+        }
+        if (withinThreshold.isEmpty()) return notFound(trimmed, onToken);
 
         // Hybrid focus: when the question names a distinctive entity/term, keep
         // only chunks that actually contain it — removes semantically-loose noise
@@ -569,8 +594,16 @@ public final class QueryEngine {
             return QueryResult.found(chatReply, List.of());
         }
 
-        // Active client scope has no documents → nothing to search.
-        if (allowedPaths != null && allowedPaths.isEmpty()) return notFound(trimmed);
+        // Active client scope has no documents (often a polluted/duplicate registry
+        // entry with no membership). Don't dead-end a lookup for a doc that exists —
+        // if the question names an indexed file, answer from that one file.
+        if (allowedPaths != null && allowedPaths.isEmpty()) {
+            for (String named : entityNamedFiles(trimmed, null)) {
+                QueryResult r = answerFromFileScope(trimmed, named, null);
+                if (r != null) return r;
+            }
+            return notFound(trimmed);
+        }
 
         // File-targeted path — see streaming variant for the rationale.
         java.util.Optional<String> scoped = detectFileScope(trimmed, allowedPaths);
@@ -595,22 +628,24 @@ public final class QueryEngine {
 
         List<SearchResult> matches = vectorStore.query(queryVector, TOP_K, allowedPaths);
 
-        if (matches.isEmpty()) {
-            log.info("VectorStore returned no matches");
-            return notFound(trimmed);
-        }
-
-        double bestDistance = matches.get(0).distance();
-        log.debug("Best match distance: {}", bestDistance);
-
-        if (bestDistance > RELEVANCE_THRESHOLD) {
-            log.info("No relevant chunks found (best distance: {})", bestDistance);
+        // Filename-anchored retrieval (see the streaming path): a file the question
+        // NAMES is the answer even when vector retrieval ranked it past the threshold.
+        List<String> namedFiles = entityNamedFiles(retrievalQuery, allowedPaths);
+        double bestDistance = matches.isEmpty() ? Double.MAX_VALUE : matches.get(0).distance();
+        if (namedFiles.isEmpty() && (matches.isEmpty() || bestDistance > RELEVANCE_THRESHOLD)) {
+            log.info("No relevant chunks found (best distance: {}, no named file)", bestDistance);
             return notFound(trimmed);
         }
 
         List<SearchResult> withinThreshold = matches.stream()
                 .filter(m -> m.distance() <= RELEVANCE_THRESHOLD)
-                .collect(Collectors.toList());
+                .collect(Collectors.toCollection(ArrayList::new));
+        for (String path : namedFiles) {                   // guarantee the named file is present
+            if (withinThreshold.stream().anyMatch(m -> path.equals(m.sourceFilePath()))) continue;
+            List<SearchResult> fc = vectorStore.getChunksForFile(path);
+            for (int i = 0; i < Math.min(fc.size(), MAX_CHUNKS_PER_FILE); i++) withinThreshold.add(fc.get(i));
+        }
+        if (withinThreshold.isEmpty()) return notFound(trimmed);
 
         // Hybrid focus: when the question names a distinctive entity/term, keep
         // only chunks that actually contain it — removes semantically-loose noise
@@ -1067,10 +1102,12 @@ public final class QueryEngine {
         String answer = (onToken == null)
                 ? llmClient.answer(question, chunks, history)
                 : llmClient.answerStream(question, chunks, history, onToken);
+        // If this ONE file couldn't answer, don't dead-end — fall through to semantic
+        // search + the filename anchor, which may pull the right file (the resolver
+        // can pick the wrong doc when a name matches several).
+        if (isFallbackAnswer(answer)) return null;
         history.add(question, answer);
-        return isFallbackAnswer(answer)
-                ? QueryResult.notFound(answer)
-                : QueryResult.found(answer, groupMatchesByFile(chunks, answer));
+        return QueryResult.found(answer, groupMatchesByFile(chunks, answer));
     }
 
     public void clearHistory() {
@@ -1338,6 +1375,9 @@ public final class QueryEngine {
             - A message asking for a money TOTAL alongside a count ("how many invoices
               and what's their total?") is the AMOUNTS aggregate (operation sum) — the
               money engine reports the count alongside the total.
+            - "list / show / who are all X", even "biggest first / ranked / sorted / in
+              order", is operation LIST (the list already comes largest-first).
+              operation max / min is ONLY for the SINGLE largest / smallest one.
             - A named person, company, or entity is almost always in the user's files:
               route "who is <name>" / "what is <name>" / "tell me about <name>" to
               LOOKUP, never UNCLEAR.
@@ -1677,6 +1717,34 @@ public final class QueryEngine {
             out.addAll(significantTokens(splitCamelAndDigits(r.getFileName())));
         }
         return out;
+    }
+
+    // Generic document-KIND words in filenames: they name a kind, not a specific file
+    // (every invoice shares "invoice"), so a match on these alone must not anchor.
+    private static final Set<String> DOC_TYPE_WORDS = Set.of(
+            "invoice", "invoices", "statement", "statements", "receipt", "receipts",
+            "bill", "bills", "notice", "notices", "letter", "form", "return", "returns",
+            "agreement", "lease", "contract", "report", "summary", "document", "scan",
+            "final", "copy", "note", "record", "records", "file", "docs");
+
+    /** Files the question NAMES: their filename shares a distinctive (non-doc-type)
+     *  token with the question — e.g. "the TechNova invoice" names the file whose name
+     *  contains "TechNova". Used to anchor retrieval so a named lookup always surfaces
+     *  its file even when vector similarity ranks it low. Empty when the question names
+     *  no specific file, or when it matches too many (a non-distinctive word). */
+    private List<String> entityNamedFiles(String question, java.util.Set<String> allowedPaths) {
+        if (question == null || metadataStore == null) return List.of();
+        Set<String> qTokens = significantTokens(question);   // already camelCase-split
+        qTokens.removeAll(DOC_TYPE_WORDS);
+        if (qTokens.isEmpty()) return List.of();
+        List<String> hits = new ArrayList<>();
+        for (FileRecord r : metadataStore.listIndexedFilesBySizeDesc()) {
+            if (!inScope(r.getAbsolutePath(), allowedPaths)) continue;
+            Set<String> fTokens = significantTokens(r.getFileName());
+            fTokens.removeAll(DOC_TYPE_WORDS);
+            if (!java.util.Collections.disjoint(fTokens, qTokens)) hits.add(r.getAbsolutePath());
+        }
+        return hits.size() <= 5 ? hits : List.of();   // >5 = not a specific named file
     }
 
     /** Lowercased word tokens (≥4 chars) that carry meaning — digits-only and

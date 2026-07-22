@@ -275,9 +275,14 @@ public final class SheetAggregator {
     private static boolean amountPasses(long amount, String range) {
         try {
             String r = range.trim();
-            long n = Long.parseLong(r.replaceAll("[^0-9]", ""));
-            if (r.startsWith(">")) return amount > n;
-            if (r.startsWith("<")) return amount < n;
+            if (r.startsWith(">")) return amount >  Long.parseLong(r.replaceAll("[^0-9]", ""));
+            if (r.startsWith("<")) return amount <  Long.parseLong(r.replaceAll("[^0-9]", ""));
+            if (r.matches(".*\\d\\s*-\\s*\\d.*")) {          // "1000-3000" = between (inclusive)
+                String[] p = r.split("-", 2);
+                long lo = Long.parseLong(p[0].replaceAll("[^0-9]", ""));
+                long hi = Long.parseLong(p[1].replaceAll("[^0-9]", ""));
+                return amount >= lo && amount <= hi;
+            }
             return true;
         } catch (Exception e) { return true; }
     }

@@ -1284,7 +1284,12 @@ public final class QueryEngine {
                           on my credit card", "my phone bill"): scope i_owe + the
                           category, NOT a single-item lookup. For a NUMERIC THRESHOLD
                           ("who owes me more than $3000?", "bills under $50") set
-                          "amount_range" to ">3000" or "<50" (operation list).
+                          "amount_range" to ">3000" or "<50"; a RANGE ("between $1000
+                          and $3000") is "1000-3000" (operation list).
+                          "accounts receivable", "what's outstanding", "what I'll
+                          collect", "who still owes" = money still owed → status
+                          UNPAID (NOT all/revenue). "how many owe me / still owe" =
+                          operation count over amounts (owed_to_me, status unpaid).
             • select "parties"  → the ROSTER across the collection: "how many / list
                           my clients / patients / vendors". Set "role":
                           "client"/"customer" for people the user SERVES (also
@@ -1400,6 +1405,12 @@ public final class QueryEngine {
               {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"sum","status":"unpaid","scope":"owed_to_me"}
             "do any clients owe me more than $3000?" →
               {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"list","status":"unpaid","scope":"owed_to_me","amount_range":">3000"}
+            "which clients owe me between $1000 and $3000?" →
+              {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"list","status":"unpaid","scope":"owed_to_me","amount_range":"1000-3000"}
+            "how many clients still owe me money?" →
+              {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"count","status":"unpaid","scope":"owed_to_me"}
+            "what's my accounts receivable total?" (outstanding, not billed) →
+              {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"sum","status":"unpaid","scope":"owed_to_me"}
             "who owes me the most?" →
               {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"max","status":"unpaid","scope":"owed_to_me"}
             "which clients have already paid?" →

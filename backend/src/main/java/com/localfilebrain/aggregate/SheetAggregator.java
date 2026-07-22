@@ -217,6 +217,13 @@ public final class SheetAggregator {
             total += shown;
             for (Doc d : group) if (!sources.contains(d.fileName)) sources.add(d.fileName);
         }
+        // Numeric threshold ("do any clients owe more than $3000?"): drop the rows
+        // that don't clear the bound and re-total.
+        if (q.amountRange() != null && !q.amountRange().isBlank()) {
+            rows.removeIf(r -> !amountPasses(Long.parseLong(r[2]), q.amountRange()));
+            total = 0;
+            for (String[] r : rows) total += Long.parseLong(r[2]);
+        }
         rows.sort((a, b) -> Long.compare(Long.parseLong(b[2]), Long.parseLong(a[2])));
         return renderRows(q, rows, total, sources);
     }
@@ -263,6 +270,18 @@ public final class SheetAggregator {
      *  model couldn't categorise ("other"/blank) is UNKNOWN — not "not this" — so a
      *  narrowing filter must NOT silently drop it (that hid a paid commission the model
      *  had filed as "other"). Only a doc firmly tagged a DIFFERENT category is excluded. */
+    /** Applies a numeric bound like ">3000" / "<500" to a client's amount. Unparseable
+     *  or empty → passes (no filter). */
+    private static boolean amountPasses(long amount, String range) {
+        try {
+            String r = range.trim();
+            long n = Long.parseLong(r.replaceAll("[^0-9]", ""));
+            if (r.startsWith(">")) return amount > n;
+            if (r.startsWith("<")) return amount < n;
+            return true;
+        } catch (Exception e) { return true; }
+    }
+
     private static boolean categoryMatch(Doc d, String category) {
         if (category == null || category.isBlank()) return true;
         String dc = lc(d.category), c = lc(category);

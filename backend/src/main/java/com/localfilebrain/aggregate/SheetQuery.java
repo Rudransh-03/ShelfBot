@@ -23,7 +23,8 @@ public record SheetQuery(
         String dateTo,          // dates: yyyy-MM-dd or ""
         String scope,           // amounts: "owed_to_me" | "i_owe" | "" (either direction)
         boolean obligationsOnly, // dates: true → only real deadlines, not record dates
-        String category) {       // filter to one money category (utility/rent/…), or ""
+        String category,         // filter to one money category (utility/rent/…), or ""
+        String amountRange) {    // amounts: ">3000" / "<500" numeric filter, or ""
 
     public enum Select { AMOUNTS, PARTIES, DOCUMENTS, DATES }
     public enum Op { SUM, COUNT, LIST, MAX, MIN, NONE }
@@ -31,6 +32,6 @@ public record SheetQuery(
     /** A non-aggregate plan: the question isn't corpus-wide, so RAG should answer. */
     public static SheetQuery passthrough(String rewrite) {
         return new SheetQuery(false, rewrite == null ? "" : rewrite,
-                Select.DOCUMENTS, Op.NONE, "", "", null, "", "", "", "", false, "");
+                Select.DOCUMENTS, Op.NONE, "", "", null, "", "", "", "", false, "", "");
     }
 }

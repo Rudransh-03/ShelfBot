@@ -1182,7 +1182,7 @@ public final class QueryEngine {
                                     String operation, String status, String role,
                                     Boolean isPersonal, String docType, String dateFrom,
                                     String dateTo, String scope, boolean obligationsOnly,
-                                    String category, java.util.List<String> parts) {
+                                    String category, String amountRange, java.util.List<String> parts) {
 
         /** Map the aggregate fields onto a {@link com.localfilebrain.aggregate.SheetQuery}
          *  (only valid when {@link #aggregate} is true). */
@@ -1203,7 +1203,7 @@ public final class QueryEngine {
             };
             return new com.localfilebrain.aggregate.SheetQuery(true, rewrite, sel, op,
                     status, role, isPersonal, docType, dateFrom, dateTo, scope,
-                    obligationsOnly, category);
+                    obligationsOnly, category, amountRange);
         }
     }
 
@@ -1220,7 +1220,7 @@ public final class QueryEngine {
             statements, receipts, salary slips, IDs, etc.). You may be given the
             recent conversation for context, then the user's new message. Decide how
             to handle the message and reply with ONLY a compact JSON object:
-            {"intent":"<INTENT>","subject":"<kind of document, or empty>","reply":"<text or empty>","rewrite":"<text or empty>","aggregate":true|false,"select":"amounts|parties|documents|dates","operation":"sum|count|list|max|min|none","status":"unpaid|paid|partial|owed|all|","role":"client|customer|vendor|supplier|provider|","is_personal":true|false|null,"doc_type":"","date_from":"","date_to":"","scope":"owed_to_me|i_owe|","obligations_only":true|false,"category":"","parts":[]}
+            {"intent":"<INTENT>","subject":"<kind of document, or empty>","reply":"<text or empty>","rewrite":"<text or empty>","aggregate":true|false,"select":"amounts|parties|documents|dates","operation":"sum|count|list|max|min|none","status":"unpaid|paid|partial|owed|all|","role":"client|customer|vendor|supplier|provider|","is_personal":true|false|null,"doc_type":"","date_from":"","date_to":"","scope":"owed_to_me|i_owe|","obligations_only":true|false,"category":"","amount_range":"","parts":[]}
 
             You are given TODAY'S DATE, then (optionally) the recent conversation,
             then the user's new message.
@@ -1282,7 +1282,9 @@ public final class QueryEngine {
                           credit_card/medical/tuition/…) for ONE spending category —
                           this holds even when phrased singular ("how much do I owe
                           on my credit card", "my phone bill"): scope i_owe + the
-                          category, NOT a single-item lookup.
+                          category, NOT a single-item lookup. For a NUMERIC THRESHOLD
+                          ("who owes me more than $3000?", "bills under $50") set
+                          "amount_range" to ">3000" or "<50" (operation list).
             • select "parties"  → the ROSTER across the collection: "how many / list
                           my clients / patients / vendors". Set "role":
                           "client"/"customer" for people the user SERVES (also
@@ -1396,6 +1398,8 @@ public final class QueryEngine {
             Examples (assume TODAY is 2026-07-14):
             "total unpaid fees across my clients" →
               {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"sum","status":"unpaid","scope":"owed_to_me"}
+            "do any clients owe me more than $3000?" →
+              {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"list","status":"unpaid","scope":"owed_to_me","amount_range":">3000"}
             "who owes me the most?" →
               {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"max","status":"unpaid","scope":"owed_to_me"}
             "which clients have already paid?" →
@@ -1456,7 +1460,7 @@ public final class QueryEngine {
 
     /** The classifier fallback used on any parse/LLM failure. */
     static final ClassifiedIntent DEFAULT_LOOKUP = new ClassifiedIntent(Intent.LOOKUP,
-            "", "", "", false, "", "", "", "", null, "", "", "", "", false, "", java.util.List.of());
+            "", "", "", false, "", "", "", "", null, "", "", "", "", false, "", "", java.util.List.of());
 
     /** Parse the classifier's JSON into a routing decision. Pure (no LLM), so a
      *  routing harness can drive it with live model output and it is unit-testable
@@ -1517,6 +1521,7 @@ public final class QueryEngine {
                     n.path("scope").asText("").trim().toLowerCase(),
                     n.path("obligations_only").asBoolean(false),
                     n.path("category").asText("").trim().toLowerCase(),
+                    n.path("amount_range").asText("").trim(),
                     parts);
         } catch (Exception e) {
             return DEFAULT_LOOKUP;
@@ -2133,11 +2138,14 @@ public final class QueryEngine {
                                           java.util.Set<String> allowedPaths,
                                           java.util.function.Consumer<String> onToken) {
         if (sheetExtractor == null || sheetAggregator == null) return null;
-        // A "list every document, no filter" plan is almost always a mis-classified
+        // A "LIST every document, no filter" plan is almost always a mis-classified
         // single-item lookup ("am I owed on the Pine St sale?"). Decline it so the
         // normal retrieval / corpus-overview path answers properly. A genuine "list my
-        // personal docs / my invoices" carries a filter and is unaffected.
+        // personal docs / my invoices" carries a filter and is unaffected. But a bare
+        // "how many documents do I have?" (COUNT) is a legit total — let it count every
+        // doc deterministically instead of a prose path that miscounts.
         if (q.select() == com.localfilebrain.aggregate.SheetQuery.Select.DOCUMENTS
+                && q.op() != com.localfilebrain.aggregate.SheetQuery.Op.COUNT
                 && q.isPersonal() == null && q.docType().isBlank()
                 && q.dateFrom().isBlank() && q.dateTo().isBlank()) return null;
 

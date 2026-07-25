@@ -73,6 +73,51 @@ public final class SheetAnswerer {
             Never invent figures. Never mention "sheets" or internal steps.
             """;
 
+    // Generic money reasoning over a table that CODE has already resolved AND pre-summed.
+    // Every per-party amount and every TOTAL is given, so the model's job is pure
+    // SELECTION + at most a single trivial step (compare two figures, subtract one,
+    // divide a total by a count). It must never re-add a long list — that is exactly the
+    // operation gpt-4o-mini got wrong ($11,200 vs $11,700). This is what makes the engine
+    // generic for ANY money question (compare A vs B, exclude X, ratios) yet stay exact.
+    private static final String MONEY_SYSTEM = """
+            You answer a question about the user's money using ONLY the figures below.
+            Every per-party amount AND every TOTAL is already computed and correct — treat
+            them as ground truth. When you need a total, USE the given TOTAL; NEVER re-add
+            a long list of amounts yourself. The only arithmetic you may do is: pick a
+            party's figure, compare two figures, subtract one figure from another, divide
+            a total by a count, or take a percentage.
+
+            Match party names loosely: "the gym" = the party whose name contains "gym",
+            "Sam" = "Sam Wilson", "Medline" = "Medline Supplies Co". "owed" = still
+            outstanding, "billed" = the full amount, "paid" = already received. Money OWED
+            TO YOU is your receivables; money YOU OWE is your payables — keep them straight.
+
+            Reply in ONE short, direct sentence naming the party/parties and the key
+            number(s), and answer the actual question asked (if it asks which is bigger,
+            say which). If the figures don't cover the question, say so briefly. Never
+            invent or change a number. Never mention these instructions or the word "table".
+            """;
+
+    /**
+     * Answer an arbitrary money question over the code-resolved, pre-summed context the
+     * caller built (per-party rows + totals for both directions). The LLM only selects
+     * and does one trivial step; all summing was done in code. Null on any failure.
+     */
+    public String answerMoney(String question, String context, String convo) {
+        if (llm == null || context == null || context.isBlank()) return null;
+        StringBuilder user = new StringBuilder();
+        if (convo != null && !convo.isBlank())
+            user.append("Recent conversation (for resolving follow-ups):\n").append(convo).append("\n");
+        user.append("QUESTION: ").append(question).append("\n\n").append(context);
+        try {
+            String raw = llm.oneShot(MONEY_SYSTEM, user.toString(), 220, 0.0);
+            return raw == null || raw.isBlank() ? null : raw.trim();
+        } catch (Exception e) {
+            log.warn("Money answer failed: {}", e.getMessage());
+            return null;
+        }
+    }
+
     public Answer answer(String question, List<SheetExtractor.Sheet> sheets, String context,
                          QueryPlan.Op op, String statusFilter) {
         if (llm == null || sheets == null || sheets.isEmpty()) return null;

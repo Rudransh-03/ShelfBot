@@ -28,11 +28,13 @@ public record SheetQuery(
         String dateType) {       // dates: payment/renewal/filing/appointment kind, or ""
 
     public enum Select { AMOUNTS, PARTIES, DOCUMENTS, DATES }
-    // AVERAGE / COMPARE / DIFFERENCE: the open calculations the plain menu lacked. The
-    // LLM only NAMES which one (routing); code resolves the exact per-party table and
-    // does the arithmetic itself — a live test proved gpt-4o-mini mis-adds even 6
-    // correct figures, so the math must never be delegated to it.
-    public enum Op { SUM, COUNT, LIST, MAX, MIN, AVERAGE, COMPARE, DIFFERENCE, NONE }
+    // AVERAGE stays deterministic (sum ÷ count). COMPARE / DIFFERENCE / COMPUTE are the
+    // OPEN tail — comparing two named parties, excluding one, ratios, any reasoning the
+    // fixed menu can't name. For those, code resolves AND pre-sums the whole money table
+    // (every total given), then the LLM answers with only trivial arithmetic on those
+    // correct figures — never re-adding a long list (what made the model mis-total). One
+    // generic path for any money question, so no phrasing falls through a menu gap.
+    public enum Op { SUM, COUNT, LIST, MAX, MIN, AVERAGE, COMPARE, DIFFERENCE, COMPUTE, NONE }
 
     /** A non-aggregate plan: the question isn't corpus-wide, so RAG should answer. */
     public static SheetQuery passthrough(String rewrite) {

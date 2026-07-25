@@ -1202,6 +1202,8 @@ public final class QueryEngine {
                 case "average", "avg", "mean" -> com.localfilebrain.aggregate.SheetQuery.Op.AVERAGE;
                 case "compare", "comparison", "versus", "vs" -> com.localfilebrain.aggregate.SheetQuery.Op.COMPARE;
                 case "difference", "diff", "gap", "subtract" -> com.localfilebrain.aggregate.SheetQuery.Op.DIFFERENCE;
+                case "compute", "ratio", "percent", "percentage", "exclude", "other"
+                             -> com.localfilebrain.aggregate.SheetQuery.Op.COMPUTE;
                 case "none"  -> com.localfilebrain.aggregate.SheetQuery.Op.NONE;
                 default      -> com.localfilebrain.aggregate.SheetQuery.Op.LIST;
             };
@@ -1224,7 +1226,7 @@ public final class QueryEngine {
             statements, receipts, salary slips, IDs, etc.). You may be given the
             recent conversation for context, then the user's new message. Decide how
             to handle the message and reply with ONLY a compact JSON object:
-            {"intent":"<INTENT>","subject":"<kind of document, or empty>","reply":"<text or empty>","rewrite":"<text or empty>","aggregate":true|false,"select":"amounts|parties|documents|dates","operation":"sum|count|list|max|min|average|compare|difference|none","status":"unpaid|paid|partial|owed|all|","role":"client|customer|vendor|supplier|provider|","is_personal":true|false|null,"doc_type":"","date_from":"","date_to":"","scope":"owed_to_me|i_owe|","obligations_only":true|false,"category":"","amount_range":"","date_type":"payment|renewal|filing|appointment|","parts":[]}
+            {"intent":"<INTENT>","subject":"<kind of document, or empty>","reply":"<text or empty>","rewrite":"<text or empty>","aggregate":true|false,"select":"amounts|parties|documents|dates","operation":"sum|count|list|max|min|average|compare|difference|compute|none","status":"unpaid|paid|partial|owed|all|","role":"client|customer|vendor|supplier|provider|","is_personal":true|false|null,"doc_type":"","date_from":"","date_to":"","scope":"owed_to_me|i_owe|","obligations_only":true|false,"category":"","amount_range":"","date_type":"payment|renewal|filing|appointment|","parts":[]}
 
             You are given TODAY'S DATE, then (optionally) the recent conversation,
             then the user's new message.
@@ -1297,16 +1299,22 @@ public final class QueryEngine {
                           collect", "who still owes" = money still owed → status
                           UNPAID (NOT all/revenue). "how many owe me / still owe" =
                           operation count over amounts (owed_to_me, status unpaid).
-                          For a money calculation the plain ops can't express, pick:
-                          "average" (the mean, e.g. "average my clients owe me"),
-                          "compare" (weigh two groups, e.g. "do clients owe me more than
-                          I owe others?"), or "difference" (the gap between the biggest
-                          and smallest, or a subtraction). For compare/difference set
-                          "scope" to the direction — owed_to_me or i_owe — but LEAVE it
-                          "" for a comparison that spans BOTH sides (receivables vs
-                          payables). Still set "status" as usual. Do NOT use these for a
-                          plain total (sum), a plain count, or the single largest/
-                          smallest (max/min).
+                          For money reasoning the plain ops can't express, pick:
+                          "average" (the mean, e.g. "average my clients owe me");
+                          "compare" to weigh TWO things against each other — two
+                          DIRECTIONS ("do clients owe me more than I owe others?") OR two
+                          SPECIFIC named parties/items ("do I owe more to the gym or the
+                          vet?", "who owes more, Sam or Nina?", "which costs more, rent or
+                          supplies?"); "difference" for the gap between biggest and
+                          smallest; or "compute" for ANYTHING ELSE over the amounts — an
+                          exclusion ("excluding Acme, how much am I owed?"), a ratio or
+                          percentage, or any other money reasoning that isn't a plain
+                          total/count/list/largest/smallest. For compare/compute that
+                          names specific parties or spans both sides, LEAVE "scope" ""
+                          (the engine is handed the full both-sides picture); set it
+                          owed_to_me / i_owe only when the WHOLE question is clearly one
+                          side. Still set "status". Do NOT use these for a plain total
+                          (sum), a plain count, or the single largest/smallest (max/min).
             • select "parties"  → the ROSTER across the collection: "how many / list
                           my clients / patients / vendors". Set "role":
                           "client"/"customer" for people the user SERVES (also
@@ -1471,6 +1479,12 @@ public final class QueryEngine {
               {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"average","status":"unpaid","scope":"owed_to_me"}
             "do my clients owe me more than I owe others?" (both directions) →
               {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"compare","status":"unpaid","scope":""}
+            "do I owe more to the gym or the vet?" (two named payees) →
+              {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"compare","status":"unpaid","scope":""}
+            "who owes me more, Aurora or Delgado?" (two named clients) →
+              {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"compare","status":"unpaid","scope":""}
+            "excluding Blue Ridge, how much do my clients owe me?" →
+              {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"compute","status":"unpaid","scope":"owed_to_me"}
             "how much more does my biggest client owe than my smallest?" →
               {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"difference","status":"unpaid","scope":"owed_to_me"}
             "how much would I collect if everyone paid up?" →
@@ -2213,7 +2227,15 @@ public final class QueryEngine {
 
         String qtext = q.rewrite() == null || q.rewrite().isBlank() ? question : q.rewrite();
 
-        List<com.localfilebrain.aggregate.SheetExtractor.Sheet> sheets = sheetExtractor.ensureSheets(allowedPaths);
+        // A money roll-up ("total owed", "who owes more, A or B", "excluding X…") is
+        // inherently CROSS-client — it's the user's whole financial picture, and naming
+        // clients in the question is for SELECTION, not scope. So AMOUNTS always resolves
+        // over the FULL corpus; the active per-client scope (meant for content lookups
+        // about ONE client) would wrongly shrink the table to that client's lone doc and
+        // drop the others (a live miss: "who owes more, Aurora or Delgado" saw only 1).
+        java.util.Set<String> sheetScope =
+                q.select() == com.localfilebrain.aggregate.SheetQuery.Select.AMOUNTS ? null : allowedPaths;
+        List<com.localfilebrain.aggregate.SheetExtractor.Sheet> sheets = sheetExtractor.ensureSheets(sheetScope);
         if (sheets.isEmpty()) return null;                         // nothing indexed → let RAG try
 
         // Money questions: lazily give the ambiguous bills a canonical amount-role tag
@@ -2229,14 +2251,15 @@ public final class QueryEngine {
                 && q.dateType() != null && !q.dateType().isBlank())
             sheets = sheetExtractor.ensureDateTypes(sheets);
 
-        // Open calculation (average / compare / difference): the fixed calculator can't
-        // express it, so resolve the EXACT per-party money table and do the arithmetic
-        // in CODE (never the LLM — a live test showed gpt-4o-mini mis-adds even correct
-        // figures). The classifier only NAMED the operation; code computes it exactly.
+        // Open money reasoning (average / compare / difference / compute): average is
+        // done in code; the rest go to the generic answerer over a code-resolved,
+        // pre-summed table. Handles arbitrary questions (compare two named parties,
+        // exclude one, ratios) without a fixed-menu gap, while all summing stays in code.
         if (q.select() == com.localfilebrain.aggregate.SheetQuery.Select.AMOUNTS
                 && (q.op() == com.localfilebrain.aggregate.SheetQuery.Op.AVERAGE
                  || q.op() == com.localfilebrain.aggregate.SheetQuery.Op.COMPARE
-                 || q.op() == com.localfilebrain.aggregate.SheetQuery.Op.DIFFERENCE)) {
+                 || q.op() == com.localfilebrain.aggregate.SheetQuery.Op.DIFFERENCE
+                 || q.op() == com.localfilebrain.aggregate.SheetQuery.Op.COMPUTE)) {
             QueryResult computed = runMoneyCompute(q, qtext, sheets, onToken);
             if (computed != null) return computed;
             // fall through to the normal aggregate render if there was nothing to compute
@@ -2270,37 +2293,22 @@ public final class QueryEngine {
     }
 
     /**
-     * Open money calculation (average / compare / difference) done ENTIRELY in code
-     * over the exact per-party table. The classifier only named the operation; a live
-     * test proved the LLM mis-adds even correct figures, so no arithmetic is delegated.
-     * Returns null when there's nothing to compute (caller falls back to the normal
-     * render). "owed" figures use the still-owed column; total EARNED/billed questions
-     * (status "all") use the billed column.
+     * Money reasoning. AVERAGE is a plain sum ÷ count, done in code. Everything OPEN —
+     * COMPARE (incl. two specific named parties), DIFFERENCE, and the COMPUTE catch-all
+     * (exclusions, ratios, any reasoning) — is answered by the LLM over a table that CODE
+     * has already resolved AND pre-summed: it only selects rows and does one trivial step
+     * (compare / subtract-one / divide-a-total), never re-adding a long list. That keeps
+     * it generic for ANY money question yet exact, since all summing stays in code.
      */
     private QueryResult runMoneyCompute(com.localfilebrain.aggregate.SheetQuery q, String qtext,
                                         List<com.localfilebrain.aggregate.SheetExtractor.Sheet> sheets,
                                         java.util.function.Consumer<String> onToken) {
         boolean billedCol = "all".equals(q.status());                  // else the still-owed column
-        boolean payDir = q.scope() != null && q.scope().contains("i_owe");
         List<String> srcNames = new ArrayList<>();
         String text;
 
-        if (q.op() == com.localfilebrain.aggregate.SheetQuery.Op.COMPARE) {
-            // Cross-direction: what others owe you vs what you owe others.
-            List<com.localfilebrain.aggregate.SheetAggregator.ClientMoney> recv =
-                    sheetAggregator.moneyTable(sheets, ownerNames, true, q.category());
-            List<com.localfilebrain.aggregate.SheetAggregator.ClientMoney> pay =
-                    sheetAggregator.moneyTable(sheets, ownerNames, false, q.category());
-            long recvTotal = sumCol(recv, billedCol, srcNames);
-            long payTotal  = sumCol(pay,  billedCol, srcNames);
-            if (recv.isEmpty() && pay.isEmpty()) return null;
-            long diff = Math.abs(recvTotal - payTotal);
-            String verb = recvTotal > payTotal ? "more than you owe others"
-                        : recvTotal < payTotal ? "less than you owe others" : "exactly what you owe others";
-            text = "Your clients owe you " + MoneyFormat.format(recvTotal)
-                 + " and you owe others " + MoneyFormat.format(payTotal) + " — you're owed "
-                 + verb + (diff == 0 ? "." : ", a difference of " + MoneyFormat.format(diff) + ".");
-        } else {
+        if (q.op() == com.localfilebrain.aggregate.SheetQuery.Op.AVERAGE) {
+            boolean payDir = q.scope() != null && q.scope().contains("i_owe");
             List<com.localfilebrain.aggregate.SheetAggregator.ClientMoney> rows =
                     sheetAggregator.moneyTable(sheets, ownerNames, !payDir, q.category());
             // Only parties with a non-zero figure in the relevant column count — a
@@ -2308,21 +2316,22 @@ public final class QueryEngine {
             List<com.localfilebrain.aggregate.SheetAggregator.ClientMoney> nz = new ArrayList<>();
             for (var m : rows) if ((billedCol ? m.billed() : m.owed()) > 0) nz.add(m);
             if (nz.isEmpty()) return null;
-
-            if (q.op() == com.localfilebrain.aggregate.SheetQuery.Op.AVERAGE) {
-                long sum = sumCol(nz, billedCol, srcNames);
-                long avg = Math.round((double) sum / nz.size());
-                text = "The average is " + MoneyFormat.format(avg) + " across " + nz.size()
-                     + (nz.size() == 1 ? " party" : " parties") + " (total " + MoneyFormat.format(sum) + ").";
-            } else {   // DIFFERENCE — spread between the biggest and smallest
-                nz.sort((a, b) -> Long.compare(col(b, billedCol), col(a, billedCol)));
-                var top = nz.get(0); var bot = nz.get(nz.size() - 1);
-                for (var m : nz) for (String s : m.sources()) if (!srcNames.contains(s)) srcNames.add(s);
-                long diff = col(top, billedCol) - col(bot, billedCol);
-                text = "**" + top.name() + "** (" + MoneyFormat.format(col(top, billedCol)) + ") vs **"
-                     + bot.name() + "** (" + MoneyFormat.format(col(bot, billedCol)) + ") — a difference of "
-                     + MoneyFormat.format(diff) + ".";
-            }
+            long sum = sumCol(nz, billedCol, srcNames);
+            long avg = Math.round((double) sum / nz.size());
+            text = "The average is " + MoneyFormat.format(avg) + " across " + nz.size()
+                 + (nz.size() == 1 ? " party" : " parties") + " (total " + MoneyFormat.format(sum) + ").";
+        } else {
+            // COMPARE / DIFFERENCE / COMPUTE — resolve AND pre-sum the whole money picture,
+            // then let the LLM answer with trivial arithmetic on those correct figures.
+            StringBuilder ctx = new StringBuilder();
+            appendMoneySection(ctx, "Money OWED TO YOU (your clients / receivables)",
+                    sheetAggregator.moneyTable(sheets, ownerNames, true, q.category()), srcNames);
+            appendMoneySection(ctx, "Money YOU OWE (your vendors / payables)",
+                    sheetAggregator.moneyTable(sheets, ownerNames, false, q.category()), srcNames);
+            if (ctx.length() == 0) return null;
+            String ans = sheetAnswerer.answerMoney(qtext, ctx.toString(), plannerContext());
+            if (ans == null || ans.isBlank()) return null;
+            text = ans;
         }
 
         java.util.Map<String, String> nameToPath = new java.util.HashMap<>();
@@ -2332,14 +2341,33 @@ public final class QueryEngine {
             String p = nameToPath.get(name);
             if (p != null) chips.add(new Source(name, p, List.of(), List.of()));
         }
-        log.info("Intent: AGGREGATE (sheets={}, op={}) — money compute (code)", sheets.size(), q.op());
+        log.info("Intent: AGGREGATE (sheets={}, op={}) — money compute", sheets.size(), q.op());
         if (onToken != null) onToken.accept(text);
         history.add(qtext, text);
         return QueryResult.found(text, chips);
     }
 
-    private static long col(com.localfilebrain.aggregate.SheetAggregator.ClientMoney m, boolean billed) {
-        return billed ? m.billed() : m.owed();
+    /** One direction's per-party rows PLUS the code-computed totals/counts, so the LLM
+     *  answerer never has to sum a list itself — it reads the total off the block. */
+    private static void appendMoneySection(StringBuilder sb, String title,
+                                           List<com.localfilebrain.aggregate.SheetAggregator.ClientMoney> rows,
+                                           List<String> srcNames) {
+        if (rows == null || rows.isEmpty()) return;
+        long owedTotal = 0, billedTotal = 0, owingCount = 0;
+        sb.append(title).append(":\n");
+        for (com.localfilebrain.aggregate.SheetAggregator.ClientMoney m : rows) {
+            sb.append("- ").append(m.name())
+              .append(": billed ").append(MoneyFormat.format(m.billed()))
+              .append(", paid ").append(MoneyFormat.format(m.paid()))
+              .append(", still owed ").append(MoneyFormat.format(m.owed())).append('\n');
+            owedTotal += m.owed(); billedTotal += m.billed();
+            if (m.owed() > 0) owingCount++;
+            for (String s : m.sources()) if (!srcNames.contains(s)) srcNames.add(s);
+        }
+        sb.append("TOTAL still owed: ").append(MoneyFormat.format(owedTotal))
+          .append(" (").append(owingCount).append(" of ").append(rows.size()).append(" have a balance); ")
+          .append("TOTAL billed: ").append(MoneyFormat.format(billedTotal))
+          .append(" across ").append(rows.size()).append(".\n\n");
     }
 
     /** Sum one column across rows, collecting each contributing file for the chips. */

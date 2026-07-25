@@ -27,13 +27,21 @@ public final class SheetAggregator {
 
     public record Result(String text, List<String> sources) {}
 
+    /** One party's fully-resolved money, computed in code (netted, payments applied,
+     *  settled bills excluded). This is the "100% correct" figure set handed to the LLM
+     *  for open calculations (average / compare / difference) it must not re-derive. */
+    public record ClientMoney(String name, long billed, long paid, long owed, List<String> sources) {}
+
     // ── parsed view of one sheet ─────────────────────────────────────────────
     private record Party(String name, String role, String side) {}
     // role = the model's canonical tag for what this amount IS (charge|payment|
     // deposit|balance|refund|estimate|other), filled lazily for ambiguous docs. Blank
     // when untagged → the aggregator falls back to label keywords.
     private record Amount(double value, String status, String label, String role) {}
-    private record Dated(String label, String date, boolean deadline) {}
+    // type = the model's canonical kind for the date (payment_due|renewal|filing|
+    // appointment|other), filled lazily so "payment due dates" filters cleanly instead
+    // of guessing from free-text labels. Blank when untagged → falls back to the label.
+    private record Dated(String label, String date, boolean deadline, String type) {}
     private static final class Doc {
         String fileName, docType, title, gist, category = "";
         boolean isPersonal;
@@ -55,6 +63,21 @@ public final class SheetAggregator {
      *   consumer, which is exactly why a configured identity is preferred.
      */
     public Result run(SheetQuery q, List<SheetExtractor.Sheet> sheets, java.util.Collection<String> ownerNames) {
+        Prepared p = prepare(sheets, ownerNames);
+        if (p == null) return null;
+        return switch (q.select()) {
+            case AMOUNTS   -> amounts(q, p.docs(), p.ownerKeys());
+            case PARTIES   -> parties(q, p.docs(), p.ownerKeys());
+            case DOCUMENTS -> documents(q, p.docs());
+            case DATES     -> dates(q, p.docs());
+        };
+    }
+
+    /** The parsed corpus plus the resolved owner identity — the shared setup that both
+     *  {@link #run} and {@link #moneyTable} need. Null when nothing parses. */
+    private record Prepared(List<Doc> docs, Set<String> ownerKeys) {}
+
+    private Prepared prepare(List<SheetExtractor.Sheet> sheets, java.util.Collection<String> ownerNames) {
         List<Doc> docs = new ArrayList<>();
         for (SheetExtractor.Sheet s : sheets) {
             Doc d = parse(s.json(), s.fileName());
@@ -71,13 +94,26 @@ public final class SheetAggregator {
 
         String ownerFirm = detectOwnerFirm(docs);
         for (Doc d : docs) d.counterparty = counterpartyOf(d, ownerFirm);
+        return new Prepared(docs, ownerKeys);
+    }
 
-        return switch (q.select()) {
-            case AMOUNTS   -> amounts(q, docs, ownerKeys);
-            case PARTIES   -> parties(q, docs, ownerKeys);
-            case DOCUMENTS -> documents(q, docs);
-            case DATES     -> dates(q, docs);
-        };
+    /**
+     * The exact per-party money table for one direction — the same resolution the
+     * AMOUNTS aggregate uses (grouping name variants, netting partial payments,
+     * excluding settled bills), exposed as structured figures. Fed to the LLM for
+     * open calculations (average, compare, difference) so it computes over correct
+     * numbers instead of re-deciding which amounts count.
+     *
+     * @param owedToMe true = the user's receivables (money others owe them);
+     *                 false = the user's payables (money they owe others).
+     * @param category one money category to filter to, or "" for all.
+     */
+    public List<ClientMoney> moneyTable(List<SheetExtractor.Sheet> sheets,
+                                        java.util.Collection<String> ownerNames,
+                                        boolean owedToMe, String category) {
+        Prepared p = prepare(sheets, ownerNames);
+        if (p == null) return List.of();
+        return perClientMoney(p.docs(), p.ownerKeys(), owedToMe, category == null ? "" : category);
     }
 
     private static boolean isOwner(String name, Set<String> ownerKeys) {
@@ -96,20 +132,67 @@ public final class SheetAggregator {
 
     // ── AMOUNTS: money owed / paid, grouped by client ────────────────────────
     private Result amounts(SheetQuery q, List<Doc> docs, Set<String> ownerKeys) {
-        // One owed/paid figure per client, netting partial payments and excluding
-        // fully-settled invoices. Grouped by a NORMALISED client name so an invoice
-        // ("Blue Ridge Landscaping LLC") and its follow-up note ("Blue Ridge
-        // Landscaping") land together, and so does a separate payment confirmation.
-        // Direction: "owed_to_me" (the user's receivables) counts only groups with a
-        // real client/customer party; "i_owe" / unset counts every bill, including
-        // the user's own personal bills. This is what keeps the engine generic — the
-        // is_personal flag no longer gates money, the question's direction does.
         boolean owedToMe = q.scope() != null && q.scope().contains("owed_to_me");
+        boolean wantAll  = q.status().equals("all");   // total earned/billed = paid + owed
+        // "paid" OR "partial" → the paid path (a partial payer HAS paid something); the
+        // partial ones are labelled. "unpaid" stays the outstanding path.
+        boolean wantPaid = !wantAll && (q.status().contains("paid") || q.status().contains("partial"))
+                && !q.status().contains("un");
+        List<String[]> rows = new ArrayList<>();               // {client, formattedAmount, rawAmount}
+        List<String> sources = new ArrayList<>();
+        long total = 0;
+
+        for (ClientMoney m : perClientMoney(docs, ownerKeys, owedToMe, q.category())) {
+            long billed = m.billed(), paid = m.paid(), owed = m.owed();
+            long shown; String amtStr; boolean include;
+            if (wantAll) {                       // total billed = what's paid PLUS still owed
+                shown = billed; include = billed > 0;
+                amtStr = MoneyFormat.format(billed);
+            } else if (wantPaid) {               // paid at all — in full, or partial (called out)
+                include = paid > 0;
+                if (owed > 0) {                  // partially paid — state it explicitly
+                    shown = paid;
+                    amtStr = MoneyFormat.format(paid) + " paid, " + MoneyFormat.format(owed) + " still owed (partial)";
+                } else {                         // paid in full
+                    shown = billed; amtStr = MoneyFormat.format(billed);
+                }
+            } else {                             // unpaid / outstanding
+                include = owed > 0; shown = owed; amtStr = MoneyFormat.format(owed);
+            }
+            if (!include) continue;
+            rows.add(new String[]{m.name(), amtStr, String.valueOf(shown)});
+            total += shown;
+            for (String s : m.sources()) if (!sources.contains(s)) sources.add(s);
+        }
+        // Numeric threshold ("do any clients owe more than $3000?"): drop the rows
+        // that don't clear the bound and re-total.
+        if (q.amountRange() != null && !q.amountRange().isBlank()) {
+            rows.removeIf(r -> !amountPasses(Long.parseLong(r[2]), q.amountRange()));
+            total = 0;
+            for (String[] r : rows) total += Long.parseLong(r[2]);
+        }
+        rows.sort((a, b) -> Long.compare(Long.parseLong(b[2]), Long.parseLong(a[2])));
+        return renderRows(q, rows, total, sources);
+    }
+
+    /**
+     * The resolved money per party for one direction — the single source of truth the
+     * AMOUNTS render and the LLM compute path both read. One owed/paid/billed figure
+     * per client, netting partial payments and excluding fully-settled invoices.
+     * Grouped by a NORMALISED client name so an invoice ("Blue Ridge Landscaping LLC")
+     * and its follow-up note ("Blue Ridge Landscaping") land together, and so does a
+     * separate payment confirmation. Direction: "owed_to_me" (the user's receivables)
+     * counts only groups with a real client/customer party; "i_owe" counts every bill,
+     * including the user's own personal bills — the is_personal flag never gates money,
+     * the direction does.
+     */
+    private List<ClientMoney> perClientMoney(List<Doc> docs, Set<String> ownerKeys,
+                                             boolean owedToMe, String category) {
         Map<String, List<Doc>> byClient = new LinkedHashMap<>();
         Map<String, String> display = new LinkedHashMap<>();
         Set<String> clientKeys = new java.util.HashSet<>();
         for (Doc d : docs) {
-            if (!categoryMatch(d, q.category())) continue;    // "utility bills" etc.
+            if (!categoryMatch(d, category)) continue;         // "utility bills" etc.
             // is_personal is too fuzzy to gate money (a clinic's patient invoice gets
             // mislabeled "personal"). Direction + side + owner-exclusion do the gating:
             // a receivable is only counted for a group that has a real client party
@@ -123,15 +206,7 @@ public final class SheetAggregator {
             if (hasClientParty(d, ownerKeys)) clientKeys.add(key);
         }
 
-        boolean wantAll  = q.status().equals("all");   // total earned/billed = paid + owed
-        // "paid" OR "partial" → the paid path (a partial payer HAS paid something); the
-        // partial ones are labelled. "unpaid" stays the outstanding path.
-        boolean wantPaid = !wantAll && (q.status().contains("paid") || q.status().contains("partial"))
-                && !q.status().contains("un");
-        List<String[]> rows = new ArrayList<>();               // {client, formattedAmount, rawAmount}
-        List<String> sources = new ArrayList<>();
-        long total = 0;
-
+        List<ClientMoney> out = new ArrayList<>();
         for (Map.Entry<String, List<Doc>> e : byClient.entrySet()) {
             if (owedToMe && !clientKeys.contains(e.getKey())) continue;   // receivables only
             List<Doc> group = e.getValue();
@@ -196,36 +271,11 @@ public final class SheetAggregator {
             // sidesteps a charge that was mislabeled "paid" (we never trust that figure).
             long billed = Math.max(owed, Math.round(balance != null ? maxFace : sumFace));
             long paid = billed - owed;
-
-            long shown; String amtStr; boolean include;
-            if (wantAll) {                       // total billed = what's paid PLUS still owed
-                shown = billed; include = billed > 0;
-                amtStr = MoneyFormat.format(billed);
-            } else if (wantPaid) {               // paid at all — in full, or partial (called out)
-                include = paid > 0;
-                if (owed > 0) {                  // partially paid — state it explicitly
-                    shown = paid;
-                    amtStr = MoneyFormat.format(paid) + " paid, " + MoneyFormat.format(owed) + " still owed (partial)";
-                } else {                         // paid in full
-                    shown = billed; amtStr = MoneyFormat.format(billed);
-                }
-            } else {                             // unpaid / outstanding
-                include = owed > 0; shown = owed; amtStr = MoneyFormat.format(owed);
-            }
-            if (!include) continue;
-            rows.add(new String[]{display.get(e.getKey()), amtStr, String.valueOf(shown)});
-            total += shown;
-            for (Doc d : group) if (!sources.contains(d.fileName)) sources.add(d.fileName);
+            List<String> gsrc = new ArrayList<>();
+            for (Doc d : group) if (!gsrc.contains(d.fileName)) gsrc.add(d.fileName);
+            out.add(new ClientMoney(display.get(e.getKey()), billed, paid, owed, gsrc));
         }
-        // Numeric threshold ("do any clients owe more than $3000?"): drop the rows
-        // that don't clear the bound and re-total.
-        if (q.amountRange() != null && !q.amountRange().isBlank()) {
-            rows.removeIf(r -> !amountPasses(Long.parseLong(r[2]), q.amountRange()));
-            total = 0;
-            for (String[] r : rows) total += Long.parseLong(r[2]);
-        }
-        rows.sort((a, b) -> Long.compare(Long.parseLong(b[2]), Long.parseLong(a[2])));
-        return renderRows(q, rows, total, sources);
+        return out;
     }
 
     /** The largest genuine "owed" amount on a bill in the group (ignores partial
@@ -255,6 +305,31 @@ public final class SheetAggregator {
     // A date label that plainly names a future obligation to meet/attend — a safety
     // net for when the model's per-date deadline flag misses one. Excludes record
     // words (issued/paid) by only matching obligation words.
+    /** True when a date matches the requested KIND (payment_due / renewal / filing /
+     *  appointment). Prefers the model's canonical {@code type}; when a date is untagged
+     *  or "other", falls back to label keywords so nothing is silently dropped. Empty
+     *  request → always true (no kind filter). */
+    private static boolean dateTypeMatches(Dated dt, String requested) {
+        if (requested == null || requested.isBlank()) return true;
+        String req = lc(requested);
+        String base = req.contains("payment") ? "payment_due"
+                    : (req.contains("renew") || req.contains("expir")) ? "renewal"
+                    : req.contains("fil") ? "filing"
+                    : (req.contains("appoint") || req.contains("meeting") || req.contains("hearing")) ? "appointment"
+                    : req;
+        String t = lc(dt.type());
+        if (!t.isBlank() && !t.equals("other"))
+            return t.contains(base) || base.contains(t) || t.contains(req);
+        String lb = lc(dt.label());   // untagged → label fallback
+        return switch (base) {
+            case "payment_due" -> lb.contains("payment") || lb.contains("invoice") || lb.contains("bill") || lb.contains("due");
+            case "renewal"     -> lb.contains("renew") || lb.contains("expir");
+            case "filing"      -> lb.contains("fil") || lb.contains("return") || lb.contains("submiss");
+            case "appointment" -> lb.contains("appoint") || lb.contains("hearing") || lb.contains("exam") || lb.contains("meeting");
+            default            -> true;
+        };
+    }
+
     private static boolean isObligationLabel(String label) {
         String l = lc(label);
         // No bare "payment" — it also matches "payment received" (a record). A real
@@ -522,6 +597,9 @@ public final class SheetAggregator {
             // plainly names an obligation (exam, hearing, due, renewal…) the flag
             // sometimes misses — never a record date (issued/paid).
             if (q.obligationsOnly() && !dt.deadline() && !isObligationLabel(dt.label())) continue;
+            // Date KIND filter ("payment due dates" vs "renewals"): match the model's
+            // canonical type; fall back to the label only when the date is untagged.
+            if (!dateTypeMatches(dt, q.dateType())) continue;
             if (!q.dateFrom().isBlank() && dt.date().compareTo(q.dateFrom()) < 0) continue;
             if (!q.dateTo().isBlank() && dt.date().compareTo(q.dateTo()) > 0) continue;
             String label = (d.title == null || d.title.isBlank() ? d.fileName : d.title)
@@ -654,7 +732,7 @@ public final class SheetAggregator {
             JsonNode dt = n.get("dates");
             if (dt != null && dt.isArray()) for (JsonNode x : dt)
                 d.dates.add(new Dated(x.path("label").asText(""), x.path("date").asText(""),
-                        x.path("deadline").asBoolean(false)));
+                        x.path("deadline").asBoolean(false), x.path("type").asText("")));
             return d;
         } catch (Exception e) {
             log.warn("Could not parse sheet for '{}': {}", fileName, e.getMessage());

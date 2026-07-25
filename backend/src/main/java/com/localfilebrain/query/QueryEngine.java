@@ -555,7 +555,7 @@ public final class QueryEngine {
 
         logChunksGoingToLlm(relevantMatches);
         String answer = llmClient.answerStream(trimmed, relevantMatches, history,
-                obligationsContext(trimmed, allowedPaths), onToken);
+                extraContext(trimmed, allowedPaths), onToken);
 
         List<Source> sources = trimSourcesToCited(groupMatchesByFile(relevantMatches, answer), answer);
         history.add(trimmed, answer);
@@ -691,7 +691,7 @@ public final class QueryEngine {
                 withinThreshold.size(), candidateFiles, relevantMatches.size(), finalFiles);
 
         String answer = llmClient.answer(trimmed, relevantMatches, history,
-                obligationsContext(trimmed, allowedPaths));
+                extraContext(trimmed, allowedPaths));
 
         List<Source> sources = trimSourcesToCited(groupMatchesByFile(relevantMatches, answer), answer);
 
@@ -1182,7 +1182,8 @@ public final class QueryEngine {
                                     String operation, String status, String role,
                                     Boolean isPersonal, String docType, String dateFrom,
                                     String dateTo, String scope, boolean obligationsOnly,
-                                    String category, String amountRange, java.util.List<String> parts) {
+                                    String category, String amountRange, String dateType,
+                                    java.util.List<String> parts) {
 
         /** Map the aggregate fields onto a {@link com.localfilebrain.aggregate.SheetQuery}
          *  (only valid when {@link #aggregate} is true). */
@@ -1198,12 +1199,15 @@ public final class QueryEngine {
                 case "count" -> com.localfilebrain.aggregate.SheetQuery.Op.COUNT;
                 case "max", "who_most", "highest" -> com.localfilebrain.aggregate.SheetQuery.Op.MAX;
                 case "min", "lowest" -> com.localfilebrain.aggregate.SheetQuery.Op.MIN;
+                case "average", "avg", "mean" -> com.localfilebrain.aggregate.SheetQuery.Op.AVERAGE;
+                case "compare", "comparison", "versus", "vs" -> com.localfilebrain.aggregate.SheetQuery.Op.COMPARE;
+                case "difference", "diff", "gap", "subtract" -> com.localfilebrain.aggregate.SheetQuery.Op.DIFFERENCE;
                 case "none"  -> com.localfilebrain.aggregate.SheetQuery.Op.NONE;
                 default      -> com.localfilebrain.aggregate.SheetQuery.Op.LIST;
             };
             return new com.localfilebrain.aggregate.SheetQuery(true, rewrite, sel, op,
                     status, role, isPersonal, docType, dateFrom, dateTo, scope,
-                    obligationsOnly, category, amountRange);
+                    obligationsOnly, category, amountRange, dateType);
         }
     }
 
@@ -1220,7 +1224,7 @@ public final class QueryEngine {
             statements, receipts, salary slips, IDs, etc.). You may be given the
             recent conversation for context, then the user's new message. Decide how
             to handle the message and reply with ONLY a compact JSON object:
-            {"intent":"<INTENT>","subject":"<kind of document, or empty>","reply":"<text or empty>","rewrite":"<text or empty>","aggregate":true|false,"select":"amounts|parties|documents|dates","operation":"sum|count|list|max|min|none","status":"unpaid|paid|partial|owed|all|","role":"client|customer|vendor|supplier|provider|","is_personal":true|false|null,"doc_type":"","date_from":"","date_to":"","scope":"owed_to_me|i_owe|","obligations_only":true|false,"category":"","amount_range":"","parts":[]}
+            {"intent":"<INTENT>","subject":"<kind of document, or empty>","reply":"<text or empty>","rewrite":"<text or empty>","aggregate":true|false,"select":"amounts|parties|documents|dates","operation":"sum|count|list|max|min|average|compare|difference|none","status":"unpaid|paid|partial|owed|all|","role":"client|customer|vendor|supplier|provider|","is_personal":true|false|null,"doc_type":"","date_from":"","date_to":"","scope":"owed_to_me|i_owe|","obligations_only":true|false,"category":"","amount_range":"","date_type":"payment|renewal|filing|appointment|","parts":[]}
 
             You are given TODAY'S DATE, then (optionally) the recent conversation,
             then the user's new message.
@@ -1252,9 +1256,12 @@ public final class QueryEngine {
             "how many clients", "which documents are personal", deadlines across
             everything. It is FALSE for a fact from one or a few specific documents,
             AND FALSE whenever the question is scoped to ONE specific named item — a
-            particular sale, property, invoice, client, or person — EVEN IF it
-            mentions money ("am I owed on the Pine St sale?", "is the Blue Ridge
-            invoice paid?", "total of Rohan Mehta's invoices"). Aggregate is only for
+            particular sale, property, invoice, client, person, course, subject, or
+            project — EVEN IF it mentions money OR dates ("am I owed on the Pine St
+            sale?", "is the Blue Ridge invoice paid?", "total of Rohan Mehta's
+            invoices", "what are the CS201 homework deadlines?"). Deadlines for ONE
+            named course/project are a LOOKUP of that item's document, NOT the
+            corpus-wide dates aggregate. Aggregate is only for
             the whole collection, never a single named thing. This ALSO covers a
             follow-up that narrows to ONE named party after a collection question
             ("and Anjali Rao?", "what about Zenlite?"): naming one client/person makes
@@ -1290,6 +1297,16 @@ public final class QueryEngine {
                           collect", "who still owes" = money still owed → status
                           UNPAID (NOT all/revenue). "how many owe me / still owe" =
                           operation count over amounts (owed_to_me, status unpaid).
+                          For a money calculation the plain ops can't express, pick:
+                          "average" (the mean, e.g. "average my clients owe me"),
+                          "compare" (weigh two groups, e.g. "do clients owe me more than
+                          I owe others?"), or "difference" (the gap between the biggest
+                          and smallest, or a subtraction). For compare/difference set
+                          "scope" to the direction — owed_to_me or i_owe — but LEAVE it
+                          "" for a comparison that spans BOTH sides (receivables vs
+                          payables). Still set "status" as usual. Do NOT use these for a
+                          plain total (sum), a plain count, or the single largest/
+                          smallest (max/min).
             • select "parties"  → the ROSTER across the collection: "how many / list
                           my clients / patients / vendors". Set "role":
                           "client"/"customer" for people the user SERVES (also
@@ -1305,7 +1322,12 @@ public final class QueryEngine {
             • select "dates"    → deadlines / due dates / expiries / appointments
                           across everything. Set "date_from"/"date_to" (yyyy-MM-dd) if
                           a period is implied; operation list / count; set
-                          "obligations_only":true for things the user must DO/meet.
+                          "obligations_only":true for things the user must DO/meet. When
+                          the question asks for ONE KIND of date, set "date_type":
+                          "payment" (bill/invoice payment due dates), "renewal"
+                          (license/subscription/policy renewals or expiries), "filing"
+                          (tax/legal/compliance filing deadlines), or "appointment"
+                          (meetings/hearings/exams). Leave "" for all deadlines.
             Resolve relative periods against TODAY'S DATE: "this month" = 1st to last
             day of the current month; "this week"/"next 30 days"/"by Friday" likewise
             — always concrete yyyy-MM-dd.
@@ -1429,6 +1451,10 @@ public final class QueryEngine {
               {"intent":"DOCUMENTS","aggregate":true,"select":"documents","operation":"count","doc_type":"invoice"}
             "what deadlines do I have this month?" →
               {"intent":"DATES","aggregate":true,"select":"dates","operation":"list","date_from":"2026-07-01","date_to":"2026-07-31","obligations_only":true}
+            "what payment due dates do I have?" →
+              {"intent":"DATES","aggregate":true,"select":"dates","operation":"list","obligations_only":true,"date_type":"payment"}
+            "when do my licenses/subscriptions renew?" →
+              {"intent":"DATES","aggregate":true,"select":"dates","operation":"list","obligations_only":true,"date_type":"renewal"}
             "what's my most expensive bill?" →
               {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"max","status":"unpaid","scope":"i_owe"}
             "how much have I earned in commissions so far?" (EARNED → all) →
@@ -1441,10 +1467,19 @@ public final class QueryEngine {
               {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"sum","status":"all","scope":"owed_to_me"}
             "who owes me and what's the total?" →
               {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"sum","status":"unpaid","scope":"owed_to_me"}
+            "what's the average amount my clients owe me?" →
+              {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"average","status":"unpaid","scope":"owed_to_me"}
+            "do my clients owe me more than I owe others?" (both directions) →
+              {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"compare","status":"unpaid","scope":""}
+            "how much more does my biggest client owe than my smallest?" →
+              {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"difference","status":"unpaid","scope":"owed_to_me"}
+            "how much would I collect if everyone paid up?" →
+              {"intent":"AMOUNTS","aggregate":true,"select":"amounts","operation":"sum","status":"unpaid","scope":"owed_to_me"}
             "total of Rohan's invoices" (ONE named client) → {"intent":"LOOKUP","aggregate":false}
             "summarize my documents" → {"intent":"OVERVIEW","aggregate":false}
             "did I get any scholarship?" → {"intent":"LOOKUP","aggregate":false}
             "is the Blue Ridge invoice paid?" → {"intent":"LOOKUP","aggregate":false}
+            "what are the CS201 homework deadlines?" (ONE named course) → {"intent":"LOOKUP","aggregate":false}
             "when is the rent due?" → {"intent":"LOOKUP","aggregate":false}
             "thanks!" → {"intent":"CHITCHAT","aggregate":false,"reply":"You're welcome!"}
             - Output JSON only, nothing else.
@@ -1471,7 +1506,7 @@ public final class QueryEngine {
 
     /** The classifier fallback used on any parse/LLM failure. */
     static final ClassifiedIntent DEFAULT_LOOKUP = new ClassifiedIntent(Intent.LOOKUP,
-            "", "", "", false, "", "", "", "", null, "", "", "", "", false, "", "", java.util.List.of());
+            "", "", "", false, "", "", "", "", null, "", "", "", "", false, "", "", "", java.util.List.of());
 
     /** Parse the classifier's JSON into a routing decision. Pure (no LLM), so a
      *  routing harness can drive it with live model output and it is unit-testable
@@ -1533,6 +1568,7 @@ public final class QueryEngine {
                     n.path("obligations_only").asBoolean(false),
                     n.path("category").asText("").trim().toLowerCase(),
                     n.path("amount_range").asText("").trim(),
+                    n.path("date_type").asText("").trim().toLowerCase(),
                     parts);
         } catch (Exception e) {
             return DEFAULT_LOOKUP;
@@ -1792,7 +1828,7 @@ public final class QueryEngine {
         Set<String> out = new java.util.HashSet<>();
         for (FileRecord r : metadataStore.listIndexedFilesBySizeDesc()) {
             if (!inScope(r.getAbsolutePath(), allowedPaths)) continue;
-            out.addAll(significantTokens(splitCamelAndDigits(r.getFileName())));
+            out.addAll(significantTokens(r.getFileName()));   // splits internally; raw keeps IDs like cs201
         }
         return out;
     }
@@ -1831,11 +1867,26 @@ public final class QueryEngine {
     private static Set<String> significantTokens(String text) {
         Set<String> out = new java.util.HashSet<>();
         if (text == null) return out;
-        java.util.regex.Matcher m = OVERLAP_TOKEN.matcher(splitCamelAndDigits(text).toLowerCase());
+        String lower = text.toLowerCase();
+        java.util.regex.Matcher m = OVERLAP_TOKEN.matcher(splitCamelAndDigits(lower));
         while (m.find()) {
             String t = m.group();
             if (t.length() >= 4 && t.chars().anyMatch(Character::isLetter)
                     && !STOPWORDS.contains(t)) {
+                out.add(t);
+            }
+        }
+        // ALSO keep alphanumeric identifiers UN-split. A course code / invoice id
+        // ("cs201", "math210", "ls2041", "nsu2026") is highly distinctive, but the
+        // camelCase/digit split turns it into a too-short letter run + a letter-less
+        // digit run, so it vanishes — and a question naming it ("grading for CS201")
+        // then matched no file and got wrongly bounced as UNCLEAR. Keep the raw token
+        // when it mixes letters AND digits.
+        java.util.regex.Matcher raw = OVERLAP_TOKEN.matcher(lower);
+        while (raw.find()) {
+            String t = raw.group();
+            if (t.length() >= 4 && t.chars().anyMatch(Character::isLetter)
+                    && t.chars().anyMatch(Character::isDigit) && !STOPWORDS.contains(t)) {
                 out.add(t);
             }
         }
@@ -2171,6 +2222,26 @@ public final class QueryEngine {
         if (q.select() == com.localfilebrain.aggregate.SheetQuery.Select.AMOUNTS)
             sheets = sheetExtractor.ensureAmountRoles(sheets);
 
+        // Date-KIND questions ("payment due dates" vs "renewals"): lazily give each date
+        // a canonical type so the filter is exact. One-time per doc-with-dates, and only
+        // when a kind is actually requested — a plain "what deadlines" never pays it.
+        if (q.select() == com.localfilebrain.aggregate.SheetQuery.Select.DATES
+                && q.dateType() != null && !q.dateType().isBlank())
+            sheets = sheetExtractor.ensureDateTypes(sheets);
+
+        // Open calculation (average / compare / difference): the fixed calculator can't
+        // express it, so resolve the EXACT per-party money table and do the arithmetic
+        // in CODE (never the LLM — a live test showed gpt-4o-mini mis-adds even correct
+        // figures). The classifier only NAMED the operation; code computes it exactly.
+        if (q.select() == com.localfilebrain.aggregate.SheetQuery.Select.AMOUNTS
+                && (q.op() == com.localfilebrain.aggregate.SheetQuery.Op.AVERAGE
+                 || q.op() == com.localfilebrain.aggregate.SheetQuery.Op.COMPARE
+                 || q.op() == com.localfilebrain.aggregate.SheetQuery.Op.DIFFERENCE)) {
+            QueryResult computed = runMoneyCompute(q, qtext, sheets, onToken);
+            if (computed != null) return computed;
+            // fall through to the normal aggregate render if there was nothing to compute
+        }
+
         String text; List<String> sourceNames;
         com.localfilebrain.aggregate.SheetAggregator.Result det = sheetAggregator.run(q, sheets, ownerNames);
         if (det != null && !det.text().isBlank()) {
@@ -2198,6 +2269,92 @@ public final class QueryEngine {
         return QueryResult.found(text, chips);
     }
 
+    /**
+     * Open money calculation (average / compare / difference) done ENTIRELY in code
+     * over the exact per-party table. The classifier only named the operation; a live
+     * test proved the LLM mis-adds even correct figures, so no arithmetic is delegated.
+     * Returns null when there's nothing to compute (caller falls back to the normal
+     * render). "owed" figures use the still-owed column; total EARNED/billed questions
+     * (status "all") use the billed column.
+     */
+    private QueryResult runMoneyCompute(com.localfilebrain.aggregate.SheetQuery q, String qtext,
+                                        List<com.localfilebrain.aggregate.SheetExtractor.Sheet> sheets,
+                                        java.util.function.Consumer<String> onToken) {
+        boolean billedCol = "all".equals(q.status());                  // else the still-owed column
+        boolean payDir = q.scope() != null && q.scope().contains("i_owe");
+        List<String> srcNames = new ArrayList<>();
+        String text;
+
+        if (q.op() == com.localfilebrain.aggregate.SheetQuery.Op.COMPARE) {
+            // Cross-direction: what others owe you vs what you owe others.
+            List<com.localfilebrain.aggregate.SheetAggregator.ClientMoney> recv =
+                    sheetAggregator.moneyTable(sheets, ownerNames, true, q.category());
+            List<com.localfilebrain.aggregate.SheetAggregator.ClientMoney> pay =
+                    sheetAggregator.moneyTable(sheets, ownerNames, false, q.category());
+            long recvTotal = sumCol(recv, billedCol, srcNames);
+            long payTotal  = sumCol(pay,  billedCol, srcNames);
+            if (recv.isEmpty() && pay.isEmpty()) return null;
+            long diff = Math.abs(recvTotal - payTotal);
+            String verb = recvTotal > payTotal ? "more than you owe others"
+                        : recvTotal < payTotal ? "less than you owe others" : "exactly what you owe others";
+            text = "Your clients owe you " + MoneyFormat.format(recvTotal)
+                 + " and you owe others " + MoneyFormat.format(payTotal) + " — you're owed "
+                 + verb + (diff == 0 ? "." : ", a difference of " + MoneyFormat.format(diff) + ".");
+        } else {
+            List<com.localfilebrain.aggregate.SheetAggregator.ClientMoney> rows =
+                    sheetAggregator.moneyTable(sheets, ownerNames, !payDir, q.category());
+            // Only parties with a non-zero figure in the relevant column count — a
+            // fully-paid client does not belong in "the average my clients owe".
+            List<com.localfilebrain.aggregate.SheetAggregator.ClientMoney> nz = new ArrayList<>();
+            for (var m : rows) if ((billedCol ? m.billed() : m.owed()) > 0) nz.add(m);
+            if (nz.isEmpty()) return null;
+
+            if (q.op() == com.localfilebrain.aggregate.SheetQuery.Op.AVERAGE) {
+                long sum = sumCol(nz, billedCol, srcNames);
+                long avg = Math.round((double) sum / nz.size());
+                text = "The average is " + MoneyFormat.format(avg) + " across " + nz.size()
+                     + (nz.size() == 1 ? " party" : " parties") + " (total " + MoneyFormat.format(sum) + ").";
+            } else {   // DIFFERENCE — spread between the biggest and smallest
+                nz.sort((a, b) -> Long.compare(col(b, billedCol), col(a, billedCol)));
+                var top = nz.get(0); var bot = nz.get(nz.size() - 1);
+                for (var m : nz) for (String s : m.sources()) if (!srcNames.contains(s)) srcNames.add(s);
+                long diff = col(top, billedCol) - col(bot, billedCol);
+                text = "**" + top.name() + "** (" + MoneyFormat.format(col(top, billedCol)) + ") vs **"
+                     + bot.name() + "** (" + MoneyFormat.format(col(bot, billedCol)) + ") — a difference of "
+                     + MoneyFormat.format(diff) + ".";
+            }
+        }
+
+        java.util.Map<String, String> nameToPath = new java.util.HashMap<>();
+        for (com.localfilebrain.aggregate.SheetExtractor.Sheet s : sheets) nameToPath.put(s.fileName(), s.path());
+        List<Source> chips = new ArrayList<>();
+        for (String name : srcNames) {
+            String p = nameToPath.get(name);
+            if (p != null) chips.add(new Source(name, p, List.of(), List.of()));
+        }
+        log.info("Intent: AGGREGATE (sheets={}, op={}) — money compute (code)", sheets.size(), q.op());
+        if (onToken != null) onToken.accept(text);
+        history.add(qtext, text);
+        return QueryResult.found(text, chips);
+    }
+
+    private static long col(com.localfilebrain.aggregate.SheetAggregator.ClientMoney m, boolean billed) {
+        return billed ? m.billed() : m.owed();
+    }
+
+    /** Sum one column across rows, collecting each contributing file for the chips. */
+    private static long sumCol(List<com.localfilebrain.aggregate.SheetAggregator.ClientMoney> rows,
+                               boolean billed, List<String> srcNames) {
+        long total = 0;
+        for (var m : rows) {
+            long v = billed ? m.billed() : m.owed();
+            if (v <= 0) continue;
+            total += v;
+            for (String s : m.sources()) if (!srcNames.contains(s)) srcNames.add(s);
+        }
+        return total;
+    }
+
     /** Map the generic sheet op to the LLM-answerer's op (fuzzy fallback only). */
     private static com.localfilebrain.aggregate.QueryPlan.Op mapOp(com.localfilebrain.aggregate.SheetQuery.Op op) {
         return switch (op) {
@@ -2205,7 +2362,7 @@ public final class QueryEngine {
             case MAX -> com.localfilebrain.aggregate.QueryPlan.Op.WHO_MOST;
             case COUNT -> com.localfilebrain.aggregate.QueryPlan.Op.COUNT;
             case LIST -> com.localfilebrain.aggregate.QueryPlan.Op.LIST;
-            default -> com.localfilebrain.aggregate.QueryPlan.Op.NONE;
+            default -> com.localfilebrain.aggregate.QueryPlan.Op.NONE;   // COMPUTE handled before fallback
         };
     }
 
@@ -2358,6 +2515,71 @@ public final class QueryEngine {
     }
 
     /** Instance wrapper: fetches the rows and builds the block for this scope. */
+    /** Obligations + named-party billing facts, merged into one trusted context block
+     *  for the answer LLM. Either half may be null. */
+    private String extraContext(String question, java.util.Set<String> allowedPaths) {
+        String obligations = obligationsContext(question, allowedPaths);
+        String money = moneyFactContext(question, allowedPaths);
+        if (obligations == null) return money;
+        if (money == null) return obligations;
+        return obligations + "\n" + money;
+    }
+
+    /**
+     * When a normal lookup NAMES a party the corpus has billing for ("is the Blue Ridge
+     * invoice paid?", "how much does Delgado owe?"), inject that party's already-
+     * reconciled billed/paid/owed as authoritative context. This is the fix for a
+     * status question whose answer is split across an invoice and a separate payment
+     * note: the single retrieved doc can't show it, but the money resolution already
+     * has it. Uses the SAME sheet load + amount-role tagging the aggregate path uses,
+     * so the figure is identical to what a corpus-wide money question would report (in
+     * steady state these are all cache hits — no re-extraction). Purely additive: a
+     * fact attaches only when a party name actually matches, so an unrelated lookup is
+     * untouched.
+     */
+    private String moneyFactContext(String question, java.util.Set<String> allowedPaths) {
+        if (sheetExtractor == null || sheetAggregator == null) return null;
+        Set<String> qTokens = significantTokens(question);
+        if (qTokens.isEmpty()) return null;
+        // Resolve over the WHOLE corpus, not the active client scope: a party's billing
+        // is often split across an invoice (in scope) and a payment note (filed loose,
+        // NOT in that client's membership), and the net needs both. Only the named
+        // party's own row is surfaced below, so no other client's documents leak into
+        // the answer — retrieval stays scoped, this is just that one party's figure.
+        List<com.localfilebrain.aggregate.SheetExtractor.Sheet> sheets = sheetExtractor.ensureSheets(null);
+        if (sheets.isEmpty()) return null;
+        sheets = sheetExtractor.ensureAmountRoles(sheets);   // same disambiguation the money aggregate uses
+
+        List<com.localfilebrain.aggregate.SheetAggregator.ClientMoney> all = new ArrayList<>();
+        all.addAll(sheetAggregator.moneyTable(sheets, ownerNames, true, ""));    // receivables
+        all.addAll(sheetAggregator.moneyTable(sheets, ownerNames, false, ""));   // payables
+        if (all.isEmpty()) return null;
+
+        java.util.LinkedHashMap<String, String> facts = new java.util.LinkedHashMap<>();
+        for (com.localfilebrain.aggregate.SheetAggregator.ClientMoney m : all) {
+            boolean named = false;
+            for (String t : significantTokens(m.name())) if (qTokens.contains(t)) { named = true; break; }
+            if (!named) continue;
+            String line;
+            if (m.owed() > 0 && m.paid() > 0)
+                line = m.name() + " — " + MoneyFormat.format(m.billed()) + " billed, "
+                        + MoneyFormat.format(m.paid()) + " paid, " + MoneyFormat.format(m.owed())
+                        + " still owed (partially paid, NOT fully paid).";
+            else if (m.owed() > 0)
+                line = m.name() + " — " + MoneyFormat.format(m.owed()) + " still owed (unpaid).";
+            else if (m.billed() > 0)
+                line = m.name() + " — " + MoneyFormat.format(m.billed()) + " billed, fully paid.";
+            else continue;
+            facts.putIfAbsent(m.name(), line);
+        }
+        if (facts.isEmpty()) return null;
+        StringBuilder sb = new StringBuilder("Known billing status (already reconciled across ALL "
+                + "the user's documents — authoritative, use it to answer payment/owed questions):");
+        for (String line : facts.values()) sb.append("\n- ").append(line);
+        log.info("Money-fact context attached for {} named party(ies)", facts.size());
+        return sb.toString();
+    }
+
     private String obligationsContext(String question, java.util.Set<String> allowedPaths) {
         if (!isActionFlavored(question) || metadataStore == null) return null;
         try {

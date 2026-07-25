@@ -24,14 +24,19 @@ public record SheetQuery(
         String scope,           // amounts: "owed_to_me" | "i_owe" | "" (either direction)
         boolean obligationsOnly, // dates: true → only real deadlines, not record dates
         String category,         // filter to one money category (utility/rent/…), or ""
-        String amountRange) {    // amounts: ">3000" / "<500" numeric filter, or ""
+        String amountRange,      // amounts: ">3000" / "<500" numeric filter, or ""
+        String dateType) {       // dates: payment/renewal/filing/appointment kind, or ""
 
     public enum Select { AMOUNTS, PARTIES, DOCUMENTS, DATES }
-    public enum Op { SUM, COUNT, LIST, MAX, MIN, NONE }
+    // AVERAGE / COMPARE / DIFFERENCE: the open calculations the plain menu lacked. The
+    // LLM only NAMES which one (routing); code resolves the exact per-party table and
+    // does the arithmetic itself — a live test proved gpt-4o-mini mis-adds even 6
+    // correct figures, so the math must never be delegated to it.
+    public enum Op { SUM, COUNT, LIST, MAX, MIN, AVERAGE, COMPARE, DIFFERENCE, NONE }
 
     /** A non-aggregate plan: the question isn't corpus-wide, so RAG should answer. */
     public static SheetQuery passthrough(String rewrite) {
         return new SheetQuery(false, rewrite == null ? "" : rewrite,
-                Select.DOCUMENTS, Op.NONE, "", "", null, "", "", "", "", false, "", "");
+                Select.DOCUMENTS, Op.NONE, "", "", null, "", "", "", "", false, "", "", "");
     }
 }

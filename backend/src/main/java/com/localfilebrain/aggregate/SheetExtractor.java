@@ -246,6 +246,81 @@ public final class SheetExtractor {
         }
     }
 
+    // Date kinds the model may assign — a small, fixed menu so "payment due dates"
+    // filters on a canonical type instead of guessing from free-text labels.
+    private static final String DATE_TYPE_MENU =
+        "payment_due (a bill/invoice/loan payment deadline), renewal (a license, "
+      + "subscription, policy, or registration renewal or expiry), filing (a tax, legal, "
+      + "or compliance filing/return deadline), appointment (a meeting, hearing, exam, or "
+      + "scheduled visit), or other (anything else, including record dates like issued/paid)";
+
+    /**
+     * Lazily tag each date's KIND (payment_due / renewal / filing / appointment / other)
+     * so a "payment due dates" question filters on a canonical type instead of the
+     * aggregator guessing from labels. Same shape as {@link #ensureAmountRoles}: one LLM
+     * call per doc-with-untagged-dates EVER, written back into the cached sheet, so it's
+     * a one-time cost that only fires when a date-KIND question is actually asked.
+     */
+    public List<Sheet> ensureDateTypes(List<Sheet> sheets) {
+        if (llm == null) return sheets;
+        List<Sheet> out = new ArrayList<>();
+        int tagged = 0;
+        for (Sheet s : sheets) {
+            Sheet enriched = s;
+            try {
+                JsonNode sheet = mapper.readTree(s.json());
+                if (needsDateTypes(sheet)) {
+                    JsonNode typed = tagDateTypes(sheet, s.fileName());
+                    if (typed != null) {
+                        String json = mapper.writeValueAsString(typed);
+                        meta.updateSheetJson(s.path(), json);
+                        enriched = new Sheet(s.path(), s.fileName(), json);
+                        tagged++;
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("Date-type tagging failed for '{}': {}", s.fileName(), e.getMessage());
+            }
+            out.add(enriched);
+        }
+        if (tagged > 0) log.info("Date types: tagged {} doc(s) with dates (cached)", tagged);
+        return out;
+    }
+
+    /** A doc worth tagging: it has dates and at least one lacks a type. */
+    private static boolean needsDateTypes(JsonNode sheet) {
+        JsonNode dates = sheet.get("dates");
+        if (dates == null || !dates.isArray() || dates.isEmpty()) return false;
+        for (JsonNode d : dates) if (d.path("type").asText("").isBlank()) return true;
+        return false;
+    }
+
+    /** Ask the model to tag each date's kind from the fixed menu; return the sheet with
+     *  a "type" added to every date. Null on any failure (caller keeps original). */
+    private JsonNode tagDateTypes(JsonNode sheet, String fileName) {
+        ArrayNode dates = (ArrayNode) sheet.get("dates");
+        StringBuilder list = new StringBuilder();
+        for (int i = 0; i < dates.size(); i++) {
+            JsonNode d = dates.get(i);
+            list.append(i).append(": \"").append(d.path("label").asText("")).append("\" ")
+                .append(d.path("date").asText("")).append('\n');
+        }
+        String sys = "You label the dates on ONE document. For EACH date pick the single best "
+                + "KIND from: " + DATE_TYPE_MENU + ". Reply ONLY with a JSON array of strings — "
+                + "one kind per date, in the same order. No other words.";
+        String usr = "Document: " + PromptSanitizer.safeLabel(fileName) + "\nDates:\n" + list;
+        try {
+            JsonNode arr = mapper.readTree(cleanArray(llm.oneShot(sys, usr, 120, 0.0)));
+            if (arr == null || !arr.isArray() || arr.size() != dates.size()) return null;
+            for (int i = 0; i < dates.size(); i++)
+                ((ObjectNode) dates.get(i)).put("type", arr.get(i).asText("other").trim().toLowerCase());
+            return sheet;
+        } catch (Exception e) {
+            log.warn("Date-type tag call failed for '{}': {}", fileName, e.getMessage());
+            return null;
+        }
+    }
+
     /**
      * Extract a batch, but never let a transient failure (e.g. a 502) silently
      * drop documents: whatever the first call misses is retried once as a group,

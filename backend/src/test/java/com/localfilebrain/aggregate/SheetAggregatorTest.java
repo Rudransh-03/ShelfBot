@@ -77,7 +77,7 @@ class SheetAggregatorTest {
     private final SheetAggregator agg = new SheetAggregator();
 
     private static SheetQuery amounts(SheetQuery.Op op, String status, String scope) {
-        return new SheetQuery(true, "", SheetQuery.Select.AMOUNTS, op, status, "", null, "", "", "", scope, false, "", "");
+        return new SheetQuery(true, "", SheetQuery.Select.AMOUNTS, op, status, "", null, "", "", "", scope, false, "", "", "");
     }
 
     // ── Student corpus: bills the user OWES (a different domain / direction) ──────
@@ -206,7 +206,7 @@ class SheetAggregatorTest {
     @Test
     void clinicCountsPatientsNotVendors() {
         SheetQuery q = new SheetQuery(true, "", SheetQuery.Select.PARTIES, SheetQuery.Op.COUNT,
-                "", "patient", null, "", "", "", "", false, "", "");
+                "", "patient", null, "", "", "", "", false, "", "", "");
         SheetAggregator.Result r = agg.run(q, clinicCorpus());
         assertNotNull(r);
         assertTrue(r.text().startsWith("2"), "was: " + r.text());          // Sam + Nina
@@ -337,7 +337,7 @@ class SheetAggregatorTest {
                  "dates":[{"label":"filed on","date":"2026-06-30","deadline":false},
                           {"label":"hearing","date":"2026-07-25","deadline":true}]}"""));
         SheetQuery deadlines = new SheetQuery(true, "", SheetQuery.Select.DATES, SheetQuery.Op.LIST,
-                "", "", null, "", "2026-07-01", "2026-07-31", "", true, "", "");   // obligationsOnly
+                "", "", null, "", "2026-07-01", "2026-07-31", "", true, "", "", "");   // obligationsOnly
         SheetAggregator.Result r = agg.run(deadlines, mixed);
         assertNotNull(r);
         assertTrue(r.text().contains("filing due") && r.text().contains("final exam")
@@ -352,7 +352,7 @@ class SheetAggregatorTest {
         List<SheetExtractor.Sheet> one = List.of(sheet("x.pdf", """
             {"doc_type":"invoice","dates":[{"label":"due","date":"2026-12-01","deadline":true}]}"""));
         SheetQuery q = new SheetQuery(true, "", SheetQuery.Select.DATES, SheetQuery.Op.LIST,
-                "", "", null, "", "2026-07-01", "2026-07-31", "", true, "", "");   // July → nothing
+                "", "", null, "", "2026-07-01", "2026-07-31", "", true, "", "", "");   // July → nothing
         SheetAggregator.Result r = agg.run(q, one);
         assertNotNull(r, "empty result wrongly returned null → would fall to LLM");
         assertTrue(r.text().toLowerCase().contains("no deadlines"), "was: " + r.text());
@@ -361,7 +361,7 @@ class SheetAggregatorTest {
     @Test
     void listPersonalDocumentsOnly() {
         SheetQuery q = new SheetQuery(true, "", SheetQuery.Select.DOCUMENTS, SheetQuery.Op.LIST,
-                "", "", true, "", "", "", "", false, "", "");
+                "", "", true, "", "", "", "", false, "", "", "");
         SheetAggregator.Result r = agg.run(q, corpus());
         assertNotNull(r);
         assertTrue(r.text().toLowerCase().contains("vet") || r.text().contains("312") || r.sources().contains("vet_bill.pdf"));
@@ -458,7 +458,7 @@ class SheetAggregatorTest {
                          {"name":"Zed Corp","role":"client","side":"owes"}],
                  "amounts":[{"label":"rent","value":500,"status":"paid","role":"payment"}]}"""));
         SheetQuery q = new SheetQuery(true, "", SheetQuery.Select.AMOUNTS, SheetQuery.Op.LIST,
-                "paid", "", null, "", "", "", "owed_to_me", false, "commission", "");
+                "paid", "", null, "", "", "", "owed_to_me", false, "commission", "", "");
         SheetAggregator.Result r = agg.run(q, s, List.of("Chen Realty"));
         assertNotNull(r);
         assertTrue(r.text().contains("John Kim"), "unknown-category commission dropped: " + r.text());
@@ -499,7 +499,7 @@ class SheetAggregatorTest {
                  "people":[{"name":"John","role":"client","side":"owes"}],
                  "amounts":[{"label":"commission","value":8400,"status":"paid","role":"payment"}]}"""));
         SheetQuery q = new SheetQuery(true, "", SheetQuery.Select.AMOUNTS, SheetQuery.Op.SUM,
-                "all", "", null, "", "", "", "owed_to_me", false, "", "");
+                "all", "", null, "", "", "", "owed_to_me", false, "", "", "");
         SheetAggregator.Result r = agg.run(q, s, List.of("Me Co"));
         assertNotNull(r);
         assertTrue(r.text().contains("17,400"), "total earned (paid+owed) wrong: " + r.text());
